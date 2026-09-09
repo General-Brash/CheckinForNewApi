@@ -5,6 +5,8 @@ let platforms = [];
 let editingId = null;
 let connectionPromise = null;
 let deletingId = null;
+let keepAliveTestPromise = null;
+let keepAlivePickPromise = null;
 
 function todayStr() {
   const d = new Date();
@@ -27,6 +29,25 @@ function safeHttpUrl(v) {
     return "";
   }
 }
+// ---------- 自动调用 API（防僵尸号保活）配置 ----------
+const DEFAULT_KEEPALIVE_MODEL = "deepseek v4 flash";
+const KEEPALIVE_FORMATS = ["chat", "message", "response"];
+const KEEPALIVE_PATHS = { chat: "/v1/chat/completions", message: "/v1/messages", response: "/v1/responses" };
+function normalizeKeepAlive(ka) {
+  ka = (ka && typeof ka === "object") ? ka : {};
+  return {
+    enabled: !!ka.enabled,
+    url: String(ka.url || "").trim(),
+    key: String(ka.key || ""),
+    format: KEEPALIVE_FORMATS.indexOf(ka.format) >= 0 ? ka.format : "chat",
+    model: String(ka.model || "").trim(),
+    lastDate: String(ka.lastDate || "").trim(),
+  };
+}
+function keepAliveDefaultUrl(baseUrl, format) {
+  const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+  return base ? base + (KEEPALIVE_PATHS[format] || KEEPALIVE_PATHS.chat) : "";
+}
 
 function formatQuota(v) {
   return (Number(v || 0) / 500000).toFixed(4);
@@ -39,6 +60,7 @@ function fmtTokens(v, truncated) {
 
 function toast(text, error = false) {
   const el = $("toast");
+  if (!el) return;
   el.textContent = text;
   el.className = "show" + (error ? " error" : "");
   clearTimeout(window.toastTimer);
@@ -77,9 +99,11 @@ function send(msg) {
   });
 }
 const slim = (p) => ({ baseUrl: p.baseUrl, userId: p.userId, accessToken: p.accessToken, authMode: p.authMode });
+const slimFull = (p) => ({ id: p.id, baseUrl: p.baseUrl, userId: p.userId, accessToken: p.accessToken, authMode: p.authMode, keepAlive: normalizeKeepAlive(p.keepAlive) });
 const getStats = (p, month) =>
   send({ type: "stats", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
-const doCheckin = (p, reauth = true) => send({ type: "checkin", platform: slim(p), reauth });
+const doCheckin = (p, opts = {}) =>
+  send({ type: "checkin", platform: slimFull(p), reauth: opts.reauth !== false, batch: !!opts.batch });
 const getAccount = (p, month) =>
   send({ type: "account", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 const getModelInsight = (p, hours) => send({ type: "modelInsight", platform: slim(p), hours });
@@ -95,6 +119,15 @@ function validatePlatform(p) {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
+  const ka = normalizeKeepAlive(p.keepAlive);
+  if (ka.enabled) {
+    if (ka.url && !safeHttpUrl(ka.url))
+      throw new Error("自动调用 API 的调用网址必须使用 HTTP/HTTPS");
+    if (!ka.url && !p.baseUrl)
+      throw new Error("开启自动调用 API 需要填写调用网址或站点地址");
+    if (!ka.key && (p.authMode === "cookie" || p.authMode === "agentrouter_token"))
+      throw new Error("Cookie/Agent Router 模式开启自动调用 API 时必须填写 API Key");
+  }
   if (p.authMode === "cookie") return p;
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
@@ -165,7 +198,7 @@ function render() {
           ? '<a class="address address-link" href="' + esc(addr) + '" target="_blank" rel="noopener noreferrer" data-action="open-site" title="在浏览器中打开 ' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</a>"
           : '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div>") +
         "</div>" +
-        '<span class="badge ' + cls + '">' + label + "</span></div>" +
+        '<span class="badge ' + cls + '">' + label + "</span>" + (normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
         '<div class="card-stats">' +
         '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
         '<div class="mini-stat"><strong>' + qv(acc.used) + '</strong><span>已用额度</span></div>' +
@@ -191,7 +224,10 @@ async function checkin(id, options) {
   p.loading = true;
   p.error = "";
   render();
-  const r = await doCheckin(p, !(options && options.reauth === false));
+  const r = await doCheckin(p, options || {});
+  if (r.keepAlive && typeof r.keepAlive.date === "string") {
+    p.keepAlive = normalizeKeepAlive(Object.assign({}, normalizeKeepAlive(p.keepAlive), { lastDate: r.keepAlive.date }));
+  }
   p.message = r.message;
   p.error = r.ok ? "" : r.message;
   // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
@@ -466,7 +502,17 @@ function renderSparkline(group) {
 }
 
 // ---------- 添加/编辑 ----------
+function keepAliveFromForm() {
+  return {
+    enabled: $("keepAliveEnabled") ? $("keepAliveEnabled").checked : false,
+    url: $("keepAliveUrl") ? $("keepAliveUrl").value.trim() : "",
+    key: $("keepAliveKey") ? $("keepAliveKey").value : "",
+    format: $("keepAliveFormat") && KEEPALIVE_FORMATS.indexOf($("keepAliveFormat").value) >= 0 ? $("keepAliveFormat").value : "chat",
+    model: $("keepAliveModel") ? $("keepAliveModel").value.trim() : "",
+  };
+}
 function formData() {
+  const prev = platforms.find((x) => x.id === editingId) || null;
   return {
     name: $("name").value.trim(),
     baseUrl: $("baseUrl").value.trim().replace(/\/+$/, ""),
@@ -474,6 +520,7 @@ function formData() {
     accessToken: $("accessToken").value.trim(),
     note: $("note").value.trim(),
     authMode: $("authMode") ? $("authMode").value : "token",
+    keepAlive: Object.assign({}, normalizeKeepAlive(prev && prev.keepAlive), keepAliveFromForm()),
   };
 }
 
@@ -485,6 +532,14 @@ function openModal(p) {
   $("userId").value = p ? p.userId || "" : "";
   $("accessToken").value = p ? p.accessToken || "" : "";
   $("note").value = p ? p.note || "" : "";
+  const keepKa = normalizeKeepAlive(p && p.keepAlive);
+  $("keepAliveEnabled").checked = keepKa.enabled;
+  $("keepAliveUrl").value = keepKa.url || keepAliveDefaultUrl($("baseUrl").value, keepKa.format);
+  $("keepAliveKey").value = keepKa.key || "";
+  $("keepAliveFormat").value = keepKa.format;
+  $("keepAliveModel").value = keepKa.model;
+  if ($("keepAliveFormat")) $("keepAliveFormat").dataset.prevFmt = keepKa.format;
+  syncKeepAliveFields();
   // Agent Router 使用网站原生退出与 GitHub OAuth 登录回调签到。
   if (p && p.authMode) {
     $("authMode").value = ["token", "cookie", "agentrouter_token"].includes(p.authMode) ? p.authMode : "token";
@@ -495,6 +550,10 @@ function openModal(p) {
   toggleAuthFields();
   $("connectionStatus").className = "connection-status";
   $("connectionStatus").textContent = "";
+  const ksEl = $("keepAliveStatus");
+  if (ksEl) { ksEl.className = "connection-status"; ksEl.textContent = ""; }
+  const mlEl = $("keepAliveModelList");
+  if (mlEl) { mlEl.className = "keepalive-model-list"; mlEl.textContent = ""; }
   $("modal").classList.add("open");
   $("name").focus();
 }
@@ -517,6 +576,31 @@ function toggleAuthFields() {
         ? "Agent Router 模式：填写数字用户ID，并确保浏览器已登录对应账号；插件会退出当前会话并使用 GitHub 重新登录，签到结果由登录回调返回。"
         : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
   }
+}
+
+function syncKeepAliveFields() {
+  if (!$("keepAliveEnabled")) return;
+  const on = $("keepAliveEnabled").checked;
+  if ($("keepAliveFields")) $("keepAliveFields").style.display = on ? "" : "none";
+  if (on) {
+    const base = $("baseUrl").value.trim().replace(/\/+$/, "");
+    const urlEl = $("keepAliveUrl");
+    if (urlEl && base && !urlEl.value.trim()) {
+      urlEl.value = keepAliveDefaultUrl(base, $("keepAliveFormat") ? $("keepAliveFormat").value : "chat");
+    }
+  }
+}
+function onKeepAliveFormatChange() {
+  const fmtEl = $("keepAliveFormat");
+  const urlEl = $("keepAliveUrl");
+  if (!fmtEl || !urlEl) return;
+  const prevFmt = fmtEl.dataset.prevFmt || "chat";
+  const base = $("baseUrl").value.trim().replace(/\/+$/, "");
+  const expected = base ? base + (KEEPALIVE_PATHS[prevFmt] || "") : "";
+  if (!urlEl.value.trim() || (expected && urlEl.value.trim() === expected)) {
+    urlEl.value = keepAliveDefaultUrl(base, fmtEl.value);
+  }
+  fmtEl.dataset.prevFmt = fmtEl.value;
 }
 
 function editPlatform(id) {
@@ -562,6 +646,146 @@ async function testConnection() {
   return connectionPromise;
 }
 
+function keepAliveStatusText(text, type) {
+  const el = $("keepAliveStatus");
+  if (!el) return;
+  el.textContent = text;
+  el.className = "connection-status full show " + (type || "loading");
+  el.style.display = "block";
+  // 若折叠区域仍处于隐藏状态，强制展开，确保结果文字可见
+  const wrap = el.closest ? el.closest("#keepAliveFields") : null;
+  if (wrap && wrap.style && wrap.style.display === "none") wrap.style.display = "";
+  if (el.scrollIntoView) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+async function testKeepAlive() {
+  if (keepAliveTestPromise) return keepAliveTestPromise;
+  const btn = $("keepAliveTestBtn");
+  const fail = (msg) => {
+    try {
+      keepAliveStatusText("API 调用失败：" + msg, "error");
+      toast("检测API调用失败：" + msg, true);
+    } catch (err) {
+      try { console.error("[保活检测] 显示失败信息时出错：", err); } catch (_) {}
+    }
+  };
+  try {
+    const data = formData();
+    const ka = normalizeKeepAlive(data.keepAlive);
+    validatePlatform(data);
+    if (!ka.enabled) throw new Error("请先开启「自动调用 API」开关");
+    if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = "检测中…"; }
+    keepAliveStatusText("正在发送一次 API 调用，请稍候…", "loading");
+    keepAliveTestPromise = (async () => {
+      const r = await Promise.race([
+        send({
+          type: "testKeepAlive",
+          platform: { baseUrl: data.baseUrl, accessToken: data.accessToken, authMode: data.authMode, keepAlive: ka },
+        }),
+        new Promise((resolve) => setTimeout(() => resolve({ ok: false, message: "后台无响应（超时 25 秒），请到扩展管理页重新加载扩展后重试。" }), 25000)),
+      ]);
+      if (r && r.ok) {
+        const okMsg = "API 调用成功" + (r.model ? "（模型 " + r.model + "）" : "");
+        keepAliveStatusText(okMsg, "success");
+        toast(okMsg);
+      } else {
+        fail((r && r.message) || "未知错误");
+      }
+      return r;
+    })();
+    return await keepAliveTestPromise;
+  } catch (e) {
+    try { console.error("[保活检测] 点击检测失败：", e); } catch (_) {}
+    fail(e && e.message ? e.message : "未知错误");
+    return null;
+  } finally {
+    keepAliveTestPromise = null;
+    if (btn) {
+      btn.disabled = false;
+      if (btn.dataset.label) { btn.textContent = btn.dataset.label; delete btn.dataset.label; }
+    }
+  }
+}
+async function pickKeepAliveModels() {
+  if (keepAlivePickPromise) return keepAlivePickPromise;
+  const box = $("keepAliveModelList");
+  const setLoading = (txt) => {
+    if (!box) return;
+    box.className = "keepalive-model-list loading";
+    box.textContent = txt || "";
+  };
+  const clearBox = () => {
+    if (!box) return;
+    box.className = "keepalive-model-list";
+    box.textContent = "";
+  };
+  keepAlivePickPromise = (async () => {
+    try {
+      const data = formData();
+      const ka = normalizeKeepAlive(data.keepAlive);
+      validatePlatform(data);
+      if (!ka.enabled) throw new Error("请先开启「自动调用 API」开关");
+      setLoading("正在读取模型列表…");
+      const r = await send({
+        type: "keepAliveModels",
+        platform: { baseUrl: data.baseUrl, accessToken: data.accessToken, authMode: data.authMode, keepAlive: ka },
+      });
+      if (!r || !r.ok) throw new Error((r && r.message) || "读取模型列表失败");
+      const models = Array.isArray(r.models) ? r.models : [];
+      if (!models.length) throw new Error("站点没有可用对话模型");
+      renderKeepAliveModelChoices(models);
+      if (box) box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      return r;
+    } catch (e) {
+      try { console.error("[保活] 选择模型失败：", e); } catch (_) {}
+      keepAliveStatusText("读取模型列表失败：" + ((e && e.message) || "未知错误"), "error");
+      clearBox();
+      return null;
+    }
+  })();
+  try {
+    return await keepAlivePickPromise;
+  } finally {
+    keepAlivePickPromise = null;
+  }
+}
+function renderKeepAliveModelChoices(models) {
+  const box = $("keepAliveModelList");
+  if (!box) return;
+  box.className = "keepalive-model-list";
+  box.textContent = "";
+  const seen = {};
+  const items = models.filter((m) => {
+    const s = String(m == null ? "" : m).trim();
+    if (!s || seen[s]) return false;
+    seen[s] = 1;
+    return true;
+  });
+  const choose = (model) => {
+    const input = $("keepAliveModel");
+    if (!input) return;
+    input.value = model || "";
+    box.className = "keepalive-model-list";
+    box.textContent = "";
+    if (model) {
+      keepAliveStatusText("已选择模型：" + model + "（保存后保活调用将直接使用该模型）", "success");
+      toast("已选择模型 " + model);
+    } else {
+      keepAliveStatusText("模型已留空：默认 deepseek v4 flash，不支持时自动检测", "success");
+      toast("模型已留空（自动检测）");
+    }
+  };
+  const addBtn = (label, value) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "keepalive-model-chip";
+    b.textContent = label;
+    b.title = value ? "点击使用该模型" : "清空模型输入，按默认规则自动选择";
+    b.onclick = () => choose(value);
+    box.appendChild(b);
+  };
+  addBtn("留空（自动检测）", "");
+  items.forEach((m) => addBtn(m, m));
+}
 function removePlatform(id) {
   const p = platforms.find((x) => x.id === id);
   if (!p) return;
@@ -597,8 +821,9 @@ async function renderLastAuto() {
   const el = $("lastAutoMsg");
   if (r && r.last) {
     const t = new Date(r.last.time);
-    el.textContent =
-      "上次签到：" + t.toLocaleString() + " · 成功 " + r.last.ok + " / 已签 " + r.last.already + " / 失败 " + r.last.fail;
+    let lastTxt = "上次签到：" + t.toLocaleString() + " · 成功 " + r.last.ok + " / 已签 " + r.last.already + " / 失败 " + r.last.fail;
+    if (r.last.aliveOk || r.last.aliveFail) lastTxt += " · 保活成功 " + r.last.aliveOk + " / 失败 " + r.last.aliveFail;
+    el.textContent = lastTxt;
   } else {
     el.textContent = "尚未执行过自动签到。";
   }
@@ -627,6 +852,7 @@ async function importConfig(file) {
       userId: String(p.userId || ""),
       accessToken: p.accessToken || "",
       note: p.note || "",
+      keepAlive: normalizeKeepAlive(p.keepAlive),
       stats: p.stats || {},
       message: p.message || "",
     }));
@@ -656,6 +882,19 @@ function savePlatforms() {
 // ---------- 初始化 ----------
 async function init() {
   applyTheme(preferredTheme());
+  // 用事件委托绑定「检测API调用 / 选择模型」，即使后续初始化步骤出错，按钮点击仍能给出反馈
+  document.addEventListener("click", (e) => {
+    const t = e.target && e.target.closest ? e.target.closest("#keepAliveTestBtn, #keepAlivePickBtn") : null;
+    if (!t) return;
+    e.preventDefault();
+    const pr = t.id === "keepAliveTestBtn" ? testKeepAlive() : pickKeepAliveModels();
+    if (pr && pr.catch) {
+      pr.catch((err) => {
+        try { console.error("[保活] 操作异常：", err); } catch (_) {}
+        try { keepAliveStatusText("操作异常：" + ((err && err.message) || String(err)), "error"); } catch (_) {}
+      });
+    }
+  });
   // 宽屏管理页（popup.html，body 始终带 tab-mode）：隐藏「展开」按钮
   // 侧边栏（sidebar.html，body 带 sidebar-mode）：保留「展开」按钮，打开宽屏页
   if (
@@ -696,6 +935,10 @@ async function init() {
   });
 
   $("authMode").onchange = toggleAuthFields;
+  if ($("keepAliveEnabled")) {
+    $("keepAliveEnabled").addEventListener("change", syncKeepAliveFields);
+    if ($("keepAliveFormat")) $("keepAliveFormat").addEventListener("change", onKeepAliveFormatChange);
+  }
   $("baseUrl").addEventListener("input", () => {
     if (!editingId && $("authMode")) {
       const u = $("baseUrl").value.trim();
@@ -780,7 +1023,7 @@ async function init() {
     $("batchBtn").disabled = true;
     try {
       // 各平台请求相互独立，同时发起以缩短批量签到耗时。
-      await runBatch((id) => checkin(id));
+      await runBatch((id) => checkin(id, { batch: true }));
       toast("批量签到完成");
     } finally {
       $("batchBtn").disabled = false;
@@ -818,7 +1061,7 @@ async function init() {
     try {
       const r = await send({ type: "autoRun" });
       if (r && r.ok && r.summary) {
-        toast("执行完成：成功 " + r.summary.ok + " / 已签 " + r.summary.already + " / 失败 " + r.summary.fail);
+        let doneMsg = "执行完成：成功 " + r.summary.ok + " / 已签 " + r.summary.already + " / 失败 " + r.summary.fail; if (r.summary.aliveOk || r.summary.aliveFail) doneMsg += "；保活成功 " + r.summary.aliveOk + " / 失败 " + r.summary.aliveFail; toast(doneMsg);
       } else {
         toast("没有需要签到的平台", true);
       }

@@ -112,6 +112,37 @@
           <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
         </div>
+        <div class="keepalive-box">
+          <label class="keepalive-head">
+            <span class="keepalive-title">自动调用 API（防僵尸号）</span>
+            <span class="switch"><input type="checkbox" id="keepAliveEnabled" /><span class="track"></span></span>
+          </label>
+          <div id="keepAliveFields" class="form-grid keepalive-fields">
+            <label class="full">调用网址<input id="keepAliveUrl" type="url" placeholder="https://example.com/v1/chat/completions" /></label>
+            <label>API Key<input id="keepAliveKey" type="password" autocomplete="off" placeholder="调用模型用的 API Key（sk-…）" /></label>
+            <label>上游格式
+              <select id="keepAliveFormat">
+                <option value="chat">OpenAI chat/completions</option>
+                <option value="message">Anthropic messages</option>
+                <option value="response">OpenAI responses</option>
+              </select>
+            </label>
+            <div class="full keepalive-model-block">
+  <label class="keepalive-model-label">模型（可选）</label>
+  <span class="keepalive-model-row">
+    <input id="keepAliveModel" placeholder="留空默认 deepseek v4 flash；不支持时自动检测可用模型" />
+    <button type="button" class="btn btn-light keepalive-pick-btn" id="keepAlivePickBtn">选择模型</button>
+  </span>
+  <div id="keepAliveModelList" class="keepalive-model-list" role="listbox" aria-label="可用模型"></div>
+</div>
+            <p class="full keepalive-note">开启后，一键批量签到/定时自动签到会先调用一次该 API（每天最多一次）再签到；若模型不被站点支持，将自动读取 /v1/models 随机选用可用对话模型。API Key 留空时使用上方「访问令牌」（Cookie/Agent Router 模式必须填写）。</p>
+            <div class="full keepalive-test-row">
+              <button type="button" class="btn btn-dark" id="keepAliveTestBtn">检测API调用</button>
+              <span class="keepalive-test-tip">真实发送一次最小模型请求，验证配置是否可用</span>
+            </div>
+            <div id="keepAliveStatus" class="connection-status full" role="status"></div>
+          </div>
+        </div>
         <div id="connectionStatus" class="connection-status" role="status"></div>
         <div class="card-actions" style="justify-content:flex-end;margin-top:16px">
           <button type="button" class="btn btn-light" id="cancelBtn">取消</button>

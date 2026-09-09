@@ -253,3 +253,30 @@ select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-i
   .model-table .m-groups,.model-table thead th:last-child{display:none}
   .model-table-wrap{max-height:52vh}
 }
+
+/* ---------- 自动调用 API（防僵尸号）保活 ---------- */
+.keepalive-box{display:flex;flex-direction:column;gap:9px;margin:14px 0 2px}
+.keepalive-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0;padding:10px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer}
+.keepalive-title{font-size:13px;font-weight:650;color:var(--ink)}
+.keepalive-fields{padding:12px;background:var(--tint);border:1px dashed var(--border);border-radius:var(--radius-sm)}
+.keepalive-fields label{display:block;margin:0;color:var(--muted);font-size:12px;font-weight:650}
+.keepalive-fields input,.keepalive-fields select{width:100%}
+.keepalive-note{grid-column:1/-1;margin:2px 0 0;color:var(--faint);font-size:11px;line-height:1.6}
+.badge-keepalive{color:var(--accent);background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.34)}
+
+/* 保活调用检测按钮 */
+.keepalive-test-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:2px 0 0}
+.keepalive-test-row .btn{margin:0}
+.keepalive-test-tip{font-size:11px;color:var(--faint)}
+#keepAliveStatus{margin-top:8px;grid-column:1/-1}
+/* 保活：选择模型 */
+.keepalive-model-block{display:flex;flex-direction:column;gap:6px}
+.keepalive-model-label{color:var(--faint);font-size:12px;font-weight:600}
+.keepalive-model-row{display:flex;gap:8px;align-items:center}
+.keepalive-model-row input{flex:1;min-width:0}
+.keepalive-pick-btn{flex-shrink:0;padding:8px 14px;font-size:12px;white-space:nowrap}
+.keepalive-model-list{display:flex;flex-wrap:wrap;gap:6px;max-height:134px;overflow:auto;padding:2px 0 0}
+.keepalive-model-list.loading{display:block;color:var(--faint);font-size:12px;line-height:1.6}
+.keepalive-model-chip{border:1px solid var(--border-soft);background:var(--surface-2);color:var(--ink);border-radius:999px;padding:5px 11px;font-size:12px;line-height:1.2;cursor:pointer;transition:.15s}
+.keepalive-model-chip:hover{border-color:var(--accent);color:var(--accent)}
+.keepalive-model-note{color:var(--faint);font-size:12px}

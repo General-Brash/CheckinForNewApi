@@ -10,6 +10,9 @@ const KEY_LASTAUTO = "nacheckin.lastAuto";
 const KEY_AUTOSTATE = "nacheckin.autoState";
 const KEY_AGENTROUTER_REAUTH = "nacheckin.agentRouterReauth";
 const ALARM_NAME = "nacheckin.auto";
+const DEFAULT_KEEPALIVE_MODEL = "deepseek v4 flash";
+const KEEPALIVE_FORMATS = ["chat", "message", "response"];
+const KEEPALIVE_PATHS = { chat: "/v1/chat/completions", message: "/v1/messages", response: "/v1/responses" };
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function todayStr() {
@@ -1864,26 +1867,288 @@ function isAlreadyCheckinMessage(message) {
   return /已签到|已经签到|签到过|重复签到|already\s+(?:checked\s+in|signed\s+in|today)|today\s+already/i.test(String(message || ""));
 }
 
+// ---------- 自动调用 API（防僵尸号保活：仅批量/自动签到链路触发） ----------
+const normalizeKeepAlive = (ka) => {
+  ka = (ka && typeof ka === "object") ? ka : {};
+  return {
+    enabled: !!ka.enabled,
+    url: String(ka.url || "").trim(),
+    key: String(ka.key || ""),
+    format: KEEPALIVE_FORMATS.indexOf(ka.format) >= 0 ? ka.format : "chat",
+    model: String(ka.model || "").trim(),
+    lastDate: String(ka.lastDate || "").trim(),
+  };
+};
+const getKeepAlive = (p) => normalizeKeepAlive(p && p.keepAlive);
+const needsKeepAliveToday = (p) => {
+  const ka = getKeepAlive(p);
+  return !!(ka.enabled && ka.lastDate !== todayStr());
+};
+function keepAliveDefaultUrl(p, format) {
+  const base = String((p && p.baseUrl) || "").trim().replace(/\/+$/, "");
+  return base ? base + (KEEPALIVE_PATHS[format] || KEEPALIVE_PATHS.chat) : "";
+}
+async function keepAliveFetch(url, init) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  try {
+    return await fetch(url, Object.assign({}, init, { signal: ctl.signal }));
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("请求超时（15 秒）");
+    throw new Error("网络请求失败：" + ((e && e.message) || "无法连接站点"));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function keepAliveHeaders(format, key) {
+  const headers = { Accept: "application/json, text/plain, */*", "Content-Type": "application/json" };
+  if (format === "message") {
+    headers["anthropic-version"] = "2023-06-01";
+    if (key) headers["x-api-key"] = key;
+  } else if (key) {
+    headers["Authorization"] = "Bearer " + key;
+  }
+  return headers;
+}
+function keepAliveBody(format, model) {
+  if (format === "message") return { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+  if (format === "response") return { model, input: "hi", max_output_tokens: 1 };
+  return { model, messages: [{ role: "user", content: "hi" }], max_tokens: 1 };
+}
+async function keepAliveResponseInfo(res) {
+  let text = "";
+  try { text = await res.text(); } catch {}
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch {}
+  let error = "";
+  if (body) {
+    const e = body.error;
+    error = (e && (typeof e === "string" ? e : (e.message || e.code || ""))) || body.message || "";
+  }
+  if (!error) error = String(text || "").slice(0, 200);
+  error = String(error).slice(0, 200);
+  return { ok: res.ok, status: res.status, error: error ? "HTTP " + res.status + "：" + error : "HTTP " + res.status };
+}
+function isModelRejection(status, message) {
+  if (status === 400 || status === 404 || status === 422) return true;
+  const msg = String(message || "");
+  if (/model not found|no such model|invalid model|model_not_found|does not exist|不支持|不存在|not support/i.test(msg)) return true;
+  // NewAPI/one-api 渠道无可用上游（HTTP 503 无可用渠道等）同样视为该模型不可用，触发自动换用可用模型
+  if (status >= 400 && /无可用渠道|无可用模型|无可用通道|无可用|no available channel|no channel available|no available|distributor|渠道/i.test(msg)) return true;
+  return false;
+}
+async function attemptKeepAlive(format, url, key, model) {
+  const res = await keepAliveFetch(url, {
+    method: "POST",
+    credentials: "omit",
+    headers: keepAliveHeaders(format, key),
+    body: JSON.stringify(keepAliveBody(format, model)),
+  });
+  const info = await keepAliveResponseInfo(res);
+  return info.ok ? { ok: true, model } : { ok: false, status: info.status, message: info.error, model };
+}
+function keepAliveModelsRoot(rawUrl) {
+  let s = String(rawUrl || "").trim();
+  if (!s) return "";
+  // 去掉接口路径后缀（chat/completions、messages、responses）
+  s = s.replace(/\/(chat\/completions|messages|responses)\/?$/, "");
+  let u;
+  try { u = new URL(s); } catch { return ""; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+  // 模型列表根地址：确保路径以 /v1 结尾（如 https://host/v1/chat/completions -> https://host/v1）
+  let path = u.pathname.replace(/\/+$/, "");
+  if (!path) path = "/v1";
+  else if (!/\/v1$/i.test(path)) path = path.replace(/\/+$/, "") + "/v1";
+  return u.origin + path;
+}
+async function fetchKeepAliveModels(format, key, url) {
+  const root = keepAliveModelsRoot(url);
+  if (!root) throw new Error("无法根据调用网址推导模型列表地址");
+  const headers = { Accept: "application/json, text/plain, */*" };
+  if (format === "message") {
+    headers["anthropic-version"] = "2023-06-01";
+    if (key) headers["x-api-key"] = key;
+  } else if (key) {
+    headers["Authorization"] = "Bearer " + key;
+  }
+  const res = await keepAliveFetch(root + "/models", { method: "GET", credentials: "omit", headers });
+  let text = "";
+  try { text = await res.text(); } catch {}
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok) {
+    const msg = body && ((body.error && (body.error.message || body.error.code)) || body.message);
+    throw new Error("读取模型列表失败 HTTP " + res.status + (msg ? "：" + msg : ""));
+  }
+  let list = [];
+  if (body) {
+    const data = Array.isArray(body.data) ? body.data : (Array.isArray(body.models) ? body.models : null);
+    if (data) list = data.map((m) => (m && typeof m === "object" ? m.id : null)).filter((x) => x != null);
+  }
+  return list.filter((id) => !/embedding|text-embed|tts|whisper|audio|speech|rerank|moderation|dall|gpt-image|sora|realtime|transcription|translation/i.test(String(id)));
+}
+async function retryKeepAliveWithModels(format, url, key, tried) {
+  let pool = [];
+  try {
+    pool = await fetchKeepAliveModels(format, key, url);
+  } catch (e) {
+    return { ok: false, tried: [], error: e && e.message ? e.message : "读取模型列表失败" };
+  }
+  pool = pool.filter((m) => tried.indexOf(m) < 0);
+  if (!pool.length) return { ok: false, tried: [], error: "站点模型列表为空或没有可用对话模型" };
+  const used = [];
+  let lastError = "";
+  const attempts = Math.min(3, pool.length);
+  for (let i = 0; i < attempts; i++) {
+    const pick = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+    used.push(pick);
+    try {
+      const r = await attemptKeepAlive(format, url, key, pick);
+      if (r.ok) return { ok: true, model: pick };
+      lastError = r.message || ("HTTP " + r.status);
+    } catch (e) {
+      lastError = e && e.message ? e.message : String(e);
+    }
+    if (i < attempts - 1) await wait(700);
+  }
+  return { ok: false, tried: used, error: lastError };
+}
+async function runKeepAliveCall(p) {
+  const ka = getKeepAlive(p);
+  if (!ka.enabled) return null;
+  const format = ka.format;
+  let url = ka.url || keepAliveDefaultUrl(p, format);
+  if (!url) return { ok: false, message: "未配置调用网址", status: 0 };
+  let key = ka.key || "";
+  if (!key && !isAgentRouterTokenMode(p) && p.authMode !== "cookie") {
+    key = String((p && p.accessToken) || "").trim();
+  }
+  if (!key) return { ok: false, message: "未填写 API Key（Cookie/Agent Router 模式必须填写）", status: 0 };
+  const tried = [];
+  let first = null;
+  try {
+    first = await attemptKeepAlive(format, url, key, ka.model || DEFAULT_KEEPALIVE_MODEL);
+  } catch (e) {
+    first = { ok: false, status: 0, message: e && e.message ? e.message : "调用失败", model: ka.model || DEFAULT_KEEPALIVE_MODEL };
+  }
+  tried.push(first.model);
+  if (first.ok) return { ok: true, model: first.model, message: "自动调用API成功" };
+  if (isModelRejection(first.status, first.message)) {
+    const fb = await retryKeepAliveWithModels(format, url, key, tried);
+    if (fb.ok) return { ok: true, model: fb.model, message: "自动调用API成功" };
+    const detail = (fb.tried && fb.tried.length)
+      ? "（已尝试模型：" + tried.concat(fb.tried).join("、") + (fb.error ? "；最近错误：" + fb.error : "") + "）"
+      : (fb.error ? "（" + fb.error + "）" : "");
+    return { ok: false, status: first.status, message: first.message + detail };
+  }
+  return { ok: false, status: first.status, message: first.message };
+}
+async function listKeepAliveModels(p) {
+  const ka = getKeepAlive(p);
+  if (!ka.enabled) return { ok: false, message: "请先开启「自动调用 API」开关" };
+  const format = ka.format;
+  let url = ka.url || keepAliveDefaultUrl(p, format);
+  if (!url) return { ok: false, message: "未配置调用网址" };
+  let key = ka.key || "";
+  if (!key && !isAgentRouterTokenMode(p) && p.authMode !== "cookie") {
+    key = String((p && p.accessToken) || "").trim();
+  }
+  if (!key) return { ok: false, message: "未填写 API Key（Cookie/Agent Router 模式必须填写）" };
+  try {
+    const models = await fetchKeepAliveModels(format, key, url);
+    if (!models.length) return { ok: false, message: "站点没有可用对话模型" };
+    return { ok: true, models };
+  } catch (e) {
+    return { ok: false, message: e && e.message ? e.message : "读取模型列表失败" };
+  }
+}
+async function runBatchCheckinOne(partial) {
+  if (!partial || partial.id == null) return await runCheckin(partial || {}, { reauth: true });
+  const cur = await getPlatforms();
+  const stored = cur.find((x) => x.id === partial.id);
+  if (!stored) return await runCheckin(partial, { reauth: true });
+  let alive = null;
+  if (needsKeepAliveToday(stored)) {
+    alive = await runKeepAliveCall(stored);
+    if (alive && alive.ok) {
+      const ka = getKeepAlive(stored);
+      stored.keepAlive = normalizeKeepAlive(Object.assign({}, ka, { lastDate: todayStr() }));
+      await savePlatforms(cur);
+    }
+  }
+  const r = await runCheckin(stored, { reauth: true });
+  const ka = getKeepAlive(stored);
+  if (alive) {
+    const part = alive.ok
+      ? "自动调用API成功" + (alive.model ? "（模型 " + alive.model + "）" : "")
+      : "自动调用API失败：" + alive.message + "（仍执行签到）";
+    r.message = part + "｜" + r.message;
+  }
+  if (ka.enabled) {
+    r.keepAlive = {
+      ok: alive ? !!alive.ok : null,
+      date: getKeepAlive(stored).lastDate,
+      message: alive ? (alive.ok ? "自动调用API成功" + (alive.model ? "（模型 " + alive.model + "）" : "") : "自动调用API失败：" + alive.message) : null,
+    };
+  }
+  return r;
+}
+async function collectAutoTodo(platforms) {
+  const unchecked = await findUncheckedPlatforms(platforms);
+  const todo = unchecked.slice();
+  const have = {};
+  for (const p of todo) have[p.id] = true;
+  for (const p of platforms) {
+    if (!have[p.id] && needsKeepAliveToday(p)) todo.push(p);
+  }
+  return todo;
+}
+
 // ---------- 批量/自动签到（Service Worker 内执行，可脱离弹窗） ----------
 async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null) {
   const settings = await getSettings();
   if (!settings.autoEnabled && !triggeredByUser) return { skipped: true };
-  const platforms = selectedPlatforms || await getPlatforms();
+  const explicitSelection = Array.isArray(selectedPlatforms);
+  const platforms = explicitSelection ? selectedPlatforms : await getPlatforms();
   if (!platforms.length) return { skipped: true };
-  const results = await Promise.all(platforms.map((p) => runCheckin(p, { reauth: true })));
-  let ok = 0, already = 0, fail = 0;
+  const today = todayStr();
+  const results = await Promise.all(platforms.map(async (p) => {
+    let alive = null;
+    if (needsKeepAliveToday(p)) {
+      alive = await runKeepAliveCall(p);
+      if (alive && alive.ok) {
+        const ka = getKeepAlive(p);
+        p.keepAlive = normalizeKeepAlive(Object.assign({}, ka, { lastDate: today }));
+      }
+    }
+    const alreadyToday = !!(p.stats && p.stats.checked_in_today && p.statsDate === today);
+    const r = explicitSelection && alreadyToday
+      ? { ok: true, message: "今日已签到", data: null, _alreadySkipped: true }
+      : await runCheckin(p, { reauth: true });
+    if (alive) {
+      const part = alive.ok
+        ? "自动调用API成功" + (alive.model ? "（模型 " + alive.model + "）" : "")
+        : "自动调用API失败：" + alive.message + "（仍执行签到）";
+      r.message = part + "｜" + r.message;
+    }
+    return { platform: p, result: r, alive, kind: r._alreadySkipped ? "already" : classify(r) };
+  }));
+  let ok = 0, already = 0, fail = 0, aliveOk = 0, aliveFail = 0;
   const list = [];
   const cur = await getPlatforms();
-  for (let i = 0; i < platforms.length; i++) {
-    const r = results[i];
-    const kind = classify(r);
+  for (let i = 0; i < results.length; i++) {
+    const item = results[i];
+    const p = item.platform;
+    const r = item.result;
+    const kind = item.kind;
     if (kind === "ok") ok++;
     else if (kind === "already") already++;
     else fail++;
-    list.push({ id: platforms[i].id, name: platforms[i].name, ok: r.ok, message: r.message, kind });
-    // 回写状态（统一一次落盘，避免并发读写竞争）
-    const idx = cur.findIndex((x) => x.id === platforms[i].id);
+    if (item.alive) { if (item.alive.ok) aliveOk++; else aliveFail++; }
+    list.push({ id: p.id, name: p.name, ok: r.ok, message: r.message, kind, aliveOk: !!(item.alive && item.alive.ok), aliveFail: !!(item.alive && !item.alive.ok) });
+    const idx = cur.findIndex((x) => x.id === p.id);
     if (idx >= 0) {
+      if (item.alive) cur[idx].keepAlive = normalizeKeepAlive(p.keepAlive);
       cur[idx].message = r.message;
       cur[idx].error = r.ok ? "" : r.message;
       cur[idx].lastCheckinAt = new Date().toISOString();
@@ -1892,7 +2157,7 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
         cur[idx].stats = cur[idx].stats || {};
         if (r.data && r.data.stats) Object.assign(cur[idx].stats, r.data.stats);
         cur[idx].stats.checked_in_today = true;
-        cur[idx].statsDate = todayStr();
+        cur[idx].statsDate = today;
       }
     }
   }
@@ -1902,16 +2167,17 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
     ok,
     already,
     fail,
+    aliveOk,
+    aliveFail,
     total: platforms.length,
     list,
   };
   await setStore({ [KEY_LASTAUTO]: summary });
   if (settings.notify !== false) {
     const title = (triggeredByUser ? "手动" : "自动") + "签到完成";
-    notify(
-      title,
-      `共 ${summary.total} 个站点：成功 ${ok}，已签 ${already}，失败 ${fail}`,
-    );
+    let body = `共 ${summary.total} 个站点：成功 ${ok}，已签 ${already}，失败 ${fail}`;
+    if (aliveOk || aliveFail) body += `；保活成功 ${aliveOk}，失败 ${aliveFail}`;
+    notify(title, body);
   }
   return summary;
 }
@@ -1960,14 +2226,15 @@ async function checkScheduledAuto() {
     await saveAutoState(date, "done");
     return { skipped: true };
   }
-  const unchecked = await findUncheckedPlatforms(platforms);
-  if (!unchecked.length) {
+  const todo = await collectAutoTodo(platforms);
+  if (!todo.length) {
     await saveAutoState(date, "done");
     return { skipped: true, already: true };
   }
+  const needCheckin = todo.some((p) => !(p.stats && p.stats.checked_in_today && p.statsDate === todayStr()));
   if (settings.autoApprove) {
     await saveAutoState(date, "approved");
-    await runAutoCheckin(false, unchecked);
+    await runAutoCheckin(false, todo);
     await saveAutoState(date, "done");
     return { started: true, automatic: true };
   }
@@ -1977,7 +2244,7 @@ async function checkScheduledAuto() {
     type: "basic",
     iconUrl: chrome.runtime.getURL("icons/icon128.png"),
     title: "到达自动签到时间",
-    message: "今天还有站点未签到，是否立即执行一键签到？",
+    message: needCheckin ? "今天还有站点未签到，是否立即执行一键签到？" : "今天还有站点需要自动调用 API 保活，是否立即执行？",
     priority: 2,
     buttons: [{ title: "允许签到" }, { title: "跳过今天" }],
   }).catch(() => {});
@@ -2008,9 +2275,9 @@ chrome.notifications.onButtonClicked.addListener(async (notificationId, buttonIn
   }
   const settings = await getSettings();
   if (!settings.autoEnabled || date !== todayStr()) return;
-  const unchecked = await findUncheckedPlatforms(await getPlatforms());
+  const todo = await collectAutoTodo(await getPlatforms());
   await saveAutoState(date, "approved");
-  if (unchecked.length) await runAutoCheckin(false, unchecked);
+  if (todo.length) await runAutoCheckin(false, todo);
   await saveAutoState(date, "done");
 });
 
@@ -2052,8 +2319,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(await runModelInsight(msg.platform, msg.hours));
       } else if (msg.type === "modelDetail") {
         sendResponse(await runModelDetail(msg.platform, msg.model, msg.hours));
+      } else if (msg.type === "testKeepAlive") {
+        const aliveProbe = getKeepAlive(msg.platform).enabled ? await runKeepAliveCall(msg.platform) : null;
+        sendResponse(aliveProbe ? aliveProbe : { ok: false, message: "请先开启自动调用 API" });
+      } else if (msg.type === "keepAliveModels") {
+        sendResponse(await listKeepAliveModels(msg.platform));
       } else if (msg.type === "checkin") {
-        const r = await runCheckin(msg.platform, { reauth: msg.reauth !== false });
+        const r = msg.batch
+          ? await runBatchCheckinOne(msg.platform)
+          : await runCheckin(msg.platform, { reauth: msg.reauth !== false });
         sendResponse(r);
       } else if (msg.type === "autoRun") {
         const summary = await runAutoCheckin(true);
