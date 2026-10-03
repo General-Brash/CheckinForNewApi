@@ -4,6 +4,8 @@ const KEY_SETTINGS = "nacheckin.settings";
 let platforms = [];
 let editingId = null;
 let connectionPromise = null;
+let connectionConfig = null;
+let connectionRequestId = 0;
 let deletingId = null;
 let keepAliveTestPromise = null;
 let keepAlivePickPromise = null;
@@ -86,7 +88,7 @@ function toggleTheme(){
 }
 
 // ---------- 与后台通讯 ----------
-function send(msg) {
+function sendRaw(msg) {
   return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage(msg, (resp) => {
@@ -98,8 +100,30 @@ function send(msg) {
     }
   });
 }
-const slim = (p) => ({ baseUrl: p.baseUrl, userId: p.userId, accessToken: p.accessToken, authMode: p.authMode });
-const slimFull = (p) => ({ id: p.id, baseUrl: p.baseUrl, userId: p.userId, accessToken: p.accessToken, authMode: p.authMode, keepAlive: normalizeKeepAlive(p.keepAlive) });
+const AUTH_CONFIG = globalThis.NACheckinAuth;
+const AUTH_MODES = AUTH_CONFIG.modes;
+const isAgentRouterMode = (p) => AUTH_CONFIG.isAgentRouterMode(p.authMode);
+const AUTH_REQUEST_TYPES = new Set(["test", "stats", "account", "checkin", "modelInsight", "modelDetail", "testKeepAlive", "keepAliveModels", "savePlatforms", "autoRun"]);
+// 修改源码后，现有扩展后台可能仍运行旧代码。先握手，不能将新模式交给旧 token 校验。
+// 不缓存握手结果：同一页面存活期间 Service Worker 也可能更新/恢复。
+async function send(msg) {
+  if (AUTH_REQUEST_TYPES.has(msg.type)) {
+    const capabilities = await sendRaw({ type: "getCapabilities" });
+    const mode = msg.platform && (msg.platform.authMode || "token");
+    if (!capabilities || !capabilities.ok || capabilities.authBuild !== AUTH_CONFIG.build ||
+        !Array.isArray(capabilities.authModes) || (mode && !capabilities.authModes.includes(mode))) {
+      return { ok: false, code: "BACKGROUND_UPDATE_REQUIRED", message: "扩展界面与后台版本不一致，请在扩展管理页点击本扩展的「重新加载」，再关闭并重新打开侧边栏（不要只刷新站点网页）" };
+    }
+  }
+  return await sendRaw(msg);
+}
+const isVisitOnly = (p) => NACheckinAuth.isVisitOnly(p);
+const slim = (p) => ({
+  id: p.id, baseUrl: p.baseUrl, userId: p.userId, authMode: p.authMode, visitOnly: isVisitOnly(p),
+  accessToken: !p.authMode || p.authMode === "token" ? p.accessToken : "",
+  ...(p.authMode === "password" ? { loginUsername: String(p.loginUsername || "").trim(), loginPassword: p.loginPassword } : {}),
+});
+const slimFull = (p) => ({ id: p.id, ...slim(p), keepAlive: normalizeKeepAlive(p.keepAlive) });
 const getStats = (p, month) =>
   send({ type: "stats", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 const doCheckin = (p, opts = {}) =>
@@ -119,21 +143,28 @@ function validatePlatform(p) {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
+  if (p.authMode && !AUTH_MODES.includes(p.authMode)) throw new Error("不支持的鉴权方式");
   const ka = normalizeKeepAlive(p.keepAlive);
   if (ka.enabled) {
     if (ka.url && !safeHttpUrl(ka.url))
       throw new Error("自动调用 API 的调用网址必须使用 HTTP/HTTPS");
     if (!ka.url && !p.baseUrl)
       throw new Error("开启自动调用 API 需要填写调用网址或站点地址");
-    if (!ka.key && (p.authMode === "cookie" || p.authMode === "agentrouter_token"))
-      throw new Error("Cookie/Agent Router 模式开启自动调用 API 时必须填写 API Key");
+    if (!ka.key && (p.authMode === "cookie" || p.authMode === "password" || isAgentRouterMode(p)))
+      throw new Error("Cookie/邮箱密码/Agent Router 模式开启自动调用 API 时必须填写 API Key");
   }
   if (p.authMode === "cookie") return p;
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
-  if (p.authMode === "agentrouter_token" && !/^\d+$/.test(String(p.userId || "").trim()))
+  if (isAgentRouterMode(p) && !/^\d+$/.test(String(p.userId || "").trim()))
     throw new Error("Agent Router 签到模式必须填写数字用户ID");
-  if (p.authMode === "agentrouter_token") return p;
+  if (isAgentRouterMode(p)) return p;
+  if (p.authMode === "password") {
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("邮箱密码登录必须使用无内嵌凭据的 HTTPS 地址");
+    if (!String(p.loginUsername || "").trim()) throw new Error("请填写邮箱或用户名");
+    if (!p.loginPassword) throw new Error("请填写登录密码");
+    return p;
+  }
   if (!(p.accessToken || "").trim()) throw new Error("请填写访问令牌");
   return p;
 }
@@ -164,8 +195,13 @@ function mergeStatsInto(id, data, message, ok, account) {
 // ---------- 渲染 ----------
 function status(p) {
   if (p.loading) return ["处理中", "badge-muted"];
+  if (isVisitOnly(p)) {
+    if (p.error) return ["访问失败", "badge-danger"];
+    return p.lastVisitDate === todayStr() ? ["今日已访问", "badge-success"] : ["仅访问", "badge-warning"];
+  }
   // checked_in_today 来自缓存，必须由 statsDate 锚定当天，否则跨天后视为待签到
   if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return ["今日已签到", "badge-success"];
+  if (p.reauthPending) return ["等待登录", "badge-warning"];
   if (p.error) return ["请求失败", "badge-danger"];
   return ["待签到", "badge-warning"];
 }
@@ -174,8 +210,8 @@ function render() {
   const grid = $("platformGrid");
   $("totalPlatforms").textContent = platforms.length;
   const today = todayStr();
-  $("checkedPlatforms").textContent = platforms.filter((p) => p.stats && p.stats.checked_in_today && p.statsDate === today).length;
-  $("monthCheckins").textContent = platforms.reduce((n, p) => n + ((p.stats && p.stats.checkin_count) || 0), 0);
+  $("checkedPlatforms").textContent = platforms.filter((p) => !isVisitOnly(p) && p.stats && p.stats.checked_in_today && p.statsDate === today).length;
+  $("monthCheckins").textContent = platforms.reduce((n, p) => n + ((!isVisitOnly(p) && p.stats && p.stats.checkin_count) || 0), 0);
   $("totalQuota").innerHTML =
     formatQuota(platforms.reduce((n, p) => n + (Number(p.account && p.account.available) || 0), 0)) + ' <small>$</small>';
 
@@ -206,7 +242,7 @@ function render() {
         "</div>" +
         '<p class="message' + (p.error ? " err" : "") + '">' + esc(p.message || p.note || "尚未获取最新统计") + "</p>" +
         '<div class="card-actions">' +
-        '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (p.loading ? " disabled" : "") + ">" + (p.loading ? "签到中…" : "立即签到") + "</button>" +
+        '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (p.loading ? " disabled" : "") + ">" + (isVisitOnly(p) ? (p.loading ? "访问中…" : "立即访问") : (p.loading ? "签到中…" : "立即签到")) + "</button>" +
         '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
         (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
         '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
@@ -221,17 +257,31 @@ function render() {
 async function checkin(id, options) {
   const p = platforms.find((x) => x.id === id);
   if (!p || p.loading) return;
+  const taskConfig = slim(p);
   p.loading = true;
   p.error = "";
   render();
   const r = await doCheckin(p, options || {});
+  const current = platforms.find((entry) => entry.id === id);
+  if (!current || !sameConnectionConfig(taskConfig, slim(current))) {
+    p.loading = false;
+    render();
+    toast("平台鉴权配置已变更，本次结果未覆盖当前账号", !r.ok);
+    return;
+  }
   if (r.keepAlive && typeof r.keepAlive.date === "string") {
     p.keepAlive = normalizeKeepAlive(Object.assign({}, normalizeKeepAlive(p.keepAlive), { lastDate: r.keepAlive.date }));
   }
   p.message = r.message;
   p.error = r.ok ? "" : r.message;
   // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
-  if (r.ok || isAlreadyCheckinMessage(r.message)) {
+  p.reauthPending = !!r.reauthRequired;
+  if (r.reauthRequired) p.reauthStartedAt = r.reauthStartedAt;
+  if (r.visited) {
+    p.lastVisitDate = r.lastVisitDate; p.lastVisitedAt = r.lastVisitedAt;
+    if (r.account) p.account = Object.assign({}, p.account || {}, r.account);
+  }
+  if (!r.visited && !isVisitOnly(p) && !r.reauthRequired && (r.ok || isAlreadyCheckinMessage(r.message))) {
     p.stats = p.stats || {};
     if (r.data && r.data.stats) Object.assign(p.stats, r.data.stats);
     p.stats.checked_in_today = true;
@@ -242,7 +292,7 @@ async function checkin(id, options) {
   toast(p.name + "：" + r.message, !r.ok);
   await savePlatforms();
   // Agent Router 已退出且 GitHub OAuth 尚未完成时，账户接口可能返回登录页。
-  if (r.ok && !r.reauthRequired) await refreshStats(id, true);
+  if (r.ok && !r.visited && !r.reauthRequired && !isVisitOnly(p)) await refreshStats(id, true);
 }
 
 async function fetchStats(id, btnEl) {
@@ -288,6 +338,8 @@ async function refreshAll() {
 // 指标来自站点自身按真实流量的采样统计，不需要调用模型，也不消耗额度。
 // 注意：success_rate 上游已是 0-100 的百分数，直接使用，不要再乘 100。
 const hasModelPanel = () => !!$("modelModal");
+let modelInsightRequest = 0;
+let modelDetailRequest = 0;
 let modelState = { platformId: null, hours: 24, rows: [], site: null, warnings: [], loading: false, detailModel: null };
 
 function fmtMs(v) {
@@ -389,11 +441,15 @@ function renderModelMeta() {
 async function loadModelInsight() {
   const p = platforms.find((x) => x.id === modelState.platformId);
   if (!p) return;
+  const request = ++modelInsightRequest;
+  ++modelDetailRequest;
+  const hours = modelState.hours;
   modelState.loading = true;
   modelState.detailModel = null;
   $("modelDetail").innerHTML = "";
   renderModelTable();
-  const r = await getModelInsight(p, modelState.hours);
+  const r = await getModelInsight(p, hours);
+  if (request !== modelInsightRequest || modelState.platformId !== p.id || modelState.hours !== hours || !$("modelModal").classList.contains("open")) return;
   modelState.loading = false;
   if (!r || !r.ok) {
     modelState.rows = [];
@@ -438,6 +494,8 @@ async function showModelDetail(model) {
   const p = platforms.find((x) => x.id === modelState.platformId);
   if (!p) return;
   const box = $("modelDetail");
+  const request = ++modelDetailRequest;
+  const hours = modelState.hours;
   // 再次点击同一行时收起明细
   if (modelState.detailModel === model) {
     modelState.detailModel = null;
@@ -448,9 +506,9 @@ async function showModelDetail(model) {
   modelState.detailModel = model;
   setActiveModelRow(model);
   box.innerHTML = '<div class="model-empty">正在读取「' + esc(model) + '」明细…</div>';
-  const r = await getModelDetail(p, model, modelState.hours);
+  const r = await getModelDetail(p, model, hours);
   // 期间用户已收起或切换到别的模型，丢弃本次结果
-  if (modelState.detailModel !== model) return;
+  if (request !== modelDetailRequest || modelState.detailModel !== model || modelState.platformId !== p.id || modelState.hours !== hours || !$("modelModal").classList.contains("open")) return;
   if (!r || !r.ok) {
     box.innerHTML = '<div class="model-empty err">' + esc((r && r.message) || "明细读取失败") + "</div>";
     return;
@@ -517,7 +575,10 @@ function formData() {
     name: $("name").value.trim(),
     baseUrl: $("baseUrl").value.trim().replace(/\/+$/, ""),
     userId: $("userId").value.trim(),
-    accessToken: $("accessToken").value.trim(),
+    accessToken: $("authMode").value === "token" ? $("accessToken").value.trim() : "",
+    loginUsername: $("authMode").value === "password" ? $("loginUsername").value.trim() : "",
+    loginPassword: $("authMode").value === "password" ? $("loginPassword").value : "",
+    visitOnly: $("visitOnly").checked,
     note: $("note").value.trim(),
     authMode: $("authMode") ? $("authMode").value : "token",
     keepAlive: Object.assign({}, normalizeKeepAlive(prev && prev.keepAlive), keepAliveFromForm()),
@@ -525,12 +586,16 @@ function formData() {
 }
 
 function openModal(p) {
+  invalidateConnectionTest();
   editingId = p ? p.id : null;
   $("modalTitle").textContent = p ? "编辑平台" : "添加平台";
   $("name").value = p ? p.name || "" : "";
   $("baseUrl").value = p ? p.baseUrl || "" : "";
   $("userId").value = p ? p.userId || "" : "";
   $("accessToken").value = p ? p.accessToken || "" : "";
+  $("loginUsername").value = p ? p.loginUsername || "" : "";
+  $("loginPassword").value = p ? p.loginPassword || "" : "";
+  $("visitOnly").checked = isVisitOnly(p);
   $("note").value = p ? p.note || "" : "";
   const keepKa = normalizeKeepAlive(p && p.keepAlive);
   $("keepAliveEnabled").checked = keepKa.enabled;
@@ -542,7 +607,7 @@ function openModal(p) {
   syncKeepAliveFields();
   // Agent Router 使用网站原生退出与 GitHub OAuth 登录回调签到。
   if (p && p.authMode) {
-    $("authMode").value = ["token", "cookie", "agentrouter_token"].includes(p.authMode) ? p.authMode : "token";
+    $("authMode").value = AUTH_MODES.includes(p.authMode) ? p.authMode : "token";
   } else {
     const u = $("baseUrl").value.trim();
     $("authMode").value = /agentrouter\.org|ps\.air-outer\.com/i.test(u) ? "agentrouter_token" : "token";
@@ -560,22 +625,30 @@ function openModal(p) {
 // 鉴权方式切换：Cookie 模式时令牌/用户ID可留空，并提示
 function toggleAuthFields() {
   const mode = $("authMode").value;
-  const isCookie = mode === "cookie";
-  const isAgentRouterToken = mode === "agentrouter_token";
-  const tokenInput = $("accessToken");
-  const userIdInput = $("userId");
-  tokenInput.required = !isCookie && !isAgentRouterToken;
-  const tokenField = $("accessTokenField");
-  if (tokenField) tokenField.style.display = isCookie || isAgentRouterToken ? "none" : "";
-  userIdInput.required = isAgentRouterToken;
-  const hint = $("authHint");
-  if (hint) {
-    hint.textContent = isCookie
-      ? "Cookie 模式：需已在浏览器登录该站点。agentrouter.org 签到后会在临时标签页自动发起 GitHub 重新登录，成功进入首页后自动关闭；若 GitHub 要求验证码或授权，请手动完成。"
-      : isAgentRouterToken
-        ? "Agent Router 模式：填写数字用户ID，并确保浏览器已登录对应账号；插件会退出当前会话并使用 GitHub 重新登录，签到结果由登录回调返回。"
+  const password = mode === "password";
+  const agent = isAgentRouterMode({ authMode: mode });
+  $("visitOnlyField").style.display = "";
+  const visit = $("visitOnly").checked;
+  $("keepAliveEnabled").disabled = false;
+  syncKeepAliveFields();
+  $("testBtn").textContent = "检测连接";
+  $("accessToken").required = mode === "token";
+  $("accessTokenField").style.display = mode === "token" ? "" : "none";
+  $("loginUsernameField").style.display = password ? "" : "none";
+  $("loginPasswordField").style.display = password ? "" : "none";
+  $("loginUsername").required = password;
+  $("loginPassword").required = password;
+  $("userId").required = agent;
+  const provider = mode === "agentrouter_linuxdo" ? "Linux DO" : "GitHub";
+  $("authHint").textContent = visit
+    ? "仅访问：正常登录后刷新首页一次，读取最新额度并更新卡片后关闭临时页；只跳过签到接口，额度、模型及已配置的保活保持正常。" + (password ? "邮箱密码会自动补登录；验证码需手动完成。" : agent ? provider + " 会启动本站 OAuth 登录，必要时请手动授权。" : "Cookie/令牌不能代替网页登录；会话失效时需在打开的页面手动登录。") + "登录或额度读取失败时保留页面；检测和保存会正常验证登录及额度，不代表签到成功。"
+    : password
+    ? "邮箱密码模式：仅支持 HTTPS，扩展会在本站 /login 页面打开邮箱/用户名表单并填写登录。密码仅存本地（未加密），导出不含密码；验证码需手动完成。"
+    : agent
+      ? "Agent Router 模式：填写数字用户ID，确保浏览器已登录对应账号；扩展会退出当前会话并通过 " + provider + " 重新登录。只有登录回调确认签到后才标记成功；Linux DO 本轮匹配的“允许”会自动点击，其他授权、登录或验证码需手动完成。"
+      : mode === "cookie"
+        ? "Cookie 模式：需已在浏览器登录该站点；agentrouter.org 使用 GitHub 重登录签到，需要授权或验证码时请手动完成。"
         : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
-  }
 }
 
 function syncKeepAliveFields() {
@@ -613,34 +686,47 @@ function connectionStatus(text, type) {
   el.className = "connection-status show " + (type || "loading");
 }
 
+function sameConnectionConfig(a, b) {
+  return ["baseUrl", "authMode", "userId", "accessToken", "loginUsername", "loginPassword", "visitOnly"].every((key) => a[key] === b[key]);
+}
+function invalidateConnectionTest() {
+  ++connectionRequestId;
+  connectionPromise = null;
+  connectionConfig = null;
+  $("testBtn").disabled = false;
+  connectionStatus("", "");
+  $("connectionStatus").className = "connection-status";
+}
 async function testConnection() {
-  if (connectionPromise) return connectionPromise;
   const data = formData();
-  try {
-    validatePlatform(data);
-  } catch (e) {
-    connectionStatus(e.message, "error");
-    throw e;
-  }
+  if (connectionPromise && connectionConfig && sameConnectionConfig(data, connectionConfig)) return connectionPromise;
+  try { validatePlatform(data); }
+  catch (e) { connectionStatus(e.message, "error"); throw e; }
+  const requestId = ++connectionRequestId;
+  connectionConfig = data;
+  const current = () => requestId === connectionRequestId && sameConnectionConfig(data, formData());
   $("testBtn").disabled = true;
-  connectionStatus("正在检测站点和令牌，请稍候…");
+  connectionStatus(data.authMode === "password" ? "正在检测登录会话，必要时将打开本站登录表单…" : "正在检测站点连接，请稍候…");
   connectionPromise = (async () => {
     try {
       const r = await send({ type: "test", platform: slim(data), month: $("monthInput").value || currentMonth() });
+      if (!current()) throw new Error("鉴权配置已变更，请按当前配置重新检测连接");
       if (r.ok) {
         const needsUserId = data.userId ? "当前站点已使用用户ID鉴权。" : "当前站点无需用户ID即可连接。";
-        connectionStatus("连接成功：" + (r.message || "签到接口可用") + " " + needsUserId, "success");
+        if (r.needsLogin) connectionStatus(r.message, "loading");
+        else connectionStatus("连接成功：" + (r.message || "账户接口可用") + " " + needsUserId, "success");
         return r;
       }
-      const hint = !data.userId ? " 若该站点要求 New-Api-User，请填写用户ID后重试。" : "";
-      connectionStatus("连接失败：" + r.message + hint, "error");
-      throw new Error(r.message);
+      throw new Error(r.message || "未收到有效检测结果");
     } catch (e) {
-      connectionStatus("连接失败：" + (e.message || "未知错误"), "error");
+      if (current()) connectionStatus("连接失败：" + (e.message || "未知错误"), "error");
       throw e;
     } finally {
-      connectionPromise = null;
-      $("testBtn").disabled = false;
+      if (requestId === connectionRequestId) {
+        connectionPromise = null;
+        connectionConfig = null;
+        $("testBtn").disabled = false;
+      }
     }
   })();
   return connectionPromise;
@@ -821,7 +907,7 @@ async function renderLastAuto() {
   const el = $("lastAutoMsg");
   if (r && r.last) {
     const t = new Date(r.last.time);
-    let lastTxt = "上次签到：" + t.toLocaleString() + " · 成功 " + r.last.ok + " / 已签 " + r.last.already + " / 失败 " + r.last.fail;
+    let lastTxt = "上次签到：" + t.toLocaleString() + " · 成功 " + r.last.ok + " / 已签 " + r.last.already + " / 失败 " + r.last.fail + (r.last.pending ? " / 等待登录 " + r.last.pending : "") + (r.last.visited ? " / 已访问 " + r.last.visited : "");
     if (r.last.aliveOk || r.last.aliveFail) lastTxt += " · 保活成功 " + r.last.aliveOk + " / 失败 " + r.last.aliveFail;
     el.textContent = lastTxt;
   } else {
@@ -831,7 +917,7 @@ async function renderLastAuto() {
 
 // ---------- 导入/导出 ----------
 function exportConfig() {
-  const clean = platforms.map(({ loading, error, ...rest }) => rest);
+  const clean = platforms.map(({ loading, error, loginPassword, reauthPending, reauthStartedAt, reauthCompletedAt, ...rest }) => rest);
   const blob = new Blob([JSON.stringify(clean, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -844,21 +930,31 @@ async function importConfig(file) {
   try {
     const data = JSON.parse(await file.text());
     if (!Array.isArray(data)) throw new Error("配置格式必须是数组");
-    platforms = data.map((p) => ({
-      id: /^[A-Za-z0-9_-]{1,64}$/.test(p.id) ? p.id : Date.now().toString() + Math.random().toString(16).slice(2, 8),
-      authMode: ["token", "cookie", "agentrouter_token"].includes(p.authMode) ? p.authMode : "token",
-      name: p.name || "",
-      baseUrl: p.baseUrl || "",
-      userId: String(p.userId || ""),
-      accessToken: p.accessToken || "",
-      note: p.note || "",
-      keepAlive: normalizeKeepAlive(p.keepAlive),
-      stats: p.stats || {},
-      message: p.message || "",
-    }));
+    const ids = new Set();
+    platforms = data.map((p) => {
+      if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("平台配置项必须是对象");
+      let id = typeof p.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(p.id) ? p.id : crypto.randomUUID();
+      if (ids.has(id)) id = crypto.randomUUID();
+      ids.add(id);
+      return {
+        id,
+        authMode: AUTH_MODES.includes(p.authMode) ? p.authMode : "token",
+        name: p.name || "",
+        baseUrl: p.baseUrl || "",
+        userId: String(p.userId || ""),
+        accessToken: p.accessToken || "",
+        loginUsername: p.authMode === "password" ? String(p.loginUsername || "").trim() : "",
+        visitOnly: p.visitOnly === true,
+        loginPassword: "", // 永远不信任导入文件里的密码；需要在本地重新填写。
+        note: p.note || "",
+        keepAlive: normalizeKeepAlive(p.keepAlive),
+        stats: p.stats || {},
+        message: p.message || "",
+      };
+    });
     await savePlatforms();
     render();
-    toast("已导入 " + platforms.length + " 个平台");
+    toast("已导入 " + platforms.length + " 个平台" + (platforms.some((p) => p.authMode === "password") ? "；邮箱密码平台需编辑补填密码" : ""));
   } catch (e) {
     toast("导入失败：" + e.message, true);
   }
@@ -873,10 +969,17 @@ function loadStorage() {
     });
   });
 }
-function savePlatforms() {
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ [KEY_PLATFORMS]: platforms }, resolve);
-  });
+async function savePlatforms() {
+  const stored = await new Promise((resolve) => chrome.storage.local.get(KEY_PLATFORMS, (res) => resolve(res[KEY_PLATFORMS] || [])));
+  for (const next of platforms) {
+    const previous = stored.find((p) => p.id === next.id);
+    if (next.reauthPending && previous && previous.reauthCompletedAt && Number(previous.reauthCompletedAt) >= Number(next.reauthStartedAt || 0) &&
+        next.authMode === previous.authMode && next.userId === previous.userId && next.baseUrl === previous.baseUrl) {
+      for (const key of ["reauthPending", "reauthCompletedAt", "message", "error", "stats", "statsDate", "account", "lastCheckinAt"]) next[key] = previous[key];
+    }
+  }
+  const r = await send({ type: "savePlatforms", platforms });
+  if (!r || !r.ok) throw new Error(r && r.message || "保存平台配置失败");
 }
 
 // ---------- 初始化 ----------
@@ -934,18 +1037,16 @@ async function init() {
     else if (action === "delete") removePlatform(id);
   });
 
-  $("authMode").onchange = toggleAuthFields;
+  $("authMode").onchange = () => { toggleAuthFields(); invalidateConnectionTest(); };
+  $("visitOnly").onchange = () => { toggleAuthFields(); invalidateConnectionTest(); };
+  for (const id of ["baseUrl", "userId", "accessToken", "loginUsername", "loginPassword"]) {
+    $(id).addEventListener("input", invalidateConnectionTest);
+  }
   if ($("keepAliveEnabled")) {
     $("keepAliveEnabled").addEventListener("change", syncKeepAliveFields);
     if ($("keepAliveFormat")) $("keepAliveFormat").addEventListener("change", onKeepAliveFormatChange);
   }
-  $("baseUrl").addEventListener("input", () => {
-    if (!editingId && $("authMode")) {
-      const u = $("baseUrl").value.trim();
-      const want = /agentrouter\.org|ps\.air-outer\.com/i.test(u) ? "agentrouter_token" : "token";
-      if ($("authMode").value !== want) { $("authMode").value = want; toggleAuthFields(); }
-    }
-  });
+  // 不根据地址输入自动覆盖用户主动选择的鉴权方式。
   $("addBtn").onclick = () => openModal();
   $("closeBtn").onclick = () => $("modal").classList.remove("open");
   $("cancelBtn").onclick = () => $("modal").classList.remove("open");
@@ -954,7 +1055,7 @@ async function init() {
   };
   $("testBtn").onclick = () => testConnection().catch(() => {});
   $("accessToken").addEventListener("blur", () => {
-    if ($("baseUrl").value.trim() && $("accessToken").value.trim()) testConnection().catch(() => {});
+    if ($("authMode").value === "token" && $("baseUrl").value.trim() && $("accessToken").value.trim()) testConnection().catch(() => {});
   });
   $("platformForm").onsubmit = async (e) => {
     e.preventDefault();
@@ -963,19 +1064,29 @@ async function init() {
     if (submit) submit.disabled = true;
     try {
       const r = await testConnection();
-      data.stats = r.data ? r.data.stats || {} : {};
+      if (!sameConnectionConfig(data, formData())) throw new Error("鉴权配置已变更，请重新检测后保存");
+      const previousConfig = editingId && platforms.find((p) => p.id === editingId);
+      const sameAccount = previousConfig && sameConnectionConfig(previousConfig, data);
+      data.stats = r.data ? r.data.stats || {} : sameAccount ? previousConfig.stats || {} : {};
+      if (r.account) data.account = r.account;
+      else if (!sameAccount) data.account = null; // 新账号不能继承另一账号的旧额度。
       if (r.data && r.data.max_quota != null) data.stats.max_quota = r.data.max_quota;
       if (editingId) {
-        Object.assign(platforms.find((p) => p.id === editingId) || {}, data);
+        const previous = platforms.find((p) => p.id === editingId) || {};
+        if (!sameConnectionConfig(previous, data)) {
+          previous.lastVisitDate = "";
+          previous.lastVisitedAt = "";
+        }
+        Object.assign(previous, data);
       } else {
         platforms.push({ id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(), ...data });
       }
       await savePlatforms();
       render();
       $("modal").classList.remove("open");
-      toast("连接检测成功，平台配置已保存");
-    } catch {
-      toast("保存前检测失败，请检查配置", true);
+      toast(r.needsLogin ? "配置已保存，执行任务时将登录对应账号（尚未验证登录）" : "连接检测成功，平台配置已保存");
+    } catch (e) {
+      toast(e && e.message || "保存前检测失败，请检查配置", true);
     } finally {
       if (submit) submit.disabled = false;
     }
@@ -997,6 +1108,7 @@ async function init() {
 
   if (hasModelPanel()) {
     const closeModel = () => {
+      ++modelInsightRequest; ++modelDetailRequest;
       $("modelModal").classList.remove("open");
       modelState.detailModel = null;
       $("modelDetail").innerHTML = "";
@@ -1061,7 +1173,7 @@ async function init() {
     try {
       const r = await send({ type: "autoRun" });
       if (r && r.ok && r.summary) {
-        let doneMsg = "执行完成：成功 " + r.summary.ok + " / 已签 " + r.summary.already + " / 失败 " + r.summary.fail; if (r.summary.aliveOk || r.summary.aliveFail) doneMsg += "；保活成功 " + r.summary.aliveOk + " / 失败 " + r.summary.aliveFail; toast(doneMsg);
+        let doneMsg = "执行完成：成功 " + r.summary.ok + " / 已签 " + r.summary.already + " / 失败 " + r.summary.fail + (r.summary.pending ? " / 等待登录 " + r.summary.pending : "") + (r.summary.visited ? " / 已访问 " + r.summary.visited : ""); if (r.summary.aliveOk || r.summary.aliveFail) doneMsg += "；保活成功 " + r.summary.aliveOk + " / 失败 " + r.summary.aliveFail; toast(doneMsg);
       } else {
         toast("没有需要签到的平台", true);
       }
@@ -1072,4 +1184,15 @@ async function init() {
     }
   };
 }
+// OAuth 回调由后台异步确认；侧边栏和宽屏页同步显示最终结果。
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes[KEY_PLATFORMS]) return;
+  const next = changes[KEY_PLATFORMS].newValue;
+  if (!Array.isArray(next)) return;
+  platforms = next.map((entry) => {
+    const previous = platforms.find((p) => p.id === entry.id);
+    return Object.assign(previous || {}, entry, { loading: !!(previous && previous.loading) });
+  });
+  render();
+});
 init();

@@ -99,7 +99,9 @@
           <label>鉴权方式
             <select id="authMode">
               <option value="token">访问令牌（默认）</option>
+              <option value="password">邮箱密码（邮箱或用户名登录）</option>
               <option value="agentrouter_token">Agent Router（GitHub 重登录签到）</option>
+              <option value="agentrouter_linuxdo">Agent Router（Linux DO 重登录签到）</option>
               <option value="cookie">登录 Cookie（浏览器已登录该站点）</option>
             </select>
           </label>
@@ -110,6 +112,9 @@
           <label>NewAPI 站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
           <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
           <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
+          <label id="loginUsernameField" style="display:none">邮箱 / 用户名<input id="loginUsername" autocomplete="username" placeholder="登录邮箱或用户名" /></label>
+          <label id="loginPasswordField" style="display:none">登录密码<input id="loginPassword" type="password" autocomplete="off" placeholder="仅存本地，导出不包含密码" /></label>
+          <label id="visitOnlyField" class="full"><span class="keepalive-head"><span>仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">登录后刷新首页一次，读取最新额度再关闭临时页；仅跳过签到接口，其他功能保持正常。失败时保留页面，不代表签到成功。</small></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
         </div>
         <div class="keepalive-box">
@@ -135,7 +140,7 @@
   </span>
   <div id="keepAliveModelList" class="keepalive-model-list" role="listbox" aria-label="可用模型"></div>
 </div>
-            <p class="full keepalive-note">开启后，一键批量签到/定时自动签到会先调用一次该 API（每天最多一次）再签到；若模型不被站点支持，将自动读取 /v1/models 随机选用可用对话模型。API Key 留空时使用上方「访问令牌」（Cookie/Agent Router 模式必须填写）。</p>
+            <p class="full keepalive-note">开启后，一键批量签到/定时自动签到会先调用一次该 API（每天最多一次）再签到；若模型不被站点支持，将自动读取 /v1/models 随机选用可用对话模型。API Key 留空时使用上方「访问令牌」（Cookie/邮箱密码/Agent Router 模式必须填写，绝不使用登录密码）。</p>
             <div class="full keepalive-test-row">
               <button type="button" class="btn btn-dark" id="keepAliveTestBtn">检测API调用</button>
               <span class="keepalive-test-tip">真实发送一次最小模型请求，验证配置是否可用</span>
@@ -166,6 +171,7 @@
   </div>
 
   <div id="toast"></div>
+  <script src="auth-config.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

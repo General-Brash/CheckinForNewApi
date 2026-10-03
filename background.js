@@ -4,12 +4,16 @@
 //   POST /api/user/checkin               -> 执行当日签到
 //   鉴权：Authorization: Bearer <系统访问令牌/PAT>，令牌唯一标识用户。
 
+importScripts("auth-config.js");
+const AUTH_CONFIG = globalThis.NACheckinAuth;
+
 const KEY_PLATFORMS = "nacheckin.platforms";
 const KEY_SETTINGS = "nacheckin.settings";
 const KEY_LASTAUTO = "nacheckin.lastAuto";
 const KEY_AUTOSTATE = "nacheckin.autoState";
 const KEY_AGENTROUTER_REAUTH = "nacheckin.agentRouterReauth";
 const ALARM_NAME = "nacheckin.auto";
+const OAUTH_ALARM_NAME = "nacheckin.oauth";
 const DEFAULT_KEEPALIVE_MODEL = "deepseek v4 flash";
 const KEEPALIVE_FORMATS = ["chat", "message", "response"];
 const KEEPALIVE_PATHS = { chat: "/v1/chat/completions", message: "/v1/messages", response: "/v1/responses" };
@@ -31,12 +35,34 @@ function getStore(key, fallback) {
   });
 }
 function setStore(obj) {
-  return new Promise((resolve) => {
-    chrome.storage.local.set(obj, () => resolve());
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set(obj, () => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message || "无法保存扩展配置"));
+      else resolve();
+    });
   });
 }
 const getPlatforms = () => getStore(KEY_PLATFORMS, []);
-const savePlatforms = (list) => setStore({ [KEY_PLATFORMS]: list });
+// 旧的批量/页面快照不能覆盖刚确认的 OAuth 结果。
+function preserveCompletedReauth(next, stored) {
+  if (!stored || !next.reauthPending || !stored.reauthCompletedAt ||
+      Number(stored.reauthCompletedAt) < Number(next.reauthStartedAt || 0) || next.authMode !== stored.authMode ||
+      String(next.userId || "") !== String(stored.userId || "") || next.baseUrl !== stored.baseUrl) return next;
+  return { ...next, reauthPending: false, reauthCompletedAt: stored.reauthCompletedAt, message: stored.message,
+    error: stored.error, stats: stored.stats, statsDate: stored.statsDate, account: stored.account, lastCheckinAt: stored.lastCheckinAt };
+}
+let platformWriteQueue = Promise.resolve();
+function mutatePlatforms(fn) {
+  const update = platformWriteQueue.then(async () => {
+    const current = await getPlatforms();
+    const next = await fn(current);
+    await setStore({ [KEY_PLATFORMS]: next });
+  });
+  platformWriteQueue = update.catch(() => {});
+  return update;
+}
+const savePlatforms = (list) => mutatePlatforms((current) => list.map((p) => preserveCompletedReauth(p, current.find((x) => x.id === p.id))));
 const getSettings = () =>
   getStore(KEY_SETTINGS, { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true });
 const saveSettings = (s) => setStore({ [KEY_SETTINGS]: s });
@@ -51,45 +77,128 @@ function validatePlatform(p) {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
+  if (p.authMode && !AUTH_CONFIG.modes.includes(p.authMode)) throw new Error("不支持的鉴权方式");
   if (p.authMode === "cookie") return; // Cookie 模式：仅需站点地址 + 浏览器已登录该站点
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
-  if (p.authMode === "agentrouter_token" && !/^\d+$/.test(String(p.userId || "").trim()))
+  if (isAgentRouterMode(p) && !/^\d+$/.test(String(p.userId || "").trim()))
     throw new Error("Agent Router 签到模式必须填写数字用户ID");
-  if (p.authMode === "agentrouter_token") return;
+  if (isAgentRouterMode(p)) return;
+  if (p.authMode === "password") {
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("邮箱密码登录必须使用无内嵌凭据的 HTTPS 地址");
+    if (!String(p.loginUsername || "").trim()) throw new Error("请填写邮箱或用户名");
+    if (typeof p.loginPassword !== "string" || !p.loginPassword) throw new Error("请填写登录密码");
+    return;
+  }
   if (!(p.accessToken || "").trim()) throw new Error("请填写访问令牌");
 }
 
-function isAgentRouterTokenMode(p) {
-  return !!p && p.authMode === "agentrouter_token";
+const isVisitOnly = (p) => AUTH_CONFIG.isVisitOnly(p);
+async function resolveSavedVisitOnly(p) {
+  if (!p || p.id == null) return p;
+  const stored = (await getPlatforms()).find((entry) => entry.id === p.id);
+  return isVisitOnly(stored) ? stored : p;
+}
+async function assertApiAllowed(p, reqPath = "/api/user/checkin") {
+  const current = await resolveSavedVisitOnly(p);
+  if (!isVisitOnly(p) && !isVisitOnly(current)) return;
+  // 仅访问只跳过签到动作，不禁止正常登录、额度、日志、模型或用户已配置的保活。
+  const pathOf = (path) => decodeURIComponent(new URL(path, current.baseUrl).pathname).replace(/\/+$/, "");
+  const path = pathOf(reqPath);
+  const custom = String(current.checkinPath || "").trim();
+  if (path === "/api/user/checkin" || (custom && !current.triggerSelf && path === pathOf(custom))) {
+    throw new Error("仅访问模式跳过签到接口，请使用立即访问");
+  }
 }
 
-function isAgentRouterGithubMode(p) {
-  return isAgentRouterTokenMode(p) ||
-    (!!p && p.authMode === "cookie" && /agentrouter\.org/i.test(String(p.baseUrl || "")));
+function sameTaskConfig(a, b) {
+  return isVisitOnly(a) === isVisitOnly(b) &&
+    ["baseUrl", "authMode", "userId", "loginUsername", "loginPassword"].every((key) => a[key] === b[key]);
 }
 
+function isSiteHost(base, host) {
+  try { return new URL(base).hostname.toLowerCase() === host; } catch { return false; }
+}
+// 两种显式 Agent Router 模式共享校验、账户检测及重登录链路，均不需要访问令牌。
+function isAgentRouterMode(p) {
+  return !!p && AUTH_CONFIG.isAgentRouterMode(p.authMode);
+}
+function isAgentRouterReauthMode(p) {
+  return isAgentRouterMode(p) || (!!p && p.authMode === "cookie" && isSiteHost(p.baseUrl, "agentrouter.org"));
+}
+function agentRouterProvider(p) { return AUTH_CONFIG.agentRouterProvider(p.authMode); }
+function agentRouterProviderLabel(provider) { return provider === "linuxdo" ? "Linux DO" : "GitHub"; }
 function isSelfTriggerMode(p) {
-  const base = String((p && p.baseUrl) || "");
-  return isAgentRouterTokenMode(p) ||
-    (!!p && p.authMode === "cookie" && (/agentrouter\.org|ps\.air-outer\.com/i.test(base) || !!p.triggerSelf));
+  return isAgentRouterReauthMode(p) || (!!p && p.authMode === "password" && isSiteHost(p.baseUrl, "agentrouter.org")) ||
+    (!!p && p.authMode === "cookie" && (isSiteHost(p.baseUrl, "ps.air-outer.com") || !!p.triggerSelf));
 }
 
 function verifyConfiguredUser(p, body) {
   const configured = String((p && p.userId) || "").trim();
   const actual = body && body.data && body.data.id != null ? String(body.data.id) : "";
   if (configured && actual && configured !== actual) {
-    throw new Error("当前 Agent Router 用户ID为 " + actual + "，与配置的 " + configured + " 不一致");
+    throw accountMismatchError(configured, actual);
   }
   return body;
 }
 
+function accountMismatchError(configured, actual) {
+  const error = new Error("当前站点用户ID为 " + actual + "，与配置的 " + configured + " 不一致");
+  error.code = "ACCOUNT_MISMATCH";
+  return error;
+}
+
+// 按 tab 存储 OAuth 任务，迁移旧单槽记录。写入排队，避免批量登录覆盖其他站点。
+async function getAgentRouterPending() {
+  const stored = await getStore(KEY_AGENTROUTER_REAUTH, {});
+  if (!stored) return {};
+  if (stored.tabId != null) return { [stored.tabId]: { ...stored, provider: "github", oauthStarted: !!stored.githubClicked } };
+  return stored;
+}
+let agentRouterPendingWrite = Promise.resolve();
+function updateAgentRouterPending(tabId, pending) {
+  const update = agentRouterPendingWrite.then(async () => {
+    const all = await getAgentRouterPending();
+    if (pending) all[tabId] = { ...(all[tabId] || {}), ...pending }; else delete all[tabId];
+    await setStore({ [KEY_AGENTROUTER_REAUTH]: all });
+    if (Object.keys(all).length) chrome.alarms.create(OAUTH_ALARM_NAME, { periodInMinutes: 1 });
+    else await chrome.alarms.clear(OAUTH_ALARM_NAME);
+  });
+  agentRouterPendingWrite = update.catch(() => {});
+  return update;
+}
 async function isAgentRouterReauthPending(p) {
-  if (!isAgentRouterGithubMode(p)) return false;
-  const pending = await getStore(KEY_AGENTROUTER_REAUTH, null);
-  if (!pending || !pending.origin || Date.now() - Number(pending.createdAt || 0) > 6 * 60 * 1000) return false;
-  try { return pending.origin === new URL(p.baseUrl).origin; }
-  catch { return false; }
+  if (!isAgentRouterReauthMode(p)) return false;
+  const all = await getAgentRouterPending();
+  const origin = new URL(p.baseUrl).origin;
+  return Object.values(all).some((pending) => pending.origin === origin && Date.now() - Number(pending.createdAt || 0) <= 6 * 60 * 1000);
+}
+
+// 同一个站点只有一个网页登录会话；不同账号/提供方必须等上一轮回调处理结束再切换。
+function sameOauthTask(pending, platform) {
+  return (!pending.platformId || pending.platformId === platform.id) &&
+    (!pending.authMode || pending.authMode === platform.authMode) &&
+    pending.provider === agentRouterProvider(platform) &&
+    String(pending.userId || "").trim() === String(platform.userId || "").trim() &&
+    !!pending.visitOnly === isVisitOnly(platform);
+}
+async function waitForAgentRouterTurn(platform, reuse = false) {
+  const origin = new URL(platform.baseUrl).origin;
+  const deadline = Date.now() + 120000;
+  for (let i = 0; i < 150 && Date.now() < deadline; i++) {
+    const pending = Object.values(await getAgentRouterPending()).find((item) => item.origin === origin);
+    if (!pending) return null;
+    const tab = await chrome.tabs.get(pending.tabId).catch(() => null);
+    if (!tab || Date.now() - Number(pending.createdAt || 0) > 6 * 60 * 1000) {
+      await updateAgentRouterPending(pending.tabId, null);
+      await saveAgentRouterLoginOutcome(pending, null, tab ? "登录等待超时，请重新执行" : "登录页已关闭，请重新执行");
+      continue;
+    }
+    if (reuse && sameOauthTask(pending, platform)) return pending;
+    // 不登出、不导航上一账号的页面，避免把它的 state 和回调换给后一账号。
+    await wait(800);
+  }
+  throw new Error("本站前一个账号的授权尚未完成；已保留原登录页，请先完成或关闭它，再执行当前账号");
 }
 
 // 上游 NewAPI 鉴权错误码 → 友好中文提示（来源：QuantumNous/new-api middleware/auth.go）
@@ -103,13 +212,23 @@ const CODE_HINTS = {
 };
 // ---------- 核心：直连 NewAPI 签到接口 ----------
 async function callCheckin(p, method = "GET", month, opts) {
+  await assertApiAllowed(p);
   validatePlatform(p);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
-  if (isAgentRouterGithubMode(p)) {
-    if (opts && opts.reauth) return await runAgentRouterGithubCheckin(p, base);
+  if (isAgentRouterReauthMode(p)) {
+    if (opts && opts.reauth) return await runAgentRouterOauthCheckin(p, base);
     const account = await callAgentRouterAccountViaTab(p, base);
     if (account.warning) account.body._accountWarn = account.warning;
     return account.body;
+  }
+  if (p.authMode === "password") {
+    const user = await ensurePasswordSession(p, !!(opts && opts.reauth && isSelfTriggerMode(p)));
+    if (opts && opts.reauth && user._freshLogin && user.checked_in === true) return { success: true, message: "登录回调已确认签到", data: { stats: { checked_in_today: true } } };
+    if (isSelfTriggerMode(p)) {
+      if (opts && opts.reauth) throw new Error("已登录，但本站登录回调未确认签到；请检查站点签到规则后重试");
+      return { success: true, data: user };
+    }
+    return await callViaTab(p, base, method, month, opts);
   }
   if (p.authMode === "cookie") return await callViaTab(p, base, method, month, opts);
   const url = new URL(base + "/api/user/checkin");
@@ -162,7 +281,7 @@ async function getAgentRouterPage(base) {
   return { tab, createdTabId };
 }
 
-async function callAgentRouterAccountViaTab(p, base) {
+async function callAgentRouterAccountViaTab(p, base, strict = false) {
   const { tab, createdTabId } = await getAgentRouterPage(base);
   let result = null;
   try {
@@ -170,7 +289,7 @@ async function callAgentRouterAccountViaTab(p, base) {
       target: { tabId: tab.id },
       world: "MAIN",
       func: tabFetchAgentRouterAccount,
-      args: [String(p.userId || "").trim()],
+      args: [String(p.userId || "").trim(), strict],
     });
     result = out && out[0] && out[0].result;
   } catch (e) {
@@ -180,9 +299,14 @@ async function callAgentRouterAccountViaTab(p, base) {
   }
 
   if (result && result.userMismatch) {
-    throw new Error("当前浏览器登录的 Agent Router 用户ID为 " + result.actualUserId + "，与配置的 " + result.configuredUserId + " 不一致");
+    throw accountMismatchError(result.configuredUserId, result.actualUserId);
   }
   if (result && result.ok && result.body && result.body.data) {
+    if (strict && (result.body.data.id == null || !/^\d+$/.test(String(result.body.data.id)))) {
+      const error = new Error("在线账户响应缺少有效用户ID，尚未确认登录");
+      error.code = "AUTH_NOT_LOGGED_IN";
+      throw error;
+    }
     verifyConfiguredUser(p, result.body);
     return {
       body: result.body,
@@ -191,57 +315,67 @@ async function callAgentRouterAccountViaTab(p, base) {
         : "",
     };
   }
-  if (result && result.cachedUser) {
+  if (!strict && result && result.cachedUser && ![401, 403].includes(result.status) && !result.htmlResponse) {
     const body = { success: true, data: result.cachedUser };
     verifyConfiguredUser(p, body);
     return { body, warning: "用户接口返回异常，当前额度来自最近一次登录数据" };
   }
 
   const detail = result && result.message ? result.message : "网站未返回账户数据";
-  throw new Error("获取账户额度失败：" + detail);
+  const error = new Error("获取账户额度失败：" + detail);
+  if (result && ([401, 403].includes(result.status) || result.htmlResponse)) error.code = "AUTH_NOT_LOGGED_IN";
+  throw error;
 }
 
 // Agent Router 的当前前端在 OAuth/密码登录响应中通过 data.checked_in 返回签到结果。
 // 正确流程是退出当前 Cookie 会话后重新登录，不需要预先用访问令牌请求 /api/user/self。
-async function runAgentRouterGithubCheckin(p, base) {
-  const { tab, createdTabId } = await getAgentRouterPage(base);
-  let storedUser = null;
+async function runAgentRouterOauthCheckin(p, base) {
+  const origin = new URL(base).origin;
+  if (visitOnlyOrigins.has(origin) || passwordLoginInflight.has(origin) || agentRouterStarting.has(origin)) throw new Error("本站有其他登录任务正在启动，请稍后重试");
+  agentRouterStarting.add(origin); // 在首次 await 前预留，防止两种提供方同时启动。
   try {
-    const out = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: "MAIN",
-      func: tabReadAgentRouterStoredUser,
-    });
-    storedUser = out && out[0] && out[0].result;
-  } catch {}
-  const configured = String(p.userId || "").trim();
-  const actual = storedUser && storedUser.id != null ? String(storedUser.id) : "";
-  if (configured && actual && configured !== actual) {
+    const old = await waitForAgentRouterTurn(p, true);
+    if (old) {
+      await chrome.tabs.update(old.tabId, { active: true }).catch(() => {});
+      return { success: true, message: "正在等待 " + agentRouterProviderLabel(old.provider) + " 登录完成", _reauthRequired: true, _reauthStartedAt: old.createdAt, _oauthLoginStarted: old.oauthStarted, _githubLoginStarted: old.provider === "github" && old.oauthStarted };
+    }
+    const { tab, createdTabId } = await getAgentRouterPage(base);
+    let storedUser = null;
+    try {
+      const out = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: tabReadAgentRouterStoredUser,
+      });
+      storedUser = out && out[0] && out[0].result;
+    } catch {}
+    const configured = String(p.userId || "").trim();
+    // 旧会话可以属于另一账号；主动重登录的入口应先退出它，而不是在退出前拦截切换。
+
+    let logoutResult = null;
+    try {
+      const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: tabLogout });
+      logoutResult = out && out[0] && out[0].result;
+    } catch {}
     if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
-    throw new Error("当前浏览器登录的 Agent Router 用户ID为 " + actual + "，与配置的 " + configured + " 不一致");
-  }
+    if (!logoutResult?.ok) {
+      throw new Error((logoutResult && logoutResult.body && logoutResult.body.message) || "Agent Router 退出失败，无法开始重新登录签到");
+    }
 
-  let logoutResult = null;
-  try {
-    const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: tabLogout });
-    logoutResult = out && out[0] && out[0].result;
-  } catch {}
-  if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
-  if (storedUser && !logoutResult?.ok) {
-    throw new Error((logoutResult && logoutResult.body && logoutResult.body.message) || "Agent Router 退出失败，无法开始重新登录签到");
-  }
-
-  let reauthTab = null;
-  try { reauthTab = await startAgentRouterGithubReauth(base, p.userId); } catch {}
-  if (!reauthTab) throw new Error("Agent Router GitHub 登录页启动失败");
-  return {
-    success: true,
-    message: "已退出 Agent Router，正在通过 GitHub 重新登录并签到",
-    data: storedUser || { id: configured || null },
-    _reauthRequired: true,
-    _logoutOk: !storedUser || !!(logoutResult && logoutResult.ok),
-    _githubLoginStarted: true,
-  };
+    clearSiteSessionTokens(origin);
+    const reauthTab = await startAgentRouterReauth(base, p);
+    if (!reauthTab) throw new Error("Agent Router 登录页启动失败");
+    return {
+      success: true,
+      message: "已打开 " + agentRouterProviderLabel(agentRouterProvider(p)) + " 登录页，等待登录回调确认签到",
+      data: { id: configured || null },
+      _reauthRequired: true,
+      _reauthStartedAt: reauthTab.createdAt,
+      _logoutOk: !storedUser || !!(logoutResult && logoutResult.ok),
+      _oauthLoginStarted: !!reauthTab.oauthStarted,
+      _githubLoginStarted: agentRouterProvider(p) === "github" && !!reauthTab.oauthStarted,
+    };
+  } finally { agentRouterStarting.delete(origin); }
 }
 
 // 上游返回校验（cookie/token 共用）
@@ -289,6 +423,7 @@ function waitTabComplete(tabId) {
 function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
   return (async () => {
     const url = new URL(reqPath, location.origin);
+    if (url.origin !== location.origin) return { ok: false, status: 0, body: { success: false, message: "禁止向其他站点发送会话请求" } };
     if (month) url.searchParams.set("month", month);
     if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
     const headers = {
@@ -296,6 +431,9 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
       "Cache-Control": "no-store",
     };
     if ((method || "GET").toUpperCase() !== "GET") headers["Content-Type"] = "application/json";
+    if (!userId) {
+      try { const user = JSON.parse(localStorage.getItem("user") || "null"); if (user && user.id != null) userId = String(user.id); } catch {}
+    }
     if (userId) headers[(apiUserKey || "New-Api-User")] = String(userId);
     let res;
     try {
@@ -325,7 +463,7 @@ function tabReadAgentRouterStoredUser() {
       id: user.id,
       username: user.username || "",
       display_name: user.display_name || "",
-      checked_in: !!user.checked_in,
+      checked_in: user.checked_in === true,
     };
   } catch {
     return null;
@@ -333,7 +471,7 @@ function tabReadAgentRouterStoredUser() {
 }
 
 // 与 Agent Router 当前前端的 Axios 请求保持一致：页面主世界、Cookie、New-API-User 和 XHR。
-function tabFetchAgentRouterAccount(configuredUserId) {
+function tabFetchAgentRouterAccount(configuredUserId, strict = false) {
   const readStoredUser = () => {
     try {
       const user = JSON.parse(localStorage.getItem("user") || "null");
@@ -361,11 +499,11 @@ function tabFetchAgentRouterAccount(configuredUserId) {
     const cachedUser = readStoredUser();
     const configured = String(configuredUserId || "").trim();
     const actual = cachedUser && cachedUser.id != null ? String(cachedUser.id) : "";
-    if (configured && actual && configured !== actual) {
+    if (!strict && configured && actual && configured !== actual) {
       return { userMismatch: true, configuredUserId: configured, actualUserId: actual };
     }
 
-    const userId = actual || configured || "-1";
+    const userId = strict ? configured || actual || "-1" : actual || configured || "-1";
     const valueOf = (data, names) => {
       if (!data) return null;
       for (const name of names) {
@@ -433,6 +571,12 @@ function tabFetchAgentRouterAccount(configuredUserId) {
       if (retry.ok || !result.ok) result = retry;
     }
 
+    const onlineId = result && result.ok && result.body && result.body.data && result.body.data.id;
+    if (configured && onlineId != null && configured !== String(onlineId)) {
+      return { userMismatch: true, configuredUserId: configured, actualUserId: String(onlineId) };
+    }
+    // 回调/检测必须使用在线响应，不能用旧 user 缓存补额度或证明当前会话。
+    if (strict) return { ...result, cachedUser: null };
     if (result.ok && cachedHasBalance && looksLikeEmptyAccount(result.body.data)) {
       const liveUser = result.body.data;
       result.body = {
@@ -458,6 +602,152 @@ function tabFetchAgentRouterAccount(configuredUserId) {
 }
 
 // agentrouter.org 需要重新建立登录会话后才会激活签到额度。
+// ---------- 邮箱/用户名密码：只填写本站原生登录表单，不在 SW 拼装登录请求 ----------
+// 参数只能传到已核验的 HTTPS origin；页面内再次核验，防止导航竞态误投凭据。
+async function tabSubmitPasswordLogin(expectedOrigin, username, password) {
+  const onLoginPage = () => location.origin === expectedOrigin && location.protocol === "https:" && /^\/login\/?$/.test(location.pathname);
+  const visible = (el) => !!el && !el.disabled && el.getClientRects().length > 0;
+  if (!onLoginPage()) return { ok: false, message: "登录页地址已变化，已停止填写密码" };
+  for (let i = 0; i < 30; i++) {
+    if (!onLoginPage()) return { ok: false, message: "登录页地址已变化，已停止填写密码" };
+    const pass = Array.from(document.querySelectorAll('input[name="password"], input[type="password"]')).find(visible);
+    if (pass) {
+      const form = pass.form || pass.closest("form");
+      if (!form) return { ok: false, message: "未找到本站登录表单，请手动登录后重试" };
+      const action = new URL(form.getAttribute("action") || location.href, location.href);
+      if (action.origin !== expectedOrigin || action.protocol !== "https:" || action.username || action.password) {
+        return { ok: false, message: "登录表单指向其他地址，已停止填写密码" };
+      }
+      const user = Array.from(form.querySelectorAll('input[name="username"], input[name="email"], input[autocomplete="username"], input[type="email"], input[type="text"]')).find(visible);
+      if (!user) return { ok: false, message: "未找到邮箱/用户名输入框，请手动登录后重试" };
+      // 默认 method 是 GET，Semi/React 表单通常靠 JS POST；阻止不安全的原生提交回退。
+      const safeSubmission = (button) => {
+        const target = new URL((button && button.getAttribute("formaction")) || form.getAttribute("action") || location.href, location.href);
+        return onLoginPage() && target.origin === expectedOrigin && target.protocol === "https:" && !target.username && !target.password;
+      };
+      const guard = (event) => {
+        const button = event.submitter;
+        const method = ((button && button.getAttribute("formmethod")) || form.getAttribute("method") || "get").toLowerCase();
+        if (method !== "post" || !safeSubmission(button)) event.preventDefault();
+      };
+      form.addEventListener("submit", guard, true);
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      setter.call(user, String(username).trim());
+      user.dispatchEvent(new Event("input", { bubbles: true }));
+      user.dispatchEvent(new Event("change", { bubbles: true }));
+      setter.call(pass, password); // 密码必须原样保留，包括首尾空格。
+      pass.dispatchEvent(new Event("input", { bubbles: true }));
+      pass.dispatchEvent(new Event("change", { bubbles: true }));
+      // 等待 React 受控字段更新后触发原页面处理器（包含站点 Turnstile 等逻辑）。
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!onLoginPage()) return { ok: false, message: "登录页地址已变化，已停止提交" };
+      const submit = Array.from(form.querySelectorAll('button, input[type="submit"]')).find((el) => visible(el) &&
+        (el.type === "submit" || /^(继续|登录|登\s*录|sign\s*in|log\s*in|continue)$/i.test(String(el.textContent || el.value || "").trim())));
+      if (!submit) return { ok: false, message: "登录按钮尚不可用，请完成本站验证后手动登录" };
+      // button 的 formaction 可以覆盖 form.action；同样必须检查。
+      // 必须重新读取 action：输入事件及 React 更新可能已替换提交目标。
+      const explicitMethod = (submit.getAttribute("formmethod") || form.getAttribute("method") || "").toLowerCase();
+      if (!safeSubmission(submit) || (explicitMethod && explicitMethod !== "post")) {
+        return { ok: false, message: "登录提交目标不安全，已停止提交" };
+      }
+      submit.click();
+      return { ok: true };
+    }
+    // AnyRouter/NewAPI 的 OAuth 首页需要先展开“使用邮箱或用户名进行登录”。
+    const reveal = Array.from(document.querySelectorAll("button")).find((el) => visible(el) &&
+      /(?:邮箱|用户名|email|username)/i.test(el.textContent || "") && /(?:登录|登陆|log\s*in|sign\s*in|continue)/i.test(el.textContent || ""));
+    if (reveal) reveal.click();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return { ok: false, message: "未找到邮箱密码登录表单；请在打开的页面完成安全验证或手动登录后重试" };
+}
+
+function passwordUserMatches(p, user) {
+  if (!user || user.id == null) return false;
+  const uid = String(p.userId || "").trim();
+  if (uid && uid !== String(user.id)) return false;
+  const login = String(p.loginUsername || "").trim().toLowerCase();
+  return [user.username, user.email].some((v) => v && String(v).trim().toLowerCase() === login);
+}
+
+const passwordLoginInflight = new Map();
+const visitOnlyOrigins = new Set();
+// 只负责在调用方拥有的临时页内登录；页面生命周期由调用方管理。
+async function loginPasswordOnTab(p, tab, force = false) {
+  const origin = new URL(p.baseUrl).origin;
+  const login = String(p.loginUsername || "").trim();
+  const inject = async (func, args = [], main = false) => {
+    const current = await chrome.tabs.get(tab.id);
+    if (!current.url || new URL(current.url).origin !== origin) throw new Error("站点跳转到其他地址，已停止邮箱密码登录");
+    const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, ...(main ? { world: "MAIN" } : {}), func, args });
+    return out && out[0] && out[0].result;
+  };
+  const probe = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(p.userId || ""), "New-Api-User"]);
+  const currentUser = probe && probe.ok && probe.body && probe.body.success !== false && probe.body.data;
+  if (!force && passwordUserMatches(p, currentUser)) return currentUser;
+  // 不沿用其他账号/无法确认归属的会话，也不能以旧 localStorage 证明登录成功。
+  const logout = await inject(tabLogout, [], true);
+  if (!logout || !logout.ok) throw new Error("无法退出旧登录会话，请在本站手动退出后重试");
+  clearSiteSessionTokens(origin);
+  await chrome.tabs.update(tab.id, { url: origin + "/login", active: true });
+  await waitTabComplete(tab.id);
+  const submitted = await inject(tabSubmitPasswordLogin, [origin, login, p.loginPassword], true);
+  if (!submitted || !submitted.ok) throw new Error(submitted && submitted.message || "无法填写本站登录表单");
+  // 成功必须同时有新的页面登录数据和在线 self，不能仅以提交按钮/跳转判断。
+  for (let i = 0; i < 25; i++) {
+    await wait(800);
+    let stored = null, online = null;
+    try {
+      stored = await inject(tabReadAgentRouterStoredUser);
+      if (stored && stored.id != null) online = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(stored.id), "New-Api-User"]);
+    } catch { continue; } // SPA 导航期间注入可能暂不可用。
+    const user = online && online.ok && online.body && online.body.success !== false && online.body.data;
+    if (!user || !stored || String(user.id) !== String(stored.id)) continue;
+    verifyConfiguredUser(p, online.body);
+    // 新表单登录完成后，若站点提供邮箱/用户名，进一步拒绝明确串号。
+    if ((!login.includes("@") || user.email) && !passwordUserMatches(p, user)) throw new Error("本站登录账号与配置的邮箱/用户名不一致");
+    return { ...user, checked_in: stored.checked_in === true, _freshLogin: true };
+  }
+  throw new Error("邮箱密码登录尚未完成：请在打开的页面检查密码、验证码或二次验证，完成后重试");
+}
+
+async function ensurePasswordSession(p, force = false) {
+  validatePlatform(p);
+  const origin = new URL(p.baseUrl).origin;
+  if (visitOnlyOrigins.has(origin) || agentRouterStarting.has(origin)) throw new Error("本站有访问或 OAuth 登录任务正在启动，请完成后重试");
+  await waitForAgentRouterTurn(p);
+  if (visitOnlyOrigins.has(origin) || agentRouterStarting.has(origin)) throw new Error("本站有访问或 OAuth 登录任务正在启动，请完成后重试");
+  const login = String(p.loginUsername || "").trim();
+  const existing = passwordLoginInflight.get(origin);
+  if (existing) {
+    if (existing.login !== login || existing.userId !== String(p.userId || "") || existing.password !== p.loginPassword) {
+      throw new Error("同站点的其他账号正在登录，请逐一处理，避免串号");
+    }
+    return await existing.promise;
+  }
+  const promise = (async () => {
+    const tab = await chrome.tabs.create({ url: origin + "/login", active: false });
+    let keepTab = false;
+    try {
+      await waitTabComplete(tab.id);
+      keepTab = true;
+      const user = await loginPasswordOnTab(p, tab, force);
+      keepTab = false;
+      return user;
+    } finally {
+      if (!keepTab) await chrome.tabs.remove(tab.id).catch(() => {});
+      else await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    }
+  })();
+  passwordLoginInflight.set(origin, { login, userId: String(p.userId || ""), password: p.loginPassword, promise });
+  try { return await promise; }
+  finally { passwordLoginInflight.delete(origin); }
+}
+
+function clearSiteSessionTokens(origin) {
+  for (const key of sessionTokenCache.keys()) if (key.startsWith(origin + "#")) sessionTokenCache.delete(key);
+}
+
 function tabLogout() {
   return (async () => {
     try {
@@ -494,42 +784,81 @@ function tabLogout() {
   })();
 }
 
-function tabBuildGithubOauthUrl() {
-  return (async () => {
-    try {
-      let status = null;
-      try { status = JSON.parse(localStorage.getItem("status") || "null"); } catch {}
-      if (!status || !status.github_client_id) {
-        const statusRes = await fetch("/api/status", {
-          credentials: "include",
-          headers: { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" },
-        });
-        const statusBody = await statusRes.json();
-        status = statusBody && statusBody.data;
-      }
-      const clientId = status && status.github_client_id;
-      if (!clientId) return { ok: false, message: "站点未提供 GitHub OAuth 配置" };
-      const params = new URLSearchParams();
-      const aff = localStorage.getItem("aff");
-      if (aff) params.set("aff", aff);
-      params.set("mode", "login");
-      const stateRes = await fetch("/api/oauth/state?" + params.toString(), {
-        credentials: "include",
-        headers: { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" },
-      });
-      const stateBody = await stateRes.json();
-      if (!stateRes.ok || !stateBody || stateBody.success === false || !stateBody.data)
-        return { ok: false, message: stateBody && stateBody.message ? stateBody.message : "无法生成 GitHub 登录状态" };
-      localStorage.setItem("oauth_mode", "login");
-      return {
-        ok: true,
-        url: "https://github.com/login/oauth/authorize?client_id=" + encodeURIComponent(clientId) +
-          "&state=" + encodeURIComponent(stateBody.data) + "&scope=user%3Aemail",
-      };
-    } catch (e) {
-      return { ok: false, message: e && e.message ? e.message : "无法启动 GitHub 登录" };
+// 参数来自站点公开配置，不硬编码 client_id；Cookie/state 始终由站点页面生成。
+async function tabBuildAgentRouterOauthUrl(provider, expectedOrigin) {
+  try {
+    if (location.origin !== expectedOrigin) return { ok: false, message: "登录页跳转到其他站点，已停止 OAuth" };
+    if (!["github", "linuxdo"].includes(provider)) return { ok: false, message: "不支持的 OAuth 登录方式" };
+    const headers = { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" };
+    const statusRes = await fetch("/api/status", { credentials: "include", headers });
+    const statusBody = await statusRes.json();
+    const status = statusRes.ok && statusBody && statusBody.success !== false && statusBody.data;
+    const clientId = status && status[provider === "linuxdo" ? "linuxdo_client_id" : "github_client_id"];
+    if (!clientId) return { ok: false, message: "站点未提供 " + (provider === "linuxdo" ? "Linux DO" : "GitHub") + " OAuth 配置" };
+    const params = new URLSearchParams({ mode: "login" });
+    const aff = localStorage.getItem("aff");
+    if (aff) params.set("aff", aff);
+    const stateRes = await fetch("/api/oauth/state?" + params.toString(), { credentials: "include", headers });
+    const stateBody = await stateRes.json();
+    if (!stateRes.ok || !stateBody || stateBody.success === false || typeof stateBody.data !== "string" || !stateBody.data) {
+      return { ok: false, message: "无法生成本站 OAuth 登录状态，请在登录页重试" };
     }
-  })();
+    localStorage.setItem("oauth_mode", "login");
+    const oauth = new URL(provider === "linuxdo" ? "https://connect.linux.do/oauth2/authorize" : "https://github.com/login/oauth/authorize");
+    oauth.searchParams.set("client_id", String(clientId));
+    oauth.searchParams.set("state", stateBody.data);
+    if (provider === "linuxdo") oauth.searchParams.set("response_type", "code");
+    else oauth.searchParams.set("scope", "user:email");
+    return { ok: true, url: oauth.href };
+  } catch {
+    return { ok: false, message: "无法启动 OAuth，可能需要先在本站完成安全验证" };
+  }
+}
+
+// 只在本轮动态 client_id/state 与当前授权 URL 完全匹配时寻找 Linux DO 同意链接。
+function tabClickLinuxDoApprove(expectedState, expectedClientId) {
+  let clickAttempted = false;
+  const fail = (reason) => ({ ok: false, clicked: clickAttempted, reason });
+  try {
+    const authorize = new URL(location.href);
+    if (authorize.protocol !== "https:" || authorize.origin !== "https://connect.linux.do" || authorize.pathname !== "/oauth2/authorize") return fail("not_authorize_page");
+    const oneParam = (name) => {
+      const values = authorize.searchParams.getAll(name);
+      return values.length === 1 ? values[0] : "";
+    };
+    const state = oneParam("state");
+    const clientId = oneParam("client_id");
+    if (oneParam("response_type") !== "code" || !String(expectedState || "").trim() || state !== expectedState ||
+        !String(expectedClientId || "").trim() || clientId !== expectedClientId) return fail("authorize_context_mismatch");
+
+    const selector = ".oauth-actions a.btn-pill-primary[href]";
+    const candidates = document.querySelectorAll(selector);
+    if (!candidates || candidates.length !== 1) return fail("approval_link_not_unique");
+    const anchor = candidates[0];
+    if (!anchor || String(anchor.tagName || "").toLowerCase() !== "a" || !anchor.matches(selector) || anchor.isConnected === false ||
+        anchor.disabled === true || anchor.getAttribute("aria-disabled") === "true" || anchor.textContent.trim() !== "允许" ||
+        (anchor.target && anchor.target !== "_self")) return fail("approval_link_unavailable");
+    const href = anchor.getAttribute("href");
+    if (href == null || !String(href).trim()) return fail("approval_link_unavailable");
+    const approval = new URL(href, location.href);
+    const target = approval.pathname.slice("/oauth2/approve/".length);
+    if (approval.protocol !== "https:" || approval.origin !== "https://connect.linux.do" || approval.username || approval.password ||
+        !approval.pathname.startsWith("/oauth2/approve/") || !target || target.includes("/")) return fail("approval_link_unsafe");
+    const box = anchor.getBoundingClientRect();
+    if (!anchor.getClientRects().length || !box || box.width <= 0 || box.height <= 0) return fail("approval_link_hidden");
+    for (let element = anchor; element; element = element.parentElement) {
+      const style = getComputedStyle(element);
+      if (element.hidden || element.inert || element.getAttribute("aria-hidden") === "true" || style.display === "none" ||
+          style.visibility === "hidden" || style.visibility === "collapse" || Number(style.opacity) === 0 ||
+          style.pointerEvents === "none" || style.contentVisibility === "hidden") return fail("approval_link_hidden");
+    }
+    if (typeof anchor.click !== "function") return fail("approval_link_unavailable");
+    clickAttempted = true;
+    anchor.click();
+    return { ok: true, clicked: true };
+  } catch {
+    return fail("approval_check_failed");
+  }
 }
 
 function tabCheckAgentRouterLogin(configuredUserId) {
@@ -540,84 +869,195 @@ function tabCheckAgentRouterLogin(configuredUserId) {
     const actual = String(user.id);
     return {
       ok: !configured || configured === actual,
+      userMismatch: !!configured && configured !== actual,
       userId: actual,
-      checkedIn: !!user.checked_in,
+      checkedIn: user.checked_in === true,
+      account: { available: user.quota ?? null, used: user.used_quota ?? null, requestCount: user.request_count ?? null, displayName: user.display_name || user.username || "" },
     };
-  } catch {
-    return { ok: false };
-  }
+  } catch { return { ok: false }; }
 }
 
-async function startAgentRouterGithubReauth(base, userId) {
-  const old = await getStore(KEY_AGENTROUTER_REAUTH, null);
-  if (old && old.tabId != null) await chrome.tabs.remove(old.tabId).catch(() => {});
-  const tab = await chrome.tabs.create({ url: base + "/login", active: true });
-  await setStore({
-    [KEY_AGENTROUTER_REAUTH]: {
-      tabId: tab.id,
-      base,
-      origin: new URL(base).origin,
-      userId: String(userId || ""),
-      githubClicked: false,
-      createdAt: Date.now(),
-    },
+const agentRouterStarting = new Set();
+const agentRouterReauthQueues = new Map();
+async function saveAgentRouterLoginOutcome(pending, login, message) {
+  if (pending.visitOnly) return; // 仅访问的回调/关闭/超时不得写入签到状态。
+  return await mutatePlatforms((list) => {
+    const matched = list.filter((p) => {
+      if (isVisitOnly(p) !== !!pending.visitOnly) return false; // 切换任务用途后，旧签到回调不能覆盖仅访问状态。
+      // 已被新一轮任务取代的旧关闭/超时/回调事件不能修改新任务结果。
+      if (p.reauthStartedAt != null && Number(p.reauthStartedAt) !== Number(pending.createdAt)) return false;
+      if (pending.platformId) {
+        try { return p.id === pending.platformId && p.authMode === pending.authMode && String(p.userId || "") === pending.userId && new URL(p.baseUrl).origin === pending.origin; } catch { return false; }
+      }
+      // 兼容旧 pending，没有 id 时仅匹配同源同账号同提供方配置。
+      try { return isAgentRouterReauthMode(p) && agentRouterProvider(p) === pending.provider && new URL(p.baseUrl).origin === pending.origin && String(p.userId || "") === pending.userId; }
+      catch { return false; }
+    });
+    for (const p of matched) {
+      p.reauthPending = false;
+      p.reauthCompletedAt = Date.now();
+      p.message = message;
+      p.error = login && login.ok ? "" : message;
+      p.lastCheckinAt = new Date().toISOString();
+      if (login && login.ok && login.checkedIn === true) {
+        p.stats = { ...(p.stats || {}), checked_in_today: true };
+        p.statsDate = todayStr();
+        if (login.account) p.account = { ...(p.account || {}), ...login.account };
+      }
+    }
+    return list;
+  });
+}
+
+async function startAgentRouterReauth(base, platform) {
+  const origin = new URL(base).origin;
+  const tab = await chrome.tabs.create({ url: origin + "/login", active: true });
+  const pending = {
+    tabId: tab.id, base, origin, platformId: platform.id || null,
+    userId: String(platform.userId || ""), authMode: platform.authMode || "cookie",
+    provider: agentRouterProvider(platform), oauthStarted: false, createdAt: Date.now(),
+  };
+  await updateAgentRouterPending(tab.id, pending);
+  await mutatePlatforms((list) => {
+    const configured = list.find((p) => p.id === platform.id);
+    if (configured) {
+      configured.reauthPending = true;
+      configured.reauthStartedAt = pending.createdAt;
+      configured.error = "";
+      configured.message = "等待 " + agentRouterProviderLabel(pending.provider) + " 登录回调确认签到";
+    }
+    return list;
   });
   await waitTabComplete(tab.id);
   const current = await chrome.tabs.get(tab.id).catch(() => null);
-  handleAgentRouterReauthTab(tab.id, current && current.url).catch(() => {});
-  return tab;
+  await handleAgentRouterReauthTab(tab.id, current && current.url);
+  const active = (await getAgentRouterPending())[tab.id];
+  return { ...tab, createdAt: pending.createdAt, oauthStarted: !!(active && active.oauthStarted) };
 }
 
-const agentRouterReauthProcessing = new Set();
-async function handleAgentRouterReauthTab(tabId, tabUrl) {
-  const pending = await getStore(KEY_AGENTROUTER_REAUTH, null);
-  if (!pending || pending.tabId !== tabId || agentRouterReauthProcessing.has(tabId)) return;
-  // 六分钟仍未完成通常意味着 GitHub 要求用户输入凭据/验证码；保留页面，不再自动关闭。
+// 同一 tab 的状态读取、校验与点击预留一并排队；不能在读到旧快照后才加锁。
+// 不丢弃排队中的回调 URL，避免快速导航时遗漏本轮回调证据。
+function handleAgentRouterReauthTab(tabId, tabUrl) {
+  const previous = agentRouterReauthQueues.get(tabId) || Promise.resolve();
+  const task = previous.catch(() => {}).then(() => processAgentRouterReauthTab(tabId, tabUrl));
+  agentRouterReauthQueues.set(tabId, task);
+  task.finally(() => {
+    if (agentRouterReauthQueues.get(tabId) === task) agentRouterReauthQueues.delete(tabId);
+  }).catch(() => {});
+  return task;
+}
+async function processAgentRouterReauthTab(tabId, tabUrl) {
+  const pending = (await getAgentRouterPending())[tabId];
+  if (!pending) return;
+  let reportedUrl;
+  try { reportedUrl = new URL(tabUrl); } catch {}
+  const callbackStates = reportedUrl ? reportedUrl.searchParams.getAll("state") : [];
+  const callbackCodes = reportedUrl ? reportedUrl.searchParams.getAll("code") : [];
+  if (reportedUrl && reportedUrl.origin === pending.origin && reportedUrl.pathname.replace(/\/$/, "") === "/oauth/" + pending.provider &&
+      pending.oauthStarted === true && String(pending.oauthState || "").trim() && callbackStates.length === 1 &&
+      callbackStates[0] === pending.oauthState && callbackCodes.length === 1 && callbackCodes[0]) {
+    pending.callbackSeen = true;
+    await updateAgentRouterPending(tabId, { callbackSeen: true });
+  }
+  const label = agentRouterProviderLabel(pending.provider);
   if (Date.now() - Number(pending.createdAt || 0) > 6 * 60 * 1000) {
-    await setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+    await updateAgentRouterPending(tabId, null);
+    await saveAgentRouterLoginOutcome(pending, null, label + " 登录等待超时，请完成验证后重新签到");
+    return; // 不关闭需要用户交互的页面。
+  }
+  let url;
+  try { url = new URL(tabUrl); } catch { return; }
+  if (pending.provider === "linuxdo" && pending.authMode === "agentrouter_linuxdo" &&
+      url.protocol === "https:" && url.origin === "https://connect.linux.do" && url.pathname === "/oauth2/authorize") {
+    if (pending.approveClickStarted === true || pending.oauthStarted !== true ||
+        !String(pending.oauthState || "").trim() || !String(pending.oauthClientId || "").trim()) return;
+    const states = url.searchParams.getAll("state");
+    const clientIds = url.searchParams.getAll("client_id");
+    const responseTypes = url.searchParams.getAll("response_type");
+    if (states.length !== 1 || states[0] !== pending.oauthState || clientIds.length !== 1 ||
+        clientIds[0] !== pending.oauthClientId || responseTypes.length !== 1 || responseTypes[0] !== "code") return;
+    // 先持久化预留：注入结果丢失或 worker 中断时不重复提交授权。
+    await updateAgentRouterPending(tabId, { approveClickStarted: true });
+    let approval;
+    try {
+      const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabClickLinuxDoApprove, args: [pending.oauthState, pending.oauthClientId] });
+      approval = out && out[0] && out[0].result;
+    } catch { return; } // 结果不确定时保留页面供人工处理，不重试可能已发生的点击。
+    if (approval && approval.ok === false && approval.clicked === false) {
+      await updateAgentRouterPending(tabId, { approveClickStarted: false });
+    }
     return;
   }
-  agentRouterReauthProcessing.add(tabId);
-  try {
-    const url = String(tabUrl || "");
-    if (!url.startsWith(pending.origin + "/") && url !== pending.origin) return;
-    if (/\/login(?:[/?#]|$)/i.test(url)) {
-      if (pending.githubClicked) return;
-      let oauth = null;
-      try {
-        const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabBuildGithubOauthUrl });
-        oauth = out && out[0] && out[0].result;
-      } catch {}
-      if (oauth && oauth.ok && oauth.url) {
-        const updated = await chrome.tabs.update(tabId, { url: oauth.url, active: true }).catch(() => null);
-        if (updated) {
-          pending.githubClicked = true;
-          await setStore({ [KEY_AGENTROUTER_REAUTH]: pending });
-        }
-      } else {
-        notify("Agent Router 自动登录未启动", (oauth && oauth.message) || "请在登录页手动点击「使用 GitHub 继续」");
-      }
-      return;
+  if (url.origin !== pending.origin) return; // 其他 provider / 外站页面不注入本站代码。
+  if (/^\/login\/?$/.test(url.pathname) && !pending.oauthStarted) {
+    let oauth = null;
+    try {
+      const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabBuildAgentRouterOauthUrl, args: [pending.provider, pending.origin] });
+      oauth = out && out[0] && out[0].result;
+    } catch {}
+    if (!oauth || !oauth.ok || !oauth.url) {
+      notify("Agent Router 自动登录未启动", (oauth && oauth.message) || "请在本站登录页手动使用 " + label + " 登录");
+      return; // 保留 pending，可在手动回调后继续确认。
     }
-    // OAuth 回到 Agent Router 后，等待网站回调把登录响应（含 checked_in）写入 localStorage。
-    let loggedIn = false;
-    for (let i = 0; i < 8 && !loggedIn; i++) {
-      if (i) await wait(1200);
-      try {
-        const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabCheckAgentRouterLogin, args: [pending.userId || ""] });
-        const loginState = out && out[0] && out[0].result;
-        loggedIn = !!(loginState && loginState.ok);
-      } catch {}
+    const destination = new URL(oauth.url);
+    if (destination.origin !== (pending.provider === "linuxdo" ? "https://connect.linux.do" : "https://github.com")) return;
+    const states = destination.searchParams.getAll("state");
+    if (states.length !== 1 || !String(states[0] || "").trim()) return;
+    if (pending.provider === "linuxdo") {
+      const clientIds = destination.searchParams.getAll("client_id");
+      const responseTypes = destination.searchParams.getAll("response_type");
+      if (destination.protocol !== "https:" || destination.pathname !== "/oauth2/authorize" || clientIds.length !== 1 ||
+          !String(clientIds[0] || "").trim() || responseTypes.length !== 1 || responseTypes[0] !== "code") return;
+      pending.oauthClientId = clientIds[0]; // 本轮从站点配置生成，不硬编码。
+      pending.approveClickStarted = false;
     }
-    if (!loggedIn) return;
-    await chrome.tabs.update(tabId, { url: pending.base + "/", active: true }).catch(() => {});
-    await waitTabComplete(tabId);
-    await wait(1800);
-    await chrome.tabs.remove(tabId).catch(() => {});
-    await setStore({ [KEY_AGENTROUTER_REAUTH]: null });
-  } finally {
-    agentRouterReauthProcessing.delete(tabId);
+    // 在导航前保存阶段，避免快速跳转回调时重复发起 OAuth。
+    pending.oauthStarted = true;
+    pending.oauthState = states[0];
+    await updateAgentRouterPending(tabId, pending);
+    const updated = await chrome.tabs.update(tabId, { url: oauth.url, active: true }).catch(() => null);
+    if (!updated) { pending.oauthStarted = false; await updateAgentRouterPending(tabId, pending); }
+    return;
   }
+  if (pending.visitOnly) return; // 仅访问由其任务核验在线身份和首页，不能按 checked_in 关闭页面。
+  if (!pending.callbackSeen) return; // 不能把任意同源页面的旧缓存当作本轮回调。
+  let login = null;
+  for (let i = 0; i < 12; i++) {
+    if (i) await wait(800);
+    try {
+      const current = await chrome.tabs.get(tabId);
+      if (!current.url || new URL(current.url).origin !== pending.origin) return;
+      const cachedOut = await chrome.scripting.executeScript({ target: { tabId }, func: tabCheckAgentRouterLogin, args: [pending.userId] });
+      const cached = cachedOut && cachedOut[0] && cachedOut[0].result;
+      const onlineOut = await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: tabFetchAgentRouterAccount, args: [pending.userId, true] });
+      const online = onlineOut && onlineOut[0] && onlineOut[0].result;
+      const live = online && online.ok && online.body && online.body.success !== false && online.body.data;
+      const expected = String(pending.userId || cached && cached.userId || "").trim();
+      if (online && (online.userMismatch || (live && live.id != null && expected && String(live.id) !== expected))) {
+        login = { ok: false, userMismatch: true, userId: String(online.actualUserId || live && live.id || "") };
+        break; // 在线证明确实登录错账号时立即失败，释放这一轮任务，不挂到超时。
+      }
+      if (!live || live.id == null || !cached || !cached.ok || String(live.id) !== String(cached.userId)) continue;
+      // localStorage 可能还保留上一账号，不能据此过早拒绝，也不能据此证明成功。
+      const freshAccount = accountFromSelf(live);
+      const account = { ...(cached.account || {}) };
+      for (const key of ["available", "used", "requestCount", "displayName"]) {
+        if (freshAccount[key] != null) account[key] = freshAccount[key];
+      }
+      login = { ...cached, account };
+      break;
+    } catch {} // SPA 回调/安全验证期间保留页面继续等，不能使用旧缓存兜底。
+  }
+  if (!login) return;
+  const message = login.userMismatch
+    ? "登录账号与配置的用户ID不一致，未确认签到；请切换正确账号后重试"
+    : login.checkedIn === true
+      ? label + " 重登录回调已确认签到成功"
+      : label + " 登录已完成，但本站回调未确认签到；请检查站点签到规则";
+  await saveAgentRouterLoginOutcome(pending, login, message);
+  await updateAgentRouterPending(tabId, null);
+  notify("Agent Router 登录结果", message);
+  if (login.ok && login.checkedIn === true) await chrome.tabs.remove(tabId).catch(() => {});
 }
 
 // 在目标站点页面内完成 Turnstile 验证，再用同一页面上下文提交签到。
@@ -716,6 +1156,7 @@ function isTurnstileMissingMessage(message) {
 }
 
 async function runTurnstileCheckin(platform) {
+  await assertApiAllowed(platform);
   validatePlatform(platform);
   const base = (platform.baseUrl || "").trim().replace(/\/+$/, "");
   const origin = new URL(base).origin;
@@ -738,7 +1179,7 @@ async function runTurnstileCheckin(platform) {
       target: { tabId: tab.id },
       world: "MAIN",
       func: tabFetchTurnstileCheckin,
-      args: [platform.authMode === "cookie" ? "" : String(platform.accessToken || "").trim(), String(platform.userId || "").trim()],
+      args: [isTokenAuthMode(platform) ? String(platform.accessToken || "").trim() : "", String(platform.userId || "").trim()],
     });
     result = out && out[0] && out[0].result;
   } catch (e) {
@@ -766,13 +1207,14 @@ function cookieStrategy(p, base) {
     };
   }
   // 默认与特殊站点
-  if (/agentrouter\.org/i.test(base)) {
+  if (isSiteHost(base, "agentrouter.org")) {
     return { reqPath: "/api/user/self", reqMethod: "GET", apiUserKey: "new-api-user", triggerSelf: true };
   }
   return { reqPath: "/api/user/checkin", reqMethod: "POST", apiUserKey: "New-Api-User", triggerSelf: false };
 }
 
 async function callViaTab(p, base, method, month, opts) {
+  await assertApiAllowed(p);
   const origin = new URL(base).origin;
   let tab = null;
   let createdTabId = null;
@@ -837,18 +1279,6 @@ async function callViaTab(p, base, method, month, opts) {
       keepCreatedTab = true;
     }
     const body = throwOnBadResult(result, reqMethod, st);
-    if (opts && opts.reauth && st.triggerSelf && /agentrouter\.org/i.test(base)) {
-      let logoutResult = null;
-      try {
-        const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: tabLogout });
-        logoutResult = out && out[0] && out[0].result;
-      } catch {}
-      let reauthTab = null;
-      try { reauthTab = await startAgentRouterGithubReauth(base, p.userId); } catch {}
-      body._reauthRequired = true;
-      body._logoutOk = !!(logoutResult && logoutResult.ok);
-      body._githubLoginStarted = !!(reauthTab && reauthTab.id != null);
-    }
     return body;
   } finally {
     if (createdTabId != null && !keepCreatedTab) await chrome.tabs.remove(createdTabId).catch(() => {});
@@ -857,6 +1287,7 @@ async function callViaTab(p, base, method, month, opts) {
 
 // Cookie 模式通用同源请求：用于 /api/user/self、/api/log/self/stat 等
 async function callViaTabRaw(p, base, reqPath, method, opts) {
+  await assertApiAllowed(p, reqPath);
   const origin = new URL(base).origin;
   let tab = null, createdTabId = null;
   const tabs = await chrome.tabs.query({ url: origin + "/*" }).catch(() => []);
@@ -899,6 +1330,7 @@ async function callViaTabRaw(p, base, reqPath, method, opts) {
 
 // Token 模式通用请求（任意 path + query），headers 与签到一致
 async function callApiPath(p, reqPath, method, opts) {
+  await assertApiAllowed(p, reqPath);
   validatePlatform(p);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
   const url = new URL(base + reqPath);
@@ -936,8 +1368,11 @@ async function callApiPath(p, reqPath, method, opts) {
 
 // 按 authMode 分发：Cookie/Agent Router 复用网站原生会话，普通 token 由 Service Worker 直连。
 async function callApi(p, reqPath, method, opts) {
+  await assertApiAllowed(p, reqPath);
+  validatePlatform(p);
+  if (p.authMode === "password") await ensurePasswordSession(p);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
-  if (p.authMode === "cookie" || isAgentRouterTokenMode(p)) {
+  if (p.authMode === "cookie" || p.authMode === "password" || isAgentRouterMode(p)) {
     const st = cookieStrategy(p, base);
     const merged = Object.assign({ apiUserKey: st.apiUserKey }, opts || {});
     return await callViaTabRaw(p, base, reqPath, method, merged);
@@ -945,9 +1380,179 @@ async function callApi(p, reqPath, method, opts) {
   return await callApiPath(p, reqPath, method, opts);
 }
 
-// 签到
+// 仅访问：始终创建独立临时页，不复用或关闭用户原有标签页。
+function waitVisitComplete(tabId) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(updated);
+      chrome.tabs.onRemoved.removeListener(removed);
+      if (error) reject(error); else resolve();
+    };
+    const updated = (id, info) => { if (id === tabId && info.status === "complete") finish(); };
+    const removed = (id) => { if (id === tabId) finish(new Error("访问页面在加载完成前已关闭")); };
+    chrome.tabs.onUpdated.addListener(updated);
+    chrome.tabs.onRemoved.addListener(removed);
+    timer = setTimeout(() => finish(new Error("访问页面加载超时，页面已保留，请检查站点后重试")), 30000);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab && tab.status === "complete") finish();
+    }).catch(() => finish(new Error("无法读取访问页面")));
+  });
+}
+// 必须在线验证 Cookie 会话；不能以页面加载、旧 localStorage 或配置令牌当作网页登录成功。
+async function readVisitSession(platform, tabId, allowAccountSwitch = false, allowLoginPage = false) {
+  const current = await chrome.tabs.get(tabId).catch(() => null);
+  if (!current) throw new Error("访问页面已关闭，未确认登录");
+  const origin = new URL(platform.baseUrl).origin;
+  let url;
+  try { url = new URL(current.url); } catch { throw new Error("访问页面加载失败"); }
+  if (!/^https?:$/.test(url.protocol)) throw new Error("访问页面加载失败");
+  if (url.origin !== origin) {
+    if (isAgentRouterReauthMode(platform)) return null; // 授权站点只能走已有的 state/client_id 校验链路。
+    throw new Error("访问页面跳转到其他站点，未确认目标站点登录");
+  }
+  if (current.status !== "complete") return null;
+  let probe;
+  try {
+    const out = await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: tabFetchCheckin,
+      args: ["/api/user/self", "GET", null, String(platform.userId || ""), cookieStrategy(platform, platform.baseUrl).apiUserKey] });
+    probe = out && out[0] && out[0].result;
+  } catch { return null; } // SPA 导航或安全验证期间，不能宣称已登录。
+  const user = probe && probe.ok && probe.body && probe.body.success !== false && probe.body.data;
+  if (!user || user.id == null || !/^\d+$/.test(String(user.id))) return null;
+  if (allowAccountSwitch && platform.authMode === "password" && !passwordUserMatches(platform, user)) return null;
+  if (allowAccountSwitch && isAgentRouterReauthMode(platform) && platform.userId && String(platform.userId).trim() !== String(user.id)) return null;
+  verifyConfiguredUser(platform, probe.body);
+  if (platform.authMode === "password" && !passwordUserMatches(platform, user)) {
+    throw new Error("本站登录账号与配置的邮箱/用户名不一致，页面已保留");
+  }
+  // 登录/回调页面还未完成前端导航，不能立即关闭。
+  const latest = await chrome.tabs.get(tabId).catch(() => null);
+  if (!latest) throw new Error("访问页面已关闭，未确认登录");
+  const latestUrl = new URL(latest.url);
+  if (latestUrl.origin !== origin) throw new Error("身份核验期间页面跳转到其他站点，未确认登录");
+  if (latest.status !== "complete" || (!allowLoginPage && /^\/(login|signin|register|oauth)(\/|$)/i.test(latestUrl.pathname))) return null;
+  return user;
+}
+
+async function waitVisitSession(platform, tabId, oauth = false, allowLoginPage = false, requireQuota = false) {
+  const deadline = Date.now() + 120000;
+  for (let i = 0; i < 150 && Date.now() < deadline; i++) {
+    if (oauth) {
+      const current = await chrome.tabs.get(tabId).catch(() => null);
+      if (!current) throw new Error("访问登录页已关闭，未确认登录");
+      await handleAgentRouterReauthTab(tabId, current.url);
+      const pending = (await getAgentRouterPending())[tabId];
+      if (!pending || !pending.callbackSeen) { await wait(800); continue; }
+    }
+    const user = await readVisitSession(platform, tabId, false, allowLoginPage);
+    if (user && (!requireQuota || hasAccountQuota(user))) return user;
+    await wait(800);
+  }
+  throw new Error("尚未确认目标账号登录或最新额度，页面已保留；请完成登录、验证码或授权后重新访问");
+}
+
+// 所有账户/日志请求固定使用本轮临时页，不重新开登录页或读取其他账号的页面。
+async function readVisitApi(platform, tabId, reqPath, query) {
+  await assertApiAllowed(platform, reqPath);
+  const origin = new URL(platform.baseUrl).origin;
+  const checkPage = async () => {
+    const page = await chrome.tabs.get(tabId);
+    if (!page.url || new URL(page.url).origin !== origin || page.status !== "complete" ||
+        /^\/(login|signin|register|oauth)(\/|$)/i.test(new URL(page.url).pathname)) {
+      throw new Error("刷新账户时页面登录状态已变化，页面已保留");
+    }
+  };
+  await checkPage();
+  const st = cookieStrategy(platform, platform.baseUrl);
+  const out = await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: tabFetchCheckin,
+    args: [reqPath, "GET", null, String(platform.userId || ""), st.apiUserKey, query || null] });
+  await checkPage();
+  const result = out && out[0] && out[0].result;
+  if (!result || !result.ok || !result.body || result.body.success === false) {
+    throw new Error(result && result.body && result.body.message || "无法获取最新账户数据");
+  }
+  return result.body;
+}
+
+async function runVisitOnly(platform, options) {
+  validatePlatform(platform);
+  const origin = new URL(platform.baseUrl).origin;
+  const home = origin + "/";
+  if (visitOnlyOrigins.has(origin) || passwordLoginInflight.has(origin) || agentRouterStarting.has(origin)) {
+    throw new Error("本站有其他访问或登录任务尚未完成，请稍后重试");
+  }
+  visitOnlyOrigins.add(origin);
+  let tab, completed = false, oauth = false;
+  try {
+    await waitForAgentRouterTurn(platform);
+    tab = await chrome.tabs.create({ url: home, active: false });
+    if (!tab || tab.id == null) throw new Error("无法创建访问页面");
+    await waitVisitComplete(tab.id);
+    const user = await readVisitSession(platform, tab.id, true);
+    // 与普通任务一致：依赖登录回调的站点需要重新登录，不能用旧会话跳过该动作。
+    const reauth = !!(options && options.reauth);
+    const forceLogin = reauth && (isAgentRouterReauthMode(platform) ||
+      (platform.authMode === "password" && isSelfTriggerMode(platform)));
+    if (!user || forceLogin) {
+      if (platform.authMode === "password") {
+        await loginPasswordOnTab(platform, tab, forceLogin);
+      } else {
+        if (isAgentRouterReauthMode(platform)) {
+          // 进入 OAuth 就必须退出旧站点会话，即使它属于另一提供方/账号。
+          const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: tabLogout });
+          if (!out || !out[0] || !out[0].result || !out[0].result.ok) throw new Error("无法退出旧登录会话，页面已保留");
+          clearSiteSessionTokens(origin);
+          oauth = true;
+          await updateAgentRouterPending(tab.id, { tabId: tab.id, base: platform.baseUrl, origin,
+            platformId: platform.id || null, userId: String(platform.userId || ""), authMode: platform.authMode,
+            provider: agentRouterProvider(platform), visitOnly: true, oauthStarted: false, createdAt: Date.now() });
+        }
+        await chrome.tabs.update(tab.id, { url: origin + "/login", active: true });
+        await waitVisitComplete(tab.id);
+      }
+      await waitVisitSession(platform, tab.id, oauth, true);
+    }
+    // 无论旧会话还是刚完成登录，都刷新首页一次，再在线读取额度；不等同于“额度必须上涨”。
+    await chrome.tabs.update(tab.id, { url: home, active: false });
+    await waitVisitComplete(tab.id);
+    const freshUser = await waitVisitSession(platform, tab.id, false, false, true);
+    const read = (reqPath, query) => readVisitApi(platform, tab.id, reqPath, query);
+    const account = await fetchAccount(platform, currentMonth(), freshUser, read);
+    // 日志取数期间共享会话可能变化；关闭前再核验，并以这份在线数据更新最终额度。
+    const finalUser = await waitVisitSession(platform, tab.id, false, false, true);
+    Object.assign(account, accountFromSelf(finalUser, account.monthlyTokens, account.tokensTruncated, account._warn));
+    const previous = platform.account && platform.account.available;
+    const quotaDelta = previous != null && previous !== "" && Number.isFinite(Number(previous))
+      ? Number(account.available) - Number(previous) : null;
+    // 先发布最新账户信息，让侧边栏/管理页同步额度，再关闭临时页。
+    await mutatePlatforms((list) => {
+      const current = list.find((entry) => entry.id === platform.id);
+      if (current && sameTaskConfig(current, platform)) current.account = Object.assign({}, current.account || {}, account);
+      return list;
+    });
+    if (oauth) { await updateAgentRouterPending(tab.id, null); oauth = false; }
+    await chrome.tabs.remove(tab.id); // 只有登录、刷新和最新额度都确认成功，才关闭本轮临时页。
+    completed = true;
+    return { ok: true, visited: true, outcome: "visited", message: "登录及刷新完成，最新额度已更新，临时页已关闭（已跳过签到接口）",
+      data: null, account, quotaDelta, lastVisitedAt: new Date().toISOString(), lastVisitDate: todayStr() };
+  } finally {
+    try {
+      if (oauth && tab) await updateAgentRouterPending(tab.id, null);
+      if (!completed && tab) await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    } finally { visitOnlyOrigins.delete(origin); }
+  }
+}
+
+// 签到 / 仅访问
 async function runCheckin(platform, options) {
   try {
+    platform = await resolveSavedVisitOnly(platform);
+    if (isVisitOnly(platform)) return await runVisitOnly(platform, options);
     // Agent Router 通过退出并重新登录签到；其他自触发兼容站点仍使用 GET 请求。
     const isSelfTrigger = isSelfTriggerMode(platform);
     const method = isSelfTrigger ? "GET" : "POST";
@@ -974,18 +1579,11 @@ async function runCheckin(platform, options) {
     const uname = data && (data.username || data.display_name);
     let msg = body.message;
     if (body._reauthRequired) {
-      if (body._githubLoginStarted) {
-        msg = "签到成功，正在通过 GitHub 自动重新登录；完成后临时页面会自动关闭";
-      } else {
-        msg = body._logoutOk
-          ? "签到成功，请在 Agent Router 登录页使用 GitHub 重新登录以激活额度"
-          : "签到已提交，请退出并重新登录 Agent Router 以激活额度";
-      }
-    } else if (isAgentRouterTokenMode(platform)) {
-      msg = (msg || "Agent Router 签到已触发") + "；如额度未到账，请在网页退出并重新登录";
-    } else if (isSelfTrigger && !(options && options.reauth)) {
-      msg = (msg || "签到成功") + "；请退出并重新登录 Agent Router 以激活额度";
+      return { ok: true, pending: true, outcome: "pending", message: body.message || "等待登录完成并确认签到", data: null,
+        reauthRequired: true, reauthStartedAt: body._reauthStartedAt, oauthLoginStarted: !!body._oauthLoginStarted, githubLoginStarted: !!body._githubLoginStarted };
     }
+    // 仅仅读取 Agent Router 用户信息不能证明签到。
+    if (isAgentRouterReauthMode(platform)) throw new Error("当前操作仅刷新了账户信息，未执行重登录签到");
     if (!msg) {
       if (awarded != null) msg = "签到成功，获得额度 " + awarded;
       else if (isSelfTrigger) msg = (uname ? "用户「" + uname + "」" : "") + "信息请求成功，签到已自动完成";
@@ -1015,7 +1613,7 @@ function monthRangeTs(month) {
 
 // 拉 /api/user/self 的账户数据（token 或 cookie 模式自适应）
 // 分页累加月内所有日志的 prompt_tokens + completion_tokens（上游无现成 token 总数接口）
-async function fetchMonthlyTokens(platform, month) {
+async function fetchMonthlyTokens(platform, month, read) {
   const { start, end } = monthRangeTs(month);
   let tokens = 0, total = null, page = 1, guard = 0, truncated = false;
   const per = 100;
@@ -1023,9 +1621,8 @@ async function fetchMonthlyTokens(platform, month) {
     if (++guard > 40) { truncated = true; break; }
     let body;
     try {
-      body = await callApi(platform, "/api/log/self", "GET", {
-        query: { start_timestamp: start, end_timestamp: end, type: 0, p: page, per },
-      });
+      const query = { start_timestamp: start, end_timestamp: end, type: 0, p: page, per };
+      body = read ? await read("/api/log/self", query) : await callApi(platform, "/api/log/self", "GET", { query });
     } catch (e) {
       return tokens > 0 ? { tokens, truncated: true } : null;
     }
@@ -1047,9 +1644,10 @@ async function fetchMonthlyTokens(platform, month) {
   return { tokens, truncated };
 }
 
-async function fetchAccount(platform, month, reuseSelfData) {
-  if (await isAgentRouterReauthPending(platform)) {
-    throw new Error("Agent Router 正在通过 GitHub 重新登录，请在登录完成后刷新额度");
+async function fetchAccount(platform, month, reuseSelfData, read) {
+  validatePlatform(platform);
+  if (!read && await isAgentRouterReauthPending(platform)) {
+    throw new Error("Agent Router 正在重新登录，请在登录完成后刷新额度");
   }
   let selfData = reuseSelfData || null;
   let selfErr = "";
@@ -1057,7 +1655,9 @@ async function fetchAccount(platform, month, reuseSelfData) {
   if (!selfData) {
     try {
       let selfBody;
-      if (isAgentRouterGithubMode(platform)) {
+      if (read) {
+        selfBody = await read("/api/user/self");
+      } else if (isAgentRouterReauthMode(platform)) {
         const result = await callAgentRouterAccountViaTab(
           platform,
           (platform.baseUrl || "").trim().replace(/\/+$/, ""),
@@ -1067,13 +1667,16 @@ async function fetchAccount(platform, month, reuseSelfData) {
       } else {
         selfBody = await callApi(platform, "/api/user/self", "GET");
       }
-      if (isAgentRouterGithubMode(platform)) verifyConfiguredUser(platform, selfBody);
+      if (isAgentRouterReauthMode(platform)) verifyConfiguredUser(platform, selfBody);
       selfData = (selfBody && selfBody.data) || null;
-    } catch (e) { selfErr = e && e.message ? e.message : String(e); selfData = null; }
+    } catch (e) {
+      if (e && e.code === "ACCOUNT_MISMATCH") throw e;
+      selfErr = e && e.message ? e.message : String(e); selfData = null;
+    }
   }
   let monthlyTokens = null, tokensTruncated = false, tokenErr = "";
   try {
-    const r = await fetchMonthlyTokens(platform, month);
+    const r = await fetchMonthlyTokens(platform, month, read);
     if (r) { monthlyTokens = r.tokens; tokensTruncated = !!r.truncated; }
     else tokenErr = "日志接口无数据";
   } catch (e) { tokenErr = e && e.message ? e.message : String(e); }
@@ -1087,6 +1690,15 @@ async function fetchAccount(platform, month, reuseSelfData) {
   if (accountWarn) warnings.push(accountWarn);
   if (tokensTruncated) warnings.push("本月Token为前若干页累计估算（超出截断）");
   else if (monthlyTokens == null) warnings.push("本月Token接口不可用");
+  return accountFromSelf(selfData, monthlyTokens, tokensTruncated, warnings.join("；"));
+}
+
+function hasAccountQuota(data) {
+  const quota = accountFromSelf(data).available;
+  return (typeof quota === "number" || (typeof quota === "string" && quota.trim() !== "")) && Number.isFinite(Number(quota));
+}
+
+function accountFromSelf(selfData, monthlyTokens = null, tokensTruncated = false, warning = "") {
   const quotaValue = (data, names) => {
     if (!data) return null;
     for (const name of names) {
@@ -1101,11 +1713,39 @@ async function fetchAccount(platform, month, reuseSelfData) {
     monthlyTokens,
     tokensTruncated,
     displayName: selfData ? (selfData.display_name || selfData.displayName || selfData.username) : null,
-    _warn: warnings.join("；"),
+    _warn: warning,
   };
 }
 
+function unverifiedOauthConfig(platform) {
+  return { ok: true, configOnly: true, needsLogin: true, data: null,
+    message: "配置已校验，尚未确认此账号登录；执行任务时将通过 " + agentRouterProviderLabel(agentRouterProvider(platform)) + " 登录" + (platform.userId ? "用户ID " + String(platform.userId).trim() : "对应账号") + "，不会沿用其他账号的额度" };
+}
+
 async function runStats(platform, month) {
+  platform = await resolveSavedVisitOnly(platform);
+  // 配置校验失败不能靠账户缓存降级为连接成功。
+  try { validatePlatform(platform); }
+  catch (e) { return { ok: false, message: e.message, error: e.message }; }
+  if (isAgentRouterReauthMode(platform)) {
+    try {
+      if (await isAgentRouterReauthPending(platform)) return unverifiedOauthConfig(platform);
+      const result = await callAgentRouterAccountViaTab(platform, platform.baseUrl.trim().replace(/\/+$/, ""), true);
+      const account = await fetchAccount(platform, month || currentMonth(), result.body.data);
+      return { ok: true, message: "当前账号在线身份及额度已确认", data: null, account };
+    } catch (e) {
+      if (e && ["ACCOUNT_MISMATCH", "AUTH_NOT_LOGGED_IN"].includes(e.code)) {
+        return unverifiedOauthConfig(platform);
+      }
+      return { ok: false, message: e.message, error: e.message };
+    }
+  }
+  if (isVisitOnly(platform)) {
+    try {
+      const account = await fetchAccount(platform, month || currentMonth(), null);
+      return { ok: true, message: "登录及额度检测成功（已跳过签到接口）", data: null, account };
+    } catch (e) { return { ok: false, message: e.message, error: e.message }; }
+  }
   const isSelfTrigger = isSelfTriggerMode(platform);
   try {
     const body = await callCheckin(platform, "GET", month);
@@ -1132,6 +1772,7 @@ const PERF_HOURS_DEFAULT = 24;
 // 只读 GET：保留 HTTP 状态码，便于区分"版本不支持(404)"和"令牌无效(401)"。
 // 不复用 callApiPath，避免把状态码丢进异常里，也避免影响既有签到链路。
 async function rawGetJson(p, reqPath, query) {
+  await assertApiAllowed(p, reqPath);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
   let url;
   try {
@@ -1205,6 +1846,7 @@ function tabGetPerfJson(reqPath, query, bearer, apiUserKey, userId) {
     } catch {
       return { status: 0, httpOk: false, netError: "接口路径不合法" };
     }
+    if (url.origin !== location.origin) return { status: 0, httpOk: false, netError: "禁止向其他站点发送会话令牌" };
     if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
     const headers = { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" };
     if (bearer) headers["Authorization"] = "Bearer " + bearer;
@@ -1399,12 +2041,15 @@ async function withInsightReader(platform, fn) {
   if (isTokenAuthMode(platform)) {
     return await fn((reqPath, query) => rawGetJson(platform, reqPath, query));
   }
+  if (await isAgentRouterReauthPending(platform)) throw new Error("本站正在重新登录，请完成后读取模型数据");
+  if (platform.authMode === "password") await ensurePasswordSession(platform);
   const st = cookieStrategy(platform, base);
   const apiUserKey = st.apiUserKey || "New-Api-User";
   const userId = String(platform.userId || "").trim();
   const key = sessionTokenKey(base, userId);
   return await withSiteTab(base, async (tabId) => {
     const read = async (reqPath, query) => {
+      await assertApiAllowed(platform, reqPath);
       const bearer = readSessionToken(key);
       const first = await injectGetJson(tabId, reqPath, query, bearer, apiUserKey, userId);
       if (first.ok || first.status !== 401) return first;
@@ -1857,6 +2502,8 @@ function mergeStats(platform, data, message, ok) {
 
 // 分类签到结果：成功 / 今日已签到 / 失败
 function classify(result) {
+  if (result.visited) return "visited";
+  if (result.reauthRequired || result.pending) return "pending";
   if (result.ok) return "ok";
   if (isAlreadyCheckinMessage(result.message))
     return "already";
@@ -2014,16 +2661,17 @@ async function retryKeepAliveWithModels(format, url, key, tried) {
   return { ok: false, tried: used, error: lastError };
 }
 async function runKeepAliveCall(p) {
+  p = await resolveSavedVisitOnly(p);
   const ka = getKeepAlive(p);
   if (!ka.enabled) return null;
   const format = ka.format;
   let url = ka.url || keepAliveDefaultUrl(p, format);
   if (!url) return { ok: false, message: "未配置调用网址", status: 0 };
   let key = ka.key || "";
-  if (!key && !isAgentRouterTokenMode(p) && p.authMode !== "cookie") {
+  if (!key && isTokenAuthMode(p)) {
     key = String((p && p.accessToken) || "").trim();
   }
-  if (!key) return { ok: false, message: "未填写 API Key（Cookie/Agent Router 模式必须填写）", status: 0 };
+  if (!key) return { ok: false, message: "未填写 API Key（Cookie/邮箱密码/Agent Router 模式必须填写）", status: 0 };
   const tried = [];
   let first = null;
   try {
@@ -2044,16 +2692,17 @@ async function runKeepAliveCall(p) {
   return { ok: false, status: first.status, message: first.message };
 }
 async function listKeepAliveModels(p) {
+  p = await resolveSavedVisitOnly(p);
   const ka = getKeepAlive(p);
   if (!ka.enabled) return { ok: false, message: "请先开启「自动调用 API」开关" };
   const format = ka.format;
   let url = ka.url || keepAliveDefaultUrl(p, format);
   if (!url) return { ok: false, message: "未配置调用网址" };
   let key = ka.key || "";
-  if (!key && !isAgentRouterTokenMode(p) && p.authMode !== "cookie") {
+  if (!key && isTokenAuthMode(p)) {
     key = String((p && p.accessToken) || "").trim();
   }
-  if (!key) return { ok: false, message: "未填写 API Key（Cookie/Agent Router 模式必须填写）" };
+  if (!key) return { ok: false, message: "未填写 API Key（Cookie/邮箱密码/Agent Router 模式必须填写）" };
   try {
     const models = await fetchKeepAliveModels(format, key, url);
     if (!models.length) return { ok: false, message: "站点没有可用对话模型" };
@@ -2073,7 +2722,11 @@ async function runBatchCheckinOne(partial) {
     if (alive && alive.ok) {
       const ka = getKeepAlive(stored);
       stored.keepAlive = normalizeKeepAlive(Object.assign({}, ka, { lastDate: todayStr() }));
-      await savePlatforms(cur);
+      await mutatePlatforms((latest) => {
+        const current = latest.find((entry) => entry.id === stored.id);
+        if (current && sameTaskConfig(current, stored)) current.keepAlive = stored.keepAlive;
+        return latest;
+      });
     }
   }
   const r = await runCheckin(stored, { reauth: true });
@@ -2112,7 +2765,8 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
   const platforms = explicitSelection ? selectedPlatforms : await getPlatforms();
   if (!platforms.length) return { skipped: true };
   const today = todayStr();
-  const results = await Promise.all(platforms.map(async (p) => {
+  const results = await Promise.all(platforms.map((p) => withPlatformSession(p, async () => {
+    p = await resolveSavedVisitOnly(p); // 出队后重读，不能让等待期间开启的仅访问失效。
     let alive = null;
     if (needsKeepAliveToday(p)) {
       alive = await runKeepAliveCall(p);
@@ -2121,8 +2775,11 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
         p.keepAlive = normalizeKeepAlive(Object.assign({}, ka, { lastDate: today }));
       }
     }
-    const alreadyToday = !!(p.stats && p.stats.checked_in_today && p.statsDate === today);
-    const r = explicitSelection && alreadyToday
+    const alreadyVisited = isVisitOnly(p) && p.lastVisitDate === today;
+    const alreadyToday = !isVisitOnly(p) && !!(p.stats && p.stats.checked_in_today && p.statsDate === today);
+    const r = explicitSelection && alreadyVisited
+      ? { ok: true, visited: true, message: "今日已访问", data: null, lastVisitDate: p.lastVisitDate, lastVisitedAt: p.lastVisitedAt }
+      : explicitSelection && alreadyToday
       ? { ok: true, message: "今日已签到", data: null, _alreadySkipped: true }
       : await runCheckin(p, { reauth: true });
     if (alive) {
@@ -2132,8 +2789,8 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
       r.message = part + "｜" + r.message;
     }
     return { platform: p, result: r, alive, kind: r._alreadySkipped ? "already" : classify(r) };
-  }));
-  let ok = 0, already = 0, fail = 0, aliveOk = 0, aliveFail = 0;
+  })));
+  let ok = 0, already = 0, fail = 0, pending = 0, visited = 0, aliveOk = 0, aliveFail = 0;
   const list = [];
   const cur = await getPlatforms();
   for (let i = 0; i < results.length; i++) {
@@ -2141,19 +2798,27 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
     const p = item.platform;
     const r = item.result;
     const kind = item.kind;
-    if (kind === "ok") ok++;
+    if (kind === "visited") visited++;
+    else if (kind === "ok") ok++;
     else if (kind === "already") already++;
+    else if (kind === "pending") pending++;
     else fail++;
     if (item.alive) { if (item.alive.ok) aliveOk++; else aliveFail++; }
     list.push({ id: p.id, name: p.name, ok: r.ok, message: r.message, kind, aliveOk: !!(item.alive && item.alive.ok), aliveFail: !!(item.alive && !item.alive.ok) });
     const idx = cur.findIndex((x) => x.id === p.id);
-    if (idx >= 0) {
+    if (idx >= 0 && sameTaskConfig(cur[idx], p)) {
       if (item.alive) cur[idx].keepAlive = normalizeKeepAlive(p.keepAlive);
       cur[idx].message = r.message;
       cur[idx].error = r.ok ? "" : r.message;
-      cur[idx].lastCheckinAt = new Date().toISOString();
+      cur[idx].reauthPending = !!r.reauthRequired;
+      if (r.reauthRequired) cur[idx].reauthStartedAt = r.reauthStartedAt;
+      if (r.visited) {
+        cur[idx].lastVisitDate = r.lastVisitDate;
+        cur[idx].lastVisitedAt = r.lastVisitedAt;
+        if (r.account) cur[idx].account = Object.assign({}, cur[idx].account || {}, r.account);
+      } else if (!isVisitOnly(p)) cur[idx].lastCheckinAt = new Date().toISOString();
       // 跨天"今日已签到"锚点：成功或站点明确提示重复签到即标记今天
-      if (r.ok || isAlreadyCheckinMessage(r.message)) {
+      if (!r.visited && !isVisitOnly(p) && !r.reauthRequired && (r.ok || isAlreadyCheckinMessage(r.message))) {
         cur[idx].stats = cur[idx].stats || {};
         if (r.data && r.data.stats) Object.assign(cur[idx].stats, r.data.stats);
         cur[idx].stats.checked_in_today = true;
@@ -2167,6 +2832,8 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
     ok,
     already,
     fail,
+    pending,
+    visited,
     aliveOk,
     aliveFail,
     total: platforms.length,
@@ -2174,8 +2841,8 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
   };
   await setStore({ [KEY_LASTAUTO]: summary });
   if (settings.notify !== false) {
-    const title = (triggeredByUser ? "手动" : "自动") + "签到完成";
-    let body = `共 ${summary.total} 个站点：成功 ${ok}，已签 ${already}，失败 ${fail}`;
+    const title = (triggeredByUser ? "手动" : "自动") + (platforms.some(isVisitOnly) ? "访问/签到任务完成" : "签到完成");
+    let body = `共 ${summary.total} 个站点：成功 ${ok}，已签 ${already}，失败 ${fail}` + (visited ? `，已访问 ${visited}` : "") + (pending ? `，等待登录 ${pending}` : "");
     if (aliveOk || aliveFail) body += `；保活成功 ${aliveOk}，失败 ${aliveFail}`;
     notify(title, body);
   }
@@ -2190,7 +2857,9 @@ function autoTimeReached(value) {
 }
 
 async function findUncheckedPlatforms(platforms) {
-  const results = await Promise.all(platforms.map(async (p) => {
+  const results = await Promise.all(platforms.map((p) => withPlatformSession(p, async () => {
+    p = await resolveSavedVisitOnly(p);
+    if (isVisitOnly(p)) return p.lastVisitDate === todayStr() ? null : p;
     if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return null;
     // /api/user/self 本身会触发 Agent Router 签到，不能把它当作只读预检接口调用。
     if (isSelfTriggerMode(p)) return p;
@@ -2201,7 +2870,7 @@ async function findUncheckedPlatforms(platforms) {
       // 只读状态不可用时仍尝试签到，由签到接口返回最终结果。
     }
     return p;
-  }));
+  })));
   return results.filter(Boolean);
 }
 
@@ -2231,7 +2900,8 @@ async function checkScheduledAuto() {
     await saveAutoState(date, "done");
     return { skipped: true, already: true };
   }
-  const needCheckin = todo.some((p) => !(p.stats && p.stats.checked_in_today && p.statsDate === todayStr()));
+  const needVisit = todo.some(isVisitOnly);
+  const needCheckin = todo.some((p) => !isVisitOnly(p) && !(p.stats && p.stats.checked_in_today && p.statsDate === todayStr()));
   if (settings.autoApprove) {
     await saveAutoState(date, "approved");
     await runAutoCheckin(false, todo);
@@ -2243,10 +2913,10 @@ async function checkScheduledAuto() {
   chrome.notifications.create(id, {
     type: "basic",
     iconUrl: chrome.runtime.getURL("icons/icon128.png"),
-    title: "到达自动签到时间",
-    message: needCheckin ? "今天还有站点未签到，是否立即执行一键签到？" : "今天还有站点需要自动调用 API 保活，是否立即执行？",
+    title: needVisit ? "到达自动任务时间" : "到达自动签到时间",
+    message: needVisit ? "今天还有站点需要仅访问，是否执行本次访问/签到任务？" : needCheckin ? "今天还有站点未签到，是否立即执行一键签到？" : "今天还有站点需要自动调用 API 保活，是否立即执行？",
     priority: 2,
-    buttons: [{ title: "允许签到" }, { title: "跳过今天" }],
+    buttons: [{ title: needVisit ? "允许执行" : "允许签到" }, { title: "跳过今天" }],
   }).catch(() => {});
   return { pending: true };
 }
@@ -2287,24 +2957,60 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  getStore(KEY_AGENTROUTER_REAUTH, null).then((pending) => {
-    if (pending && pending.tabId === tabId) return setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+  getAgentRouterPending().then(async (all) => {
+    const pending = all[tabId];
+    if (!pending) return;
+    await updateAgentRouterPending(tabId, null);
+    await saveAgentRouterLoginOutcome(pending, null, "登录页已关闭，尚未确认签到，请重新执行签到");
   }).catch(() => {});
 });
 
-// Service Worker 休眠后恢复时，继续接管尚未完成的 OAuth 临时标签页。
-getStore(KEY_AGENTROUTER_REAUTH, null).then(async (pending) => {
-  if (!pending || pending.tabId == null) return;
-  const tab = await chrome.tabs.get(pending.tabId).catch(() => null);
-  if (!tab) return setStore({ [KEY_AGENTROUTER_REAUTH]: null });
-  handleAgentRouterReauthTab(tab.id, tab.url || "").catch(() => {});
+// Service Worker 休眠后恢复时，继续接管所有未完成的 OAuth 标签页。
+getAgentRouterPending().then(async (all) => {
+  if (Object.keys(all).length) chrome.alarms.create(OAUTH_ALARM_NAME, { periodInMinutes: 1 });
+  for (const pending of Object.values(all)) {
+    const tab = await chrome.tabs.get(pending.tabId).catch(() => null);
+    if (tab) handleAgentRouterReauthTab(tab.id, tab.url || "").catch(() => {});
+    else {
+      await updateAgentRouterPending(pending.tabId, null);
+      await saveAgentRouterLoginOutcome(pending, null, "登录页已关闭，尚未确认签到，请重新执行签到");
+    }
+  }
 }).catch(() => {});
+
+// 同源会话全操作排队，不仅序列化表单填写，防止批量请求在账号切换后串号。
+const platformSessionQueues = new Map();
+function withPlatformSession(platform, fn) {
+  if (!platform || isTokenAuthMode(platform)) return Promise.resolve().then(fn);
+  let origin;
+  try { origin = new URL(platform.baseUrl).origin; } catch { return Promise.resolve().then(fn); }
+  const previous = platformSessionQueues.get(origin) || Promise.resolve();
+  const task = previous.catch(() => {}).then(fn);
+  platformSessionQueues.set(origin, task);
+  task.finally(() => { if (platformSessionQueues.get(origin) === task) platformSessionQueues.delete(origin); }).catch(() => {});
+  return task;
+}
 
 // ---------- 消息总线（popup <-> SW） ----------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  (async () => {
+  if (!sender || sender.id !== chrome.runtime.id || !String(sender.url || "").startsWith(chrome.runtime.getURL(""))) {
+    sendResponse({ ok: false, message: "只接受扩展界面的请求" });
+    return false;
+  }
+  withPlatformSession(msg.platform, async () => {
     try {
-      if (msg.type === "stats" || msg.type === "test") {
+      // 旧界面/快照遗漏新标志时，以已保存的仅访问配置为准，不能降级成签到。
+      if (msg.platform && msg.platform.id && msg.type !== "test") {
+        const stored = (await getPlatforms()).find((p) => p.id === msg.platform.id);
+        if (isVisitOnly(stored)) msg = { ...msg, platform: stored };
+      }
+      if (msg.type === "getCapabilities") {
+        sendResponse({ ok: true, authBuild: AUTH_CONFIG.build, authModes: [...AUTH_CONFIG.modes], version: chrome.runtime.getManifest().version });
+      } else if (msg.type === "savePlatforms") {
+        if (!Array.isArray(msg.platforms)) throw new Error("平台配置格式必须为数组");
+        await savePlatforms(msg.platforms);
+        sendResponse({ ok: true });
+      } else if (msg.type === "stats" || msg.type === "test") {
         const r = await runStats(msg.platform, msg.month);
         sendResponse(r);
       } else if (msg.type === "account") {
@@ -2348,7 +3054,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } catch (e) {
       sendResponse({ ok: false, message: e && e.message ? e.message : String(e) });
     }
-  })();
+  });
   return true; // 异步响应
 });
 
@@ -2361,6 +3067,18 @@ async function syncAlarm() {
   }
 }
 chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === OAUTH_ALARM_NAME) {
+    getAgentRouterPending().then(async (all) => {
+      for (const pending of Object.values(all)) {
+        const tab = await chrome.tabs.get(pending.tabId).catch(() => null);
+        if (tab) await handleAgentRouterReauthTab(tab.id, tab.url || "");
+        else {
+          await updateAgentRouterPending(pending.tabId, null);
+          await saveAgentRouterLoginOutcome(pending, null, "登录页已关闭，尚未确认签到，请重新执行签到");
+        }
+      }
+    }).catch(() => {});
+  }
   if (a.name === ALARM_NAME) checkScheduledAuto().catch(() => {});
 });
 

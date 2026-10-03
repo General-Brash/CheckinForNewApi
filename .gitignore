@@ -1,10 +1,24 @@
-﻿# 构建产物 / 旧打包
+# Packaged extension builds and signing keys
 *.zip
+*.crx
+*.pem
 
-# 误留的无关文件
+# Local secrets/configuration
+.env
+.env.*
+!.env.example
+
+# Dependencies and generated test output
+node_modules/
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Unrelated leftovers
 ar.go
 
-# 系统垃圾
+# Operating-system files
 .DS_Store
 Thumbs.db
-node_modules/
+desktop.ini
