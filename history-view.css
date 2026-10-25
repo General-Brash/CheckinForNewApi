@@ -1,0 +1,43 @@
+/* Read-only history dashboard. Colors inherit the extension's active light/dark theme. */
+.history-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:14px;background:var(--modal-overlay,rgba(4,7,12,.68));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:var(--ink,#eef2f8);font:13px/1.5 "Inter","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+.history-panel{display:flex;flex-direction:column;gap:14px;width:min(1040px,100%);max-height:min(94vh,1000px);overflow:auto;padding:20px;border:1px solid var(--border,rgba(255,255,255,.12));border-radius:16px;background:var(--modal-bg,linear-gradient(180deg,#141c28,#0c121c));box-shadow:var(--modal-shadow,0 24px 70px rgba(0,0,0,.5));overscroll-behavior:contain}
+.history-panel:focus{outline:none}
+.history-panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.history-panel-heading h2{margin:0;color:var(--ink);font-size:20px;line-height:1.3}
+.history-panel-heading p{margin:4px 0 0;color:var(--muted);font-size:12px}
+.history-close{flex:none;padding:7px 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--ink);font:inherit;cursor:pointer}
+.history-close:hover{border-color:var(--primary);color:var(--primary)}
+.history-overlay button:focus-visible,.history-overlay select:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.history-controls{display:flex;flex-wrap:wrap;gap:12px}
+.history-control{display:flex;align-items:center;gap:8px;min-width:220px;color:var(--muted);font-size:12px}
+.history-control select{min-width:150px;max-width:min(340px,65vw);margin:0;padding:8px 32px 8px 10px;border:1px solid var(--border);border-radius:8px;background-color:var(--field-bg,var(--surface));color:var(--ink);font:inherit}
+.history-range{margin:0;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.history-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.history-summary-card{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px;border:1px solid var(--border-soft,var(--border));border-radius:11px;background:var(--surface)}
+.history-summary-label{color:var(--muted);font-size:11px}
+.history-summary-value{overflow-wrap:anywhere;color:var(--ink);font-size:19px;font-variant-numeric:tabular-nums}
+.history-summary-detail{color:var(--faint);font-size:10px;line-height:1.45}
+.history-coverage{margin:0;padding:9px 11px;border-left:3px solid var(--primary);border-radius:4px 8px 8px 4px;background:var(--tint,rgba(255,255,255,.035));color:var(--muted);font-size:11px;line-height:1.55}
+.history-charts{display:grid;grid-template-columns:1fr;gap:10px}
+.history-chart-section,.history-table-section{min-width:0;padding:12px;border:1px solid var(--border-soft,var(--border));border-radius:11px;background:var(--surface)}
+.history-chart-section h3,.history-table-section h3{margin:0 0 6px;color:var(--ink);font-size:13px}
+.history-chart-container{min-height:112px;overflow:hidden}
+.history-chart-container svg{display:block;width:100%;height:214px;min-height:0;overflow:visible}
+.history-grid-line{stroke:var(--border);stroke-width:1;stroke-dasharray:3 4}
+.history-axis-label{fill:var(--muted);font-size:11px;font-family:inherit}
+.history-chart-line{fill:none;stroke:var(--primary);stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.history-chart-dot{fill:var(--surface-2,var(--surface));stroke:var(--primary);stroke-width:2;vector-effect:non-scaling-stroke}
+.history-chart-note{margin:2px 2px 0;color:var(--muted);font-size:11px;line-height:1.45}
+.history-chart-empty{display:flex;min-height:96px;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:14px;text-align:center;color:var(--muted)}
+.history-chart-empty strong{color:var(--ink);font-size:12px}
+.history-chart-empty p{max-width:680px;margin:0;font-size:11px;line-height:1.55}
+.history-table-scroll{max-height:280px;overflow:auto;border:1px solid var(--border-soft,var(--border));border-radius:8px}
+.history-table{width:100%;border-collapse:collapse;color:var(--ink);font-size:11px;font-variant-numeric:tabular-nums}
+.history-table th,.history-table td{padding:7px 8px;border-bottom:1px solid var(--border-soft,var(--border));text-align:left;vertical-align:top}
+.history-table th{position:sticky;top:0;z-index:1;background:var(--surface-2,var(--surface));color:var(--muted);font-size:10px;white-space:nowrap}
+.history-table td{overflow-wrap:anywhere}
+.history-table tr:last-child td{border-bottom:0}
+.history-table-empty{text-align:center!important;color:var(--muted);padding:18px!important}
+@media(min-width:780px){.history-charts{grid-template-columns:repeat(2,minmax(0,1fr))}.history-chart-section:first-child{grid-column:1/-1}}
+@media(max-width:560px){.history-overlay{align-items:stretch;padding:0}.history-panel{width:100%;max-height:100dvh;padding:14px;border:0;border-radius:0}.history-panel-heading h2{font-size:17px}.history-summary{grid-template-columns:1fr}.history-summary-card{padding:9px 10px}.history-summary-value{font-size:17px}.history-control{justify-content:space-between;width:100%;min-width:0}.history-control select{flex:1;min-width:0;max-width:72%}.history-table{min-width:650px}}
+@media(prefers-reduced-motion:reduce){.history-overlay *{scroll-behavior:auto!important;transition:none!important}}

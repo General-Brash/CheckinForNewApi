@@ -1,7 +1,13 @@
 // ===== NewAPI 一键签到 - 弹窗/侧边栏/宽屏页 共用逻辑 =====
 const KEY_PLATFORMS = "nacheckin.platforms";
 const KEY_SETTINGS = "nacheckin.settings";
+const KEY_EXPANDED_GROUPS = "nacheckin.expandedAccountGroups";
+let expandedAccountGroups = new Set();
+const visitProgress = new Map();
+const KEY_CHECKIN_STOP_VERSION = "nacheckin.checkinStopVersion";
+const DEFAULT_QUOTA_PER_UNIT = 500000;
 let platforms = [];
+let checkinStopVersion = 0;
 let editingId = null;
 let connectionPromise = null;
 let connectionConfig = null;
@@ -9,6 +15,15 @@ let connectionRequestId = 0;
 let deletingId = null;
 let keepAliveTestPromise = null;
 let keepAlivePickPromise = null;
+let checkinRequestSequence = 0;
+let activeBatchRun = null;
+let batchRunSequence = 0;
+let activeAutoRun = null;
+let autoRunSequence = 0;
+let pendingStopRequests = 0;
+const activeCheckins = new Map();
+const startingCheckins = new Map();
+const cancelledCheckins = new Map();
 
 function todayStr() {
   const d = new Date();
@@ -51,8 +66,23 @@ function keepAliveDefaultUrl(baseUrl, format) {
   return base ? base + (KEEPALIVE_PATHS[format] || KEEPALIVE_PATHS.chat) : "";
 }
 
-function formatQuota(v) {
-  return (Number(v || 0) / 500000).toFixed(4);
+function quotaNumber(v) {
+  if (typeof v !== "number" && typeof v !== "string") return null;
+  if (typeof v === "string" && !v.trim()) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function quotaUnitFor(account) {
+  if (!account || account.quotaPerUnit === undefined) return DEFAULT_QUOTA_PER_UNIT;
+  const unit = quotaNumber(account.quotaPerUnit);
+  return unit !== null && unit > 0 ? unit : null;
+}
+function formatQuota(v, quotaPerUnit = DEFAULT_QUOTA_PER_UNIT) {
+  const amount = quotaNumber(v);
+  const unit = quotaNumber(quotaPerUnit);
+  if (amount === null || unit === null || unit <= 0) return "—";
+  const value = amount / unit;
+  return Number.isFinite(value) ? value.toFixed(4) : "—";
 }
 function fmtTokens(v, truncated) {
   if (v == null) return "—";
@@ -103,7 +133,7 @@ function sendRaw(msg) {
 const AUTH_CONFIG = globalThis.NACheckinAuth;
 const AUTH_MODES = AUTH_CONFIG.modes;
 const isAgentRouterMode = (p) => AUTH_CONFIG.isAgentRouterMode(p.authMode);
-const AUTH_REQUEST_TYPES = new Set(["test", "stats", "account", "checkin", "modelInsight", "modelDetail", "testKeepAlive", "keepAliveModels", "savePlatforms", "autoRun"]);
+const AUTH_REQUEST_TYPES = new Set(["test", "stats", "account", "checkin", "modelInsight", "modelDetail", "testKeepAlive", "keepAliveModels", "savePlatforms", "autoRun", "stopCheckin"]);
 // 修改源码后，现有扩展后台可能仍运行旧代码。先握手，不能将新模式交给旧 token 校验。
 // 不缓存握手结果：同一页面存活期间 Service Worker 也可能更新/恢复。
 async function send(msg) {
@@ -120,6 +150,7 @@ async function send(msg) {
 const isVisitOnly = (p) => NACheckinAuth.isVisitOnly(p);
 const slim = (p) => ({
   id: p.id, baseUrl: p.baseUrl, userId: p.userId, authMode: p.authMode, visitOnly: isVisitOnly(p),
+  logoutAfterVisit: NACheckinAuth.shouldLogoutAfterVisit(p),
   accessToken: !p.authMode || p.authMode === "token" ? p.accessToken : "",
   ...(p.authMode === "password" ? { loginUsername: String(p.loginUsername || "").trim(), loginPassword: p.loginPassword } : {}),
 });
@@ -127,7 +158,7 @@ const slimFull = (p) => ({ id: p.id, ...slim(p), keepAlive: normalizeKeepAlive(p
 const getStats = (p, month) =>
   send({ type: "stats", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 const doCheckin = (p, opts = {}) =>
-  send({ type: "checkin", platform: slimFull(p), reauth: opts.reauth !== false, batch: !!opts.batch });
+  send({ type: "checkin", platform: slimFull(p), reauth: opts.reauth !== false, batch: !!opts.batch, stopVersion: opts.stopVersion });
 const getAccount = (p, month) =>
   send({ type: "account", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 const getModelInsight = (p, hours) => send({ type: "modelInsight", platform: slim(p), hours });
@@ -186,24 +217,218 @@ function mergeStatsInto(id, data, message, ok, account) {
     p.enabled = data.enabled;
     if (data.max_quota != null) p.stats.max_quota = data.max_quota;
     if (data.min_quota != null) p.stats.min_quota = data.min_quota;
-  } else if (!ok) {
-    p.error = message;
+  } else {
+    // 额度刷新独立于访问/签到结果；兼容旧版本把取数错误写入 p.error 的记录。
+    if (/^获取账户额度失败[：:]/.test(p.error || "")) p.error = "";
+    p.accountError = ok ? "" : message;
   }
   if (account) p.account = account;
 }
 
+function validStopVersion(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function isCancelledResult(result) {
+  return !!result && (result.cancelled === true || result.code === "CHECKIN_CANCELLED");
+}
+function readStoredStopVersion() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(KEY_CHECKIN_STOP_VERSION, (res) => {
+        const version = res && res[KEY_CHECKIN_STOP_VERSION];
+        resolve(validStopVersion(version) ? version : 0);
+      });
+    } catch (_) {
+      resolve(checkinStopVersion);
+    }
+  });
+}
+function applyStopVersion(version, announceExternal = false) {
+  if (!validStopVersion(version) || version <= checkinStopVersion) return false;
+  checkinStopVersion = version;
+  const hadProgress = visitProgress.size > 0;
+  for (const id of visitProgress.keys()) clearVisitProgress(id);
+  let stoppedWork = false;
+  for (const [id, operation] of startingCheckins) {
+    if (operation.stopVersion < version) {
+      startingCheckins.delete(id);
+      operation.cancelled = true;
+      const p = platforms.find((entry) => entry.id === id);
+      if (p) p.loading = false;
+      markCheckinCancelled(id, "签到已终止");
+      stoppedWork = true;
+    }
+  }
+  for (const [id, operation] of activeCheckins) {
+    if (operation.stopVersion < version) {
+      activeCheckins.delete(id);
+      const p = platforms.find((entry) => entry.id === id);
+      if (p) {
+        p.loading = false;
+        cancelledCheckins.set(id, "签到已终止");
+        stoppedWork = true;
+      }
+    }
+  }
+  if (activeBatchRun && activeBatchRun.stopVersion < version) {
+    activeBatchRun.cancelled = true;
+    activeBatchRun = null;
+    const batchButton = $("batchBtn");
+    if (batchButton) batchButton.disabled = false;
+    stoppedWork = true;
+  }
+  if (activeAutoRun && activeAutoRun.stopVersion < version) {
+    activeAutoRun.cancelled = true;
+    activeAutoRun = null;
+    const runNowButton = $("runNowBtn");
+    if (runNowButton) runNowButton.disabled = false;
+    stoppedWork = true;
+  }
+  if (stoppedWork || hadProgress) render();
+  if (announceExternal && stoppedWork && !pendingStopRequests) toast("已收到其他窗口的终止请求");
+  return true;
+}
+async function latestStopVersion() {
+  const stored = await readStoredStopVersion();
+  if (stored > checkinStopVersion) applyStopVersion(stored);
+  return checkinStopVersion;
+}
+async function stopCheckin() {
+  pendingStopRequests++;
+  try {
+    const result = await send({ type: "stopCheckin" });
+    if (!result || !result.ok || result.cancelled !== true || !validStopVersion(result.stopVersion)) {
+      toast((result && result.message) || "无法确认后台已终止签到，请重新加载扩展后台后重试。", true);
+      return result;
+    }
+    applyStopVersion(result.stopVersion);
+    toast(result.message || "签到任务已终止");
+    return result;
+  } catch (error) {
+    toast(error && error.message || "无法确认后台已终止签到，请重新加载扩展后台后重试。", true);
+    return { ok: false, message: error && error.message || "终止签到失败" };
+  } finally {
+    pendingStopRequests--;
+  }
+}
+function markCheckinCancelled(id, message) {
+  cancelledCheckins.set(id, message || "签到已终止");
+}
+function releaseCheckinOperation(id, operation) {
+  if (activeCheckins.get(id) !== operation) return false;
+  activeCheckins.delete(id);
+  return true;
+}
+
 // ---------- 渲染 ----------
 function status(p) {
-  if (p.loading) return ["处理中", "badge-muted"];
+  if (p.loading || currentVisitProgress(p.id)) return ["处理中", "badge-muted"];
+  if (cancelledCheckins.has(p.id)) return ["已终止", "badge-muted"];
   if (isVisitOnly(p)) {
-    if (p.error) return ["访问失败", "badge-danger"];
+    if (p.error) return [/^获取账户额度失败[：:]/.test(p.error) ? "额度刷新失败" : "访问失败", "badge-danger"];
+    if (p.accountError) return ["额度刷新失败", "badge-danger"];
     return p.lastVisitDate === todayStr() ? ["今日已访问", "badge-success"] : ["仅访问", "badge-warning"];
   }
   // checked_in_today 来自缓存，必须由 statsDate 锚定当天，否则跨天后视为待签到
   if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return ["今日已签到", "badge-success"];
   if (p.reauthPending) return ["等待登录", "badge-warning"];
   if (p.error) return ["请求失败", "badge-danger"];
+  if (p.accountError) return ["额度刷新失败", "badge-danger"];
   return ["待签到", "badge-warning"];
+}
+
+function clearVisitProgress(id) {
+  const progress = visitProgress.get(id);
+  if (progress) clearTimeout(progress.timer);
+  visitProgress.delete(id);
+}
+function currentVisitProgress(id) {
+  const progress = visitProgress.get(id);
+  return progress && progress.stopVersion === checkinStopVersion && Date.now() - progress.at < 90000 ? progress.message : "";
+}
+function accountGroupKey(p) {
+  try {
+    const url = new URL(p.baseUrl);
+    if (!/^https?:$/.test(url.protocol)) throw new Error("invalid");
+    // 保留部署路径和端口；不同 API 实例不能只因域名相同而合并。
+    return url.origin + url.pathname.replace(/\/+$/, "");
+  } catch { return "invalid:" + p.id; }
+}
+function groupAccounts(list) {
+  const groups = new Map();
+  for (const p of list) {
+    const key = accountGroupKey(p);
+    if (!groups.has(key)) groups.set(key, { key, accounts: [] });
+    groups.get(key).accounts.push(p);
+  }
+  return [...groups.values()];
+}
+function accountGroupSummary(accounts) {
+  const unique = new Map();
+  let duplicates = 0;
+  for (const p of accounts) {
+    // 只对在线确认过的用户 ID 去重，未确认身份的配置不猜测归属。
+    const id = p.account && p.account.userId;
+    const key = id != null && /^\d+$/.test(String(id)) ? "user:" + id : "config:" + p.id;
+    const previous = unique.get(key);
+    if (previous) {
+      duplicates++;
+      const time = (entry) => Date.parse(entry.account && entry.account.updatedAt || "") || 0;
+      if (time(previous) > time(p)) continue;
+    }
+    unique.set(key, p);
+  }
+  let total = 0, known = 0, unknown = 0;
+  for (const p of unique.values()) {
+    const acc = p.account || {};
+    const amount = quotaNumber(acc.available), unit = quotaUnitFor(acc);
+    const value = amount !== null && unit !== null ? amount / unit : NaN;
+    if (!Number.isFinite(value)) { unknown++; continue; }
+    total += value; known++;
+  }
+  return { total, known, unknown, duplicates };
+}
+function accountUpdatedLabel(account) {
+  const date = new Date(account && account.updatedAt || "");
+  return Number.isFinite(date.getTime()) ? "余额更新时间：" + date.toLocaleString() : "余额更新时间未知";
+}
+function accountIdentity(p) {
+  const id = p.account && p.account.userId || p.userId;
+  return id ? "用户 ID " + id : "尚未确认用户 ID";
+}
+function renderAccountPreview(p) {
+  const [label, cls] = status(p);
+  const account = p.account || {};
+  const busy = p.loading || startingCheckins.has(p.id) || activeCheckins.has(p.id) || !!currentVisitProgress(p.id);
+  const visitOnly = isVisitOnly(p);
+  const actionLabel = visitOnly ? (busy ? "访问中…" : "访问") : (busy ? "签到中…" : "签到");
+  const actionName = visitOnly ? "访问" : "快捷签到";
+  return '<div class="account-preview-row"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small></span>' +
+    '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account)) + '">' +
+    '<span class="account-preview-value"><button type="button" class="btn btn-primary account-preview-checkin" data-action="checkin" data-id="' + esc(p.id) + '" aria-label="' + esc(actionName + "：" + p.name) + '" title="' + esc(actionName + "：" + p.name) + '"' +
+    (busy ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
+    '<small class="' + esc(cls) + '">' + esc(label) + '</small></span></div>';
+}
+function renderAccountGroup(group, index) {
+  if (group.accounts.length === 1) return renderPlatformCard(group.accounts[0]);
+  const summary = accountGroupSummary(group.accounts);
+  const expanded = expandedAccountGroups.has(group.key);
+  const amount = summary.known && Number.isFinite(summary.total) ? "$" + summary.total.toFixed(4) : "—";
+  const warnings = (summary.unknown ? " · " + summary.unknown + " 个余额未知" : "") +
+    (summary.duplicates ? " · " + summary.duplicates + " 个重复身份配置未重复累计" : "");
+  return '<section class="account-group"><button class="account-group-toggle" data-action="toggle-group" data-group="' + esc(group.key) +
+    '" aria-expanded="' + expanded + '" aria-controls="account-group-' + index + '">' +
+    '<span><strong>' + (expanded ? "▾ " : "▸ ") + esc(group.key) + '</strong><small>' + group.accounts.length + ' 个账号配置' + esc(warnings) + '</small></span>' +
+    '<span class="account-group-total">' + amount + '<small>已知余额合计（最近快照）</small></span></button>' +
+    (expanded ? "" : '<div class="account-group-preview">' + group.accounts.map(renderAccountPreview).join("") + '</div>') +
+    '<div id="account-group-' + index + '" class="account-group-cards"' + (expanded ? "" : " hidden") + '>' +
+    (expanded ? group.accounts.map(renderPlatformCard).join("") : "") + '</div></section>';
+}
+function toggleAccountGroup(key) {
+  if (!groupAccounts(platforms).some((group) => group.key === key)) return;
+  if (expandedAccountGroups.has(key)) expandedAccountGroups.delete(key); else expandedAccountGroups.add(key);
+  chrome.storage.local.set({ [KEY_EXPANDED_GROUPS]: [...expandedAccountGroups] });
+  render();
 }
 
 function render() {
@@ -212,63 +437,104 @@ function render() {
   const today = todayStr();
   $("checkedPlatforms").textContent = platforms.filter((p) => !isVisitOnly(p) && p.stats && p.stats.checked_in_today && p.statsDate === today).length;
   $("monthCheckins").textContent = platforms.reduce((n, p) => n + ((!isVisitOnly(p) && p.stats && p.stats.checkin_count) || 0), 0);
-  $("totalQuota").innerHTML =
-    formatQuota(platforms.reduce((n, p) => n + (Number(p.account && p.account.available) || 0), 0)) + ' <small>$</small>';
+  const groups = groupAccounts(platforms);
+  const totals = groups.map((group) => accountGroupSummary(group.accounts));
+  const totalQuota = totals.reduce((sum, group) => sum + group.total, 0);
+  const hasQuota = totals.some((group) => group.known);
+  $("totalQuota").innerHTML = (hasQuota && Number.isFinite(totalQuota) ? totalQuota.toFixed(4) : "—") + ' <small>$</small>';
 
   if (!platforms.length) {
     grid.innerHTML = '<div class="empty">还没有平台配置，点击下方「添加平台」开始使用。</div>';
     return;
   }
-  grid.innerHTML = platforms
-    .map((p) => {
-      const [label, cls] = status(p);
-      const q = p.stats || {};
-      const acc = p.account || {};
-      const qv = (v) => (v == null ? "—" : formatQuota(v));
-      const qt = (v, trunc) => fmtTokens(v, trunc);
-      const addr = safeHttpUrl(p.baseUrl);
-      return (
-        '<article class="platform-card"><div class="card-top"><div>' +
-        "<h3 class=\"platform-name\">" + esc(p.name) + "</h3>" +
-        (addr
-          ? '<a class="address address-link" href="' + esc(addr) + '" target="_blank" rel="noopener noreferrer" data-action="open-site" title="在浏览器中打开 ' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</a>"
-          : '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div>") +
-        "</div>" +
-        '<span class="badge ' + cls + '">' + label + "</span>" + (normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
-        '<div class="card-stats">' +
-        '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
-        '<div class="mini-stat"><strong>' + qv(acc.used) + '</strong><span>已用额度</span></div>' +
-        '<div class="mini-stat"><strong>' + qt(acc.monthlyTokens, acc.tokensTruncated) + '</strong><span>本月Token</span></div>' +
-        "</div>" +
-        '<p class="message' + (p.error ? " err" : "") + '">' + esc(p.message || p.note || "尚未获取最新统计") + "</p>" +
-        '<div class="card-actions">' +
-        '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (p.loading ? " disabled" : "") + ">" + (isVisitOnly(p) ? (p.loading ? "访问中…" : "立即访问") : (p.loading ? "签到中…" : "立即签到")) + "</button>" +
-        '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
-        (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
-        '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
-        '<button class="btn btn-danger" data-action="delete" data-id="' + esc(p.id) + '">删除</button>' +
-        "</div></article>"
-      );
-    })
-    .join("");
+  grid.innerHTML = groups.map(renderAccountGroup).join("");
+}
+function renderPlatformCard(p) {
+  const [label, cls] = status(p);
+  const busy = p.loading || !!currentVisitProgress(p.id);
+  const acc = p.account || {};
+  const qv = (v) => formatQuota(v, quotaUnitFor(acc));
+  const qt = (v, trunc) => fmtTokens(v, trunc);
+  const addr = safeHttpUrl(p.baseUrl);
+  return (
+    '<article class="platform-card"><div class="card-top"><div>' +
+    "<h3 class=\"platform-name\">" + esc(p.name) + "</h3>" +
+    (addr
+      ? '<a class="address address-link" href="' + esc(addr) + '" target="_blank" rel="noopener noreferrer" data-action="open-site" title="在浏览器中打开 ' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</a>"
+      : '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div>") +
+    "</div>" +
+    '<span class="badge ' + cls + '">' + label + "</span>" + (normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
+    '<div class="card-stats">' +
+    '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
+    '<div class="mini-stat"><strong>' + qv(acc.used) + '</strong><span>已用额度</span></div>' +
+    '<div class="mini-stat"><strong>' + qt(acc.monthlyTokens, acc.tokensTruncated) + '</strong><span>本月Token</span></div>' +
+    "</div>" +
+    '<p class="account-meta">' + esc(accountIdentity(p)) + ' · ' + esc(accountUpdatedLabel(acc)) + '</p>' +
+    '<p class="message' + ((p.error || p.accountError) && !currentVisitProgress(p.id) && !cancelledCheckins.has(p.id) ? " err" : "") + '">' + esc(currentVisitProgress(p.id) || cancelledCheckins.get(p.id) || p.error || p.accountError || p.message || p.note || "尚未获取最新统计") + "</p>" +
+    '<div class="card-actions">' +
+    '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">" + (isVisitOnly(p) ? (busy ? "访问中…" : "立即访问") : (busy ? "签到中…" : "立即签到")) + "</button>" +
+    '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
+    (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
+    '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
+    '<button class="btn btn-danger" data-action="delete" data-id="' + esc(p.id) + '">删除</button>' +
+    "</div></article>"
+  );
 }
 
 // ---------- 操作 ----------
 async function checkin(id, options) {
+  options = options || {};
   const p = platforms.find((x) => x.id === id);
-  if (!p || p.loading) return;
+  if (!p || p.loading || activeCheckins.has(id) || startingCheckins.has(id)) return;
   const taskConfig = slim(p);
+  const hasRunVersion = validStopVersion(options.stopVersion);
+  const starting = { stopVersion: checkinStopVersion, cancelled: false };
+  startingCheckins.set(id, starting);
+  cancelledCheckins.delete(id);
   p.loading = true;
   p.error = "";
   render();
-  const r = await doCheckin(p, options || {});
+  const stopVersion = hasRunVersion ? options.stopVersion : await latestStopVersion();
+  if (startingCheckins.get(id) !== starting || starting.cancelled) {
+    return { ok: false, cancelled: true, code: "CHECKIN_CANCELLED", message: "签到已终止" };
+  }
+  startingCheckins.delete(id);
+  if (stopVersion !== checkinStopVersion) {
+    p.loading = false;
+    markCheckinCancelled(id, "签到已终止");
+    render();
+    return { ok: false, cancelled: true, code: "CHECKIN_CANCELLED", message: "签到已终止" };
+  }
+  const operation = { id: ++checkinRequestSequence, stopVersion };
+  activeCheckins.set(id, operation);
+  const r = await doCheckin(p, Object.assign({}, options, { stopVersion: operation.stopVersion }));
+  if (activeCheckins.get(id) !== operation) {
+    return { ok: false, cancelled: true, code: "CHECKIN_CANCELLED", message: "签到已终止" };
+  }
+  if (isCancelledResult(r)) {
+    releaseCheckinOperation(id, operation);
+    p.loading = false;
+    markCheckinCancelled(id, r.message || "签到已终止");
+    render();
+    toast(p.name + "：" + (r.message || "签到已终止"));
+    return r;
+  }
+  if (operation.stopVersion !== checkinStopVersion) {
+    releaseCheckinOperation(id, operation);
+    p.loading = false;
+    markCheckinCancelled(id, "签到已终止");
+    render();
+    return { ok: false, cancelled: true, code: "CHECKIN_CANCELLED", message: "签到已终止" };
+  }
   const current = platforms.find((entry) => entry.id === id);
   if (!current || !sameConnectionConfig(taskConfig, slim(current))) {
+    releaseCheckinOperation(id, operation);
     p.loading = false;
     render();
     toast("平台鉴权配置已变更，本次结果未覆盖当前账号", !r.ok);
-    return;
+    return r;
   }
+  releaseCheckinOperation(id, operation);
   if (r.keepAlive && typeof r.keepAlive.date === "string") {
     p.keepAlive = normalizeKeepAlive(Object.assign({}, normalizeKeepAlive(p.keepAlive), { lastDate: r.keepAlive.date }));
   }
@@ -277,9 +543,9 @@ async function checkin(id, options) {
   // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
   p.reauthPending = !!r.reauthRequired;
   if (r.reauthRequired) p.reauthStartedAt = r.reauthStartedAt;
+  if (r.account) { p.account = Object.assign({}, p.account || {}, r.account); p.accountError = ""; }
   if (r.visited) {
     p.lastVisitDate = r.lastVisitDate; p.lastVisitedAt = r.lastVisitedAt;
-    if (r.account) p.account = Object.assign({}, p.account || {}, r.account);
   }
   if (!r.visited && !isVisitOnly(p) && !r.reauthRequired && (r.ok || isAlreadyCheckinMessage(r.message))) {
     p.stats = p.stats || {};
@@ -291,8 +557,8 @@ async function checkin(id, options) {
   render();
   toast(p.name + "：" + r.message, !r.ok);
   await savePlatforms();
-  // Agent Router 已退出且 GitHub OAuth 尚未完成时，账户接口可能返回登录页。
-  if (r.ok && !r.visited && !r.reauthRequired && !isVisitOnly(p)) await refreshStats(id, true);
+  // 后台在任务完成前已取回额度；OAuth 则由回调同步，不能在关页后再开页取数。
+  return r;
 }
 
 async function fetchStats(id, btnEl) {
@@ -312,15 +578,33 @@ async function refreshStats(id, silent) {
   const p = platforms.find((x) => x.id === id);
   if (!p) return;
   // 刷新只拉账户额度三项，不调用签到/统计接口，避免触发签到或干扰签到状态
+  const config = slim(p);
   const r = await getAccount(p);
+  const current = platforms.find(x => x.id === id);
+  if (!current || !sameConnectionConfig(config, slim(current))) return;
   mergeStatsInto(id, null, r.ok ? "额度已更新" : r.message, r.ok, r.account || null);
   await savePlatforms();
   render();
   if (!silent) toast(p.name + "：" + (r.ok ? "额度已更新" : r.message), !r.ok);
 }
 
-async function runBatch(action) {
-  await Promise.all(platforms.map((p) => action(p.id)));
+async function runBatch(action, operation = null) {
+  for (const id of platforms.map((p) => p.id)) {
+    if (operation && (operation.cancelled || operation.stopVersion !== checkinStopVersion)) {
+      operation.cancelled = true;
+      return { cancelled: true };
+    }
+    const result = await action(id);
+    if (operation && isCancelledResult(result)) {
+      operation.cancelled = true;
+      return { cancelled: true };
+    }
+    if (operation && (operation.cancelled || operation.stopVersion !== checkinStopVersion)) {
+      operation.cancelled = true;
+      return { cancelled: true };
+    }
+  }
+  return { cancelled: false };
 }
 
 async function refreshAll() {
@@ -430,7 +714,7 @@ function renderModelMeta() {
     if (site.systemName) parts.push("站点：" + site.systemName);
     if (site.version) parts.push("内核：" + site.version);
     if (site.quotaPerUnit != null && site.quotaPerUnit !== 500000)
-      parts.push("⚠ quota_per_unit=" + site.quotaPerUnit + "（扩展按 500000 换算额度，此站不一致）");
+      parts.push("quota_per_unit=" + site.quotaPerUnit + "（额度按此站单位换算）");
   }
   const withPerf = modelState.rows.filter((r) => r.perf && r.perf.successRate != null).length;
   if (modelState.rows.length) parts.push("模型 " + modelState.rows.length + " 个，其中 " + withPerf + " 个有近期指标");
@@ -579,6 +863,7 @@ function formData() {
     loginUsername: $("authMode").value === "password" ? $("loginUsername").value.trim() : "",
     loginPassword: $("authMode").value === "password" ? $("loginPassword").value : "",
     visitOnly: $("visitOnly").checked,
+    logoutAfterVisit: $("logoutAfterVisit").checked,
     note: $("note").value.trim(),
     authMode: $("authMode") ? $("authMode").value : "token",
     keepAlive: Object.assign({}, normalizeKeepAlive(prev && prev.keepAlive), keepAliveFromForm()),
@@ -596,6 +881,7 @@ function openModal(p) {
   $("loginUsername").value = p ? p.loginUsername || "" : "";
   $("loginPassword").value = p ? p.loginPassword || "" : "";
   $("visitOnly").checked = isVisitOnly(p);
+  $("logoutAfterVisit").checked = NACheckinAuth.shouldLogoutAfterVisit(p);
   $("note").value = p ? p.note || "" : "";
   const keepKa = normalizeKeepAlive(p && p.keepAlive);
   $("keepAliveEnabled").checked = keepKa.enabled;
@@ -629,6 +915,7 @@ function toggleAuthFields() {
   const agent = isAgentRouterMode({ authMode: mode });
   $("visitOnlyField").style.display = "";
   const visit = $("visitOnly").checked;
+  $("logoutAfterVisitField").style.display = visit ? "" : "none";
   $("keepAliveEnabled").disabled = false;
   syncKeepAliveFields();
   $("testBtn").textContent = "检测连接";
@@ -641,7 +928,7 @@ function toggleAuthFields() {
   $("userId").required = agent;
   const provider = mode === "agentrouter_linuxdo" ? "Linux DO" : "GitHub";
   $("authHint").textContent = visit
-    ? "仅访问：正常登录后刷新首页一次，读取最新额度并更新卡片后关闭临时页；只跳过签到接口，额度、模型及已配置的保活保持正常。" + (password ? "邮箱密码会自动补登录；验证码需手动完成。" : agent ? provider + " 会启动本站 OAuth 登录，必要时请手动授权。" : "Cookie/令牌不能代替网页登录；会话失效时需在打开的页面手动登录。") + "登录或额度读取失败时保留页面；检测和保存会正常验证登录及额度，不代表签到成功。"
+    ? "仅访问：正常登录后刷新首页一次，读取最新额度并更新卡片后关闭临时页；只跳过签到接口，额度、模型及已配置的保活保持正常。" + (password ? "邮箱密码会自动补登录；验证码需手动完成。" : agent ? provider + " 会启动本站 OAuth 登录，必要时请手动授权。" : "Cookie/令牌不能代替网页登录；会话失效时需在打开的页面手动登录。") + "访问结束后默认不退出账号，仅关闭本轮临时页；开启“访问结束后退出账号”才在收尾时退出（同站其他页面也会受影响）。切换账号或重新授权前的必要退出不受此开关影响；保存不自动测试账号，执行任务时核验身份和额度。"
     : password
     ? "邮箱密码模式：仅支持 HTTPS，扩展会在本站 /login 页面打开邮箱/用户名表单并填写登录。密码仅存本地（未加密），导出不含密码；验证码需手动完成。"
     : agent
@@ -891,6 +1178,7 @@ async function applySettings(s) {
   $("autoTime").value = /^([01]\d|2[0-3]):[0-5]\d$/.test(s.autoTime || "") ? s.autoTime : "08:01";
   $("autoApprove").checked = !!s.autoApprove;
   $("notifyEnabled").checked = s.notify !== false;
+  $("checkinIntervalSeconds").value = String(AUTH_CONFIG.normalizeCheckinInterval(s.checkinIntervalSeconds));
 }
 async function saveSettings() {
   const settings = {
@@ -898,9 +1186,12 @@ async function saveSettings() {
     autoTime: $("autoTime").value || "08:01",
     autoApprove: $("autoApprove").checked,
     notify: $("notifyEnabled").checked,
+    checkinIntervalSeconds: AUTH_CONFIG.normalizeCheckinInterval($("checkinIntervalSeconds").value),
   };
-  await send({ type: "saveSettings", settings });
-  toast(settings.autoEnabled ? "已开启定时自动签到" : "已关闭定时自动签到");
+  $("checkinIntervalSeconds").value = String(settings.checkinIntervalSeconds);
+  const result = await send({ type: "saveSettings", settings });
+  if (!result || !result.ok) { toast(result && result.message || "设置保存失败", true); return; }
+  toast("设置已保存；签到间隔 " + settings.checkinIntervalSeconds + " 秒");
 }
 async function renderLastAuto() {
   const r = await send({ type: "getLastAuto" });
@@ -945,6 +1236,7 @@ async function importConfig(file) {
         accessToken: p.accessToken || "",
         loginUsername: p.authMode === "password" ? String(p.loginUsername || "").trim() : "",
         visitOnly: p.visitOnly === true,
+        logoutAfterVisit: NACheckinAuth.shouldLogoutAfterVisit(p),
         loginPassword: "", // 永远不信任导入文件里的密码；需要在本地重新填写。
         note: p.note || "",
         keepAlive: normalizeKeepAlive(p.keepAlive),
@@ -952,7 +1244,7 @@ async function importConfig(file) {
         message: p.message || "",
       };
     });
-    await savePlatforms();
+    await savePlatforms(true);
     render();
     toast("已导入 " + platforms.length + " 个平台" + (platforms.some((p) => p.authMode === "password") ? "；邮箱密码平台需编辑补填密码" : ""));
   } catch (e) {
@@ -963,22 +1255,25 @@ async function importConfig(file) {
 // ---------- 存储 ----------
 function loadStorage() {
   return new Promise((resolve) => {
-    chrome.storage.local.get([KEY_PLATFORMS, KEY_SETTINGS], (res) => {
-      platforms = Array.isArray(res[KEY_PLATFORMS]) ? res[KEY_PLATFORMS] : [];
+    chrome.storage.local.get([KEY_PLATFORMS, KEY_SETTINGS, KEY_CHECKIN_STOP_VERSION, KEY_EXPANDED_GROUPS], (res) => {
+      platforms = Array.isArray(res[KEY_PLATFORMS]) ? res[KEY_PLATFORMS].map(p => ({ ...p, loading: false })) : [];
+      expandedAccountGroups = new Set(Array.isArray(res[KEY_EXPANDED_GROUPS]) ? res[KEY_EXPANDED_GROUPS].filter((key) => typeof key === "string") : []);
+      const storedStopVersion = validStopVersion(res[KEY_CHECKIN_STOP_VERSION]) ? res[KEY_CHECKIN_STOP_VERSION] : 0;
+      checkinStopVersion = Math.max(checkinStopVersion, storedStopVersion);
        resolve(res[KEY_SETTINGS] || { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true });
     });
   });
 }
-async function savePlatforms() {
+async function savePlatforms(resetState = false) {
   const stored = await new Promise((resolve) => chrome.storage.local.get(KEY_PLATFORMS, (res) => resolve(res[KEY_PLATFORMS] || [])));
   for (const next of platforms) {
     const previous = stored.find((p) => p.id === next.id);
     if (next.reauthPending && previous && previous.reauthCompletedAt && Number(previous.reauthCompletedAt) >= Number(next.reauthStartedAt || 0) &&
         next.authMode === previous.authMode && next.userId === previous.userId && next.baseUrl === previous.baseUrl) {
-      for (const key of ["reauthPending", "reauthCompletedAt", "message", "error", "stats", "statsDate", "account", "lastCheckinAt"]) next[key] = previous[key];
+      for (const key of ["reauthPending", "reauthCompletedAt", "message", "error", "accountError", "stats", "statsDate", "account", "lastCheckinAt"]) next[key] = previous[key];
     }
   }
-  const r = await send({ type: "savePlatforms", platforms });
+  const r = await send({ type: "savePlatforms", resetState, platforms: platforms.map(({ loading, ...p }) => p) });
   if (!r || !r.ok) throw new Error(r && r.message || "保存平台配置失败");
 }
 
@@ -997,6 +1292,13 @@ async function init() {
         try { keepAliveStatusText("操作异常：" + ((err && err.message) || String(err)), "error"); } catch (_) {}
       });
     }
+  });
+  document.addEventListener("click", (e) => {
+    const trigger = e.target && e.target.closest ? e.target.closest("#historyBtn, #historyBtnSidebar") : null;
+    if (!trigger) return;
+    e.preventDefault();
+    const view = globalThis.HistoryView;
+    if (view && typeof view.open === "function") view.open(platforms, trigger);
   });
   // 宽屏管理页（popup.html，body 始终带 tab-mode）：隐藏「展开」按钮
   // 侧边栏（sidebar.html，body 带 sidebar-mode）：保留「展开」按钮，打开宽屏页
@@ -1030,7 +1332,8 @@ async function init() {
     if (!btn) return;
     const action = btn.dataset.action;
     const id = btn.dataset.id;
-    if (action === "checkin") checkin(id);
+    if (action === "toggle-group") toggleAccountGroup(btn.dataset.group);
+    else if (action === "checkin") checkin(id);
     else if (action === "stats") fetchStats(id, btn);
     else if (action === "edit") editPlatform(id);
     else if (action === "models") openModelPanel(id);
@@ -1054,26 +1357,20 @@ async function init() {
     if (e.target === $("modal")) $("modal").classList.remove("open");
   };
   $("testBtn").onclick = () => testConnection().catch(() => {});
-  $("accessToken").addEventListener("blur", () => {
-    if ($("authMode").value === "token" && $("baseUrl").value.trim() && $("accessToken").value.trim()) testConnection().catch(() => {});
-  });
   $("platformForm").onsubmit = async (e) => {
     e.preventDefault();
     const data = formData();
     const submit = e.submitter;
     if (submit) submit.disabled = true;
     try {
-      const r = await testConnection();
-      if (!sameConnectionConfig(data, formData())) throw new Error("鉴权配置已变更，请重新检测后保存");
+      validatePlatform(data);
       const previousConfig = editingId && platforms.find((p) => p.id === editingId);
-      const sameAccount = previousConfig && sameConnectionConfig(previousConfig, data);
-      data.stats = r.data ? r.data.stats || {} : sameAccount ? previousConfig.stats || {} : {};
-      if (r.account) data.account = r.account;
-      else if (!sameAccount) data.account = null; // 新账号不能继承另一账号的旧额度。
-      if (r.data && r.data.max_quota != null) data.stats.max_quota = r.data.max_quota;
+      const sameAccount = previousConfig && sameConnectionConfig(slim(previousConfig), slim(data));
+      data.stats = sameAccount ? previousConfig.stats || {} : {};
+      if (!sameAccount) data.account = null;
       if (editingId) {
         const previous = platforms.find((p) => p.id === editingId) || {};
-        if (!sameConnectionConfig(previous, data)) {
+        if (!sameConnectionConfig(slim(previous), slim(data))) {
           previous.lastVisitDate = "";
           previous.lastVisitedAt = "";
         }
@@ -1084,9 +1381,9 @@ async function init() {
       await savePlatforms();
       render();
       $("modal").classList.remove("open");
-      toast(r.needsLogin ? "配置已保存，执行任务时将登录对应账号（尚未验证登录）" : "连接检测成功，平台配置已保存");
+      toast("平台配置已保存（尚未验证登录），未自动检测账号；执行任务时将验证登录");
     } catch (e) {
-      toast(e && e.message || "保存前检测失败，请检查配置", true);
+      toast(e && e.message || "保存失败，请检查配置", true);
     } finally {
       if (submit) submit.disabled = false;
     }
@@ -1130,22 +1427,30 @@ async function init() {
     });
   }
 
+  if ($("stopCheckinBtn")) $("stopCheckinBtn").onclick = () => stopCheckin();
   $("batchBtn").onclick = async () => {
     if (!platforms.length) return toast("请先添加平台", true);
+    if (activeBatchRun) return;
+    const run = { id: ++batchRunSequence, stopVersion: checkinStopVersion, cancelled: false };
+    activeBatchRun = run;
     $("batchBtn").disabled = true;
     try {
-      // 各平台请求相互独立，同时发起以缩短批量签到耗时。
-      await runBatch((id) => checkin(id, { batch: true }));
-      toast("批量签到完成");
+      run.stopVersion = await latestStopVersion();
+      if (activeBatchRun !== run || run.cancelled) return;
+      // 逐项等待后台全局队列完成登录、额度取数与保存，不并发发起签到。
+      const outcome = await runBatch((id) => checkin(id, { batch: true, stopVersion: run.stopVersion }), run);
+      if (activeBatchRun === run) toast(outcome.cancelled ? "批量签到已终止" : "批量签到完成");
     } finally {
-      $("batchBtn").disabled = false;
+      if (activeBatchRun === run) {
+        activeBatchRun = null;
+        $("batchBtn").disabled = false;
+      }
     }
   };
   $("refreshBtn").onclick = refreshAll;
 
   $("exportBtn").onclick = exportConfig;
   $("importBtn").onclick = () => $("fileInput").click();
-  if ($("importBtn2")) $("importBtn2").onclick = () => $("fileInput").click();
   $("fileInput").onchange = async (e) => {
     const file = e.target.files && e.target.files[0];
     if (file) await importConfig(file);
@@ -1168,31 +1473,77 @@ async function init() {
   $("autoTime").onchange = saveSettings;
   $("autoApprove").onchange = saveSettings;
   $("notifyEnabled").onchange = saveSettings;
+  $("checkinIntervalSeconds").onchange = saveSettings;
   $("runNowBtn").onclick = async () => {
+    if (activeAutoRun) return;
+    const run = { id: ++autoRunSequence, stopVersion: checkinStopVersion, cancelled: false };
+    activeAutoRun = run;
     $("runNowBtn").disabled = true;
     try {
-      const r = await send({ type: "autoRun" });
+      run.stopVersion = await latestStopVersion();
+      if (activeAutoRun !== run || run.cancelled) return;
+      const r = await send({ type: "autoRun", stopVersion: run.stopVersion });
+      if (activeAutoRun !== run || run.cancelled) return;
+      if (isCancelledResult(r)) {
+        toast(r.message || "自动签到已终止");
+        return;
+      }
       if (r && r.ok && r.summary) {
         let doneMsg = "执行完成：成功 " + r.summary.ok + " / 已签 " + r.summary.already + " / 失败 " + r.summary.fail + (r.summary.pending ? " / 等待登录 " + r.summary.pending : "") + (r.summary.visited ? " / 已访问 " + r.summary.visited : ""); if (r.summary.aliveOk || r.summary.aliveFail) doneMsg += "；保活成功 " + r.summary.aliveOk + " / 失败 " + r.summary.aliveFail; toast(doneMsg);
+      } else if (r && !r.ok) {
+        toast(r.message || "自动签到执行失败", true);
       } else {
         toast("没有需要签到的平台", true);
       }
-      await refreshAll();
+      // 后台/回调已同步账户信息；再次统一取数会重开刚关闭的登录页，并可能串到下一账号。
       renderLastAuto();
     } finally {
-      $("runNowBtn").disabled = false;
+      if (activeAutoRun === run) {
+        activeAutoRun = null;
+        $("runNowBtn").disabled = false;
+      }
     }
   };
 }
 // OAuth 回调由后台异步确认；侧边栏和宽屏页同步显示最终结果。
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes[KEY_PLATFORMS]) return;
+  if (area !== "local") return;
+  if (changes[KEY_CHECKIN_STOP_VERSION]) {
+    applyStopVersion(changes[KEY_CHECKIN_STOP_VERSION].newValue, true);
+  }
+  if (changes[KEY_SETTINGS]) applySettings(changes[KEY_SETTINGS].newValue);
+  if (changes[KEY_EXPANDED_GROUPS]) {
+    const keys = changes[KEY_EXPANDED_GROUPS].newValue;
+    expandedAccountGroups = new Set(Array.isArray(keys) ? keys.filter((key) => typeof key === "string") : []);
+    render();
+  }
+  if (!changes[KEY_PLATFORMS]) return;
   const next = changes[KEY_PLATFORMS].newValue;
   if (!Array.isArray(next)) return;
   platforms = next.map((entry) => {
     const previous = platforms.find((p) => p.id === entry.id);
-    return Object.assign(previous || {}, entry, { loading: !!(previous && previous.loading) });
+    if (previous && entry.taskResultRevision !== previous.taskResultRevision) clearVisitProgress(entry.id);
+    // Storage delivers a full snapshot: missing fields must disappear in every open window.
+    // Keep the object identity because in-flight actions hold a reference to this account.
+    if (previous) for (const key of Object.keys(previous)) if (!Object.hasOwn(entry, key)) delete previous[key];
+    return Object.assign(previous || {}, entry, { loading: activeCheckins.has(entry.id) || startingCheckins.has(entry.id) });
   });
+  render();
+});
+// 只接收本扩展后台的短期阶段提示，不将运行状态写进账号配置。
+if (chrome.runtime.onMessage) chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!sender || sender.id !== chrome.runtime.id || msg.type !== "visitProgress" ||
+      msg.stopVersion !== checkinStopVersion || !platforms.some((p) => p.id === msg.id)) return;
+  clearVisitProgress(msg.id);
+  if (msg.phase !== "done" && typeof msg.message === "string") {
+    const progress = { message: msg.message, at: Date.now(), stopVersion: msg.stopVersion };
+    progress.timer = setTimeout(() => {
+      if (visitProgress.get(msg.id) !== progress) return;
+      clearVisitProgress(msg.id);
+      render();
+    }, 90000);
+    visitProgress.set(msg.id, progress);
+  }
   render();
 });
 init();

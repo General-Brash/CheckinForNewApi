@@ -7,6 +7,7 @@
         <script src="theme.js"></script>
   
   <link rel="stylesheet" href="sidebar.css" />
+  <link rel="stylesheet" href="history-view.css" />
 </head>
 <body class="sidebar-mode">
   <header class="appbar">
@@ -21,7 +22,7 @@
       <button class="iconbtn" id="importBtn" title="导入配置">导入</button>
       <button class="iconbtn" id="exportBtn" title="导出配置">导出</button>
       <button class="iconbtn" id="openTabBtn" title="在新标签页打开宽屏管理页">展开</button>
-      <button class="iconbtn theme-toggle" id="themeToggle" type="button" title="切换深/浅色界面" aria-label="切换深/浅色界面">☾</button>
+        &nbsp;<button class="iconbtn theme-toggle" id="themeToggle" type="button" title="切换深/浅色界面" aria-label="切换深/浅色界面">☾</button>
     </div>
   </header>
 
@@ -59,6 +60,10 @@
           <span class="switch-label">每日签到时间</span>
           <input id="autoTime" type="time" value="08:01" />
         </label>
+        <label class="field-row" title="上一项完成后再等待；0 表示不等待，适用于手动和自动签到">
+          <span class="switch-label">签到间隔（秒）</span>
+          <input id="checkinIntervalSeconds" type="number" min="0" max="3600" step="1" value="60" />
+        </label>
         <label class="switch-row">
           <span class="switch-label">自动允许一键签到</span>
           <span class="switch"><input type="checkbox" id="autoApprove" /><span class="track"></span></span>
@@ -82,7 +87,12 @@
   </main>
 
   <footer class="actionbar">
-    <button class="btn btn-light btn-block" id="importBtn2" title="同上方导入">导入</button>
+    <button class="btn btn-dark btn-block" id="historyBtnSidebar" type="button" aria-label="查看本地历史图表" title="查看本地历史图表">
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+<circle cx="12" cy="12" r="10"/>
+<path d="M12 6v6l4 2"/>
+</svg> 图表</button>
+    <button class="btn btn-danger btn-block" id="stopCheckinBtn" type="button" title="终止当前及排队中的签到">终止签到</button>
     <button class="btn btn-dark btn-block" id="addBtn">添加平台</button>
     <button class="btn btn-primary btn-block" id="batchBtn">一键签到</button>
   </footer>
@@ -114,7 +124,8 @@
           <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
           <label id="loginUsernameField" style="display:none">邮箱 / 用户名<input id="loginUsername" autocomplete="username" placeholder="登录邮箱或用户名" /></label>
           <label id="loginPasswordField" style="display:none">登录密码<input id="loginPassword" type="password" autocomplete="off" placeholder="仅存本地，导出不包含密码" /></label>
-          <label id="visitOnlyField" class="full"><span class="keepalive-head"><span>仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">登录后刷新首页一次，读取最新额度再关闭临时页；仅跳过签到接口，其他功能保持正常。失败时保留页面，不代表签到成功。</small></label>
+          <label id="visitOnlyField" class="full"><span class="keepalive-head"><span>仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">登录完成后在同一临时页刷新一次，读取最新额度再关闭，不会关闭后重新开页；仅跳过签到接口，其他功能保持正常。任务结束后关闭本轮临时页，是否退出账号由下方开关决定；不代表签到成功。</small></label>
+          <label id="logoutAfterVisitField" class="full" style="display:none"><span class="keepalive-head"><span>访问结束后退出账号</span><span class="switch"><input id="logoutAfterVisit" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">默认关闭：不主动退出登录，只关闭本轮临时页。开启后，无论访问成功、失败或停止都会尝试退出；同站其他页面也会受影响。每个账号独立保存，对后续任务生效。</small></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
         </div>
         <div class="keepalive-box">
@@ -172,6 +183,8 @@
 
   <div id="toast"></div>
   <script src="auth-config.js"></script>
+  <script src="account-history.js"></script>
   <script src="popup.js"></script>
+  <script src="history-view.js"></script>
 </body>
 </html>

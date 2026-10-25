@@ -142,6 +142,7 @@ input:focus,select:focus{border-color:var(--primary);box-shadow:var(--focus-ring
 .settings-row{display:flex;flex-wrap:wrap;align-items:center;gap:16px}
 .field{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
 .field select{margin-top:0;width:auto;padding:9px 12px}
+.field input[type="number"]{margin-top:0;width:110px;padding:9px 12px}
 .field input[type="time"]{margin-top:0;width:auto;padding:9px 12px}
 .switch{display:inline-flex;align-items:center;gap:9px;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer}
 .switch input{display:none}
@@ -280,3 +281,31 @@ select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-i
 .keepalive-model-chip{border:1px solid var(--border-soft);background:var(--surface-2);color:var(--ink);border-radius:999px;padding:5px 11px;font-size:12px;line-height:1.2;cursor:pointer;transition:.15s}
 .keepalive-model-chip:hover{border-color:var(--accent);color:var(--accent)}
 .keepalive-model-note{color:var(--faint);font-size:12px}
+/* 同一 API 实例的多账号折叠展示；账号操作仍以独立 ID 路由。 */
+.account-group{grid-column:1/-1;min-width:0;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);overflow:hidden}
+.account-group-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left;padding:16px;border:0;background:var(--surface-2);color:var(--ink);cursor:pointer;font:inherit}
+.account-group-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:-3px}
+.account-group-toggle strong{font-size:14px;overflow-wrap:anywhere}
+.account-group-toggle small,.account-preview-row small{display:block;font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}
+.account-group-total{flex-shrink:0;text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+.account-group-total small{font-weight:400}
+.account-group-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;padding:12px}
+.account-group-cards[hidden]{display:none}
+.account-group-preview{padding:0 16px}
+.account-preview-row{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--border-soft);font-size:13px}
+.account-preview-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+.account-preview-row>span:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.account-meta{font-size:11px;color:var(--muted);line-height:1.6;margin:0 0 10px;overflow-wrap:anywhere}
+@media(max-width:420px){.account-group-toggle{align-items:flex-start;flex-direction:column}.account-group-total{text-align:left}.account-group-cards{padding:8px}}
+/* 折叠账号行：快捷操作使用独立按钮，点击不会触发展开。 */
+.account-preview-row{align-items:center}
+.account-preview-name{flex:1;min-width:0;overflow-wrap:anywhere}
+.account-preview-details{display:flex;flex:0 1 auto;flex-direction:column;align-items:flex-end;gap:2px;min-width:0;max-width:64%}
+.account-preview-value{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:7px;max-width:100%}
+.account-preview-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+.account-preview-checkin{flex:none;margin:0;padding:4px 8px;border-radius:7px;font-size:10.5px;line-height:1.25;white-space:nowrap}
+.account-preview-checkin:disabled{cursor:wait;opacity:.68;transform:none}
+.site-footer-actions{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+.history-open-button{flex:none;margin:0;padding:8px 13px}
+.site-footer-actions>span{min-width:0}
+@media(max-width:420px){.account-preview-row{align-items:flex-start}.account-preview-details{max-width:68%}.account-preview-value{gap:5px}.account-preview-checkin{padding:4px 6px}}

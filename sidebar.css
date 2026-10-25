@@ -151,6 +151,7 @@ a.address:focus-visible{outline:1px solid var(--accent,#6ea8fe);outline-offset:2
 .switch-row,.field-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .switch-label{font-size:13px;font-weight:600;color:var(--ink)}
 .field-row select{margin:0;padding:8px 11px;border:1px solid var(--field-border);border-radius:var(--radius-xs);outline:none;font:inherit;color:var(--ink);width:auto;background:var(--field-bg);appearance:none;-webkit-appearance:none;padding-right:30px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a94a6' stroke-width='3'><path d='M6 9l6 6 6-6'/></svg>");background-repeat:no-repeat;background-position:right 9px center}
+.field-row input[type="number"]{margin:0;padding:8px 11px;width:100px}
 .field-row input[type="time"]{margin:0;padding:8px 11px;width:auto}
 .field-row select:focus{border-color:var(--primary);box-shadow:var(--focus-ring)}
 .switch{position:relative;display:inline-block;flex-shrink:0}
@@ -240,3 +241,31 @@ select:focus{border-color:var(--primary);box-shadow:var(--focus-ring)}
 .keepalive-model-chip{border:1px solid var(--border-soft);background:var(--surface-2);color:var(--ink);border-radius:999px;padding:5px 11px;font-size:12px;line-height:1.2;cursor:pointer;transition:.15s}
 .keepalive-model-chip:hover{border-color:var(--accent);color:var(--accent)}
 .keepalive-model-note{color:var(--faint);font-size:12px}
+/* 同一 API 实例的多账号折叠展示；账号操作仍以独立 ID 路由。 */
+.account-group{grid-column:1/-1;min-width:0;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);overflow:hidden}
+.account-group-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left;padding:16px;border:0;background:var(--surface-2);color:var(--ink);cursor:pointer;font:inherit}
+.account-group-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:-3px}
+.account-group-toggle strong{font-size:14px;overflow-wrap:anywhere}
+.account-group-toggle small,.account-preview-row small{display:block;font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}
+.account-group-total{flex-shrink:0;text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+.account-group-total small{font-weight:400}
+.account-group-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;padding:12px}
+.account-group-cards[hidden]{display:none}
+.account-group-preview{padding:0 16px}
+.account-preview-row{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--border-soft);font-size:13px}
+.account-preview-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+.account-preview-row>span:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.account-meta{font-size:11px;color:var(--muted);line-height:1.6;margin:0 0 10px;overflow-wrap:anywhere}
+@media(max-width:420px){.account-group-toggle{align-items:flex-start;flex-direction:column}.account-group-total{text-align:left}.account-group-cards{padding:8px}}
+/* 折叠账号行快捷签到/访问：按钮独立于分组展开按钮。 */
+.account-preview-row{align-items:center}
+.account-preview-name{flex:1;min-width:0;overflow-wrap:anywhere}
+.account-preview-details{display:flex;flex:0 1 auto;flex-direction:column;align-items:flex-end;gap:2px;min-width:0;max-width:68%}
+.account-preview-value{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px;max-width:100%}
+.account-preview-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+.account-preview-checkin{flex:none;margin:0;padding:4px 7px;border-radius:7px;font-size:10px;line-height:1.25;white-space:nowrap}
+.account-preview-checkin:disabled{cursor:wait;opacity:.68;transform:none}
+.actionbar #historyBtnSidebar{display:inline-flex;align-items:center;justify-content:center;gap:5px}
+.actionbar #historyBtnSidebar svg{flex:none}
+@media(max-width:360px){.account-preview-row{align-items:flex-start;flex-wrap:wrap}.account-preview-details{max-width:100%;margin-left:auto}.account-preview-value{gap:4px}.account-preview-checkin{padding:4px 6px}}
+@media(max-width:420px){.actionbar>.btn{min-width:0;padding-inline:5px;font-size:11px;white-space:nowrap}}
