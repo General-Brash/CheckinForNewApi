@@ -620,6 +620,32 @@ for (const file of ['popup.html', 'sidebar.html']) {
 }
 
 for (const file of ['popup.html','sidebar.html']) {
+  test(`${file}: a delayed save cannot close or clear a newly opened account password`, async () => {
+    const accounts = [
+      platform('alice', {authMode: 'password', loginUsername: 'alice@example.com', loginPassword: ' alice-password '}),
+      platform('bob', {authMode: 'password', loginUsername: 'bob@example.com', loginPassword: ' bob-password '}),
+    ];
+    const ui = uiHarness(file, {[PLATFORMS]: accounts}); await ui.init();
+    const save = deferred();
+    ui.setHandler((message, fallback) => message.type === 'savePlatforms' ? save.promise.then(() => fallback(message)) : fallback(message));
+    ui.value('openModal(platforms[0])');
+    ui.nodes.get('loginPasswordToggle').onclick();
+    const pending = ui.nodes.get('platformForm').onsubmit({preventDefault() {}});
+    await waitFor(() => ui.messages.some((message) => message.type === 'savePlatforms'));
+    ui.nodes.get('cancelBtn').onclick();
+    ui.value('openModal(platforms[1])');
+    const password = ui.nodes.get('loginPassword');
+    password.value = ' edited-bob-password ';
+    ui.nodes.get('loginPasswordToggle').onclick();
+    save.resolve(); await pending;
+    assert.equal(ui.nodes.get('modal').classList.contains('open'), true);
+    assert.equal(password.type, 'text');
+    assert.equal(password.value, ' edited-bob-password ');
+    assert.equal(ui.nodes.get('loginUsername').value, 'bob@example.com');
+    assert.equal(ui.store[PLATFORMS][0].loginPassword, ' alice-password ');
+    assert.equal(ui.store[PLATFORMS][1].loginPassword, ' bob-password ');
+  });
+
   test(`${file}: per-account logout switch defaults off, persists and does not reset account results`,async()=>{
     const p=platform('logout-choice',{visitOnly:true,userId:'12',lastVisitDate:localToday()});
     const ui=uiHarness(file,{[PLATFORMS]:[p]});await ui.init();

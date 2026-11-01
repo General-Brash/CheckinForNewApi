@@ -4,7 +4,7 @@
 
 ## 说明
 
-本项目的界面、代码与文档均为原创编写，未复制第三方网页的源代码、文案或图形素材。本项目仅对各站点公开的签到接口进行客户端请求。
+本项目的业务代码与文档均为原创编写，未复制第三方网页的源代码或文案；界面使用的 Lucide 通用图标列于下文。本项目仅对各站点公开的签到接口进行客户端请求。
 
 ## millylee/anyrouter-check-in
 
@@ -20,9 +20,33 @@
 - 参考内容：公开的 NewAPI 签到接口路径、请求格式和返回字段。
 - 声明：本项目没有复制或链接 NewAPI 的源代码，仅针对其公开接口实现客户端请求。如后续把 NewAPI 的源代码或其衍生代码加入本项目，必须重新评估 AGPL-3.0 的源码提供、许可证和网络服务义务，并在发布前完成相应合规工作。
 
+## Lucide 图标
+
+- 项目地址：<https://github.com/lucide-icons/lucide>
+- 许可证：ISC License
+- 使用文件：`icons/eye.svg`、`icons/eye-off.svg`，用于登录密码显示/隐藏按钮，来自上游 `icons/` 同名文件。
+
+```text
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
 ## 商标与图像
 
-`NewAPI`、各中转站域名及其 Logo、图标、文案可能属于各自权利人。本项目不主张拥有这些权利。本项目自带的 `icons/` 图标为本扩展自带素材，独立于上述第三方。
+`NewAPI`、各中转站域名及其 Logo、图标、文案可能属于各自权利人。本项目不主张拥有这些权利。本项目的 `icons/icon*.png` 为本扩展自带素材，独立于上述第三方；密码显隐图标采用上文注明的 Lucide 素材。
 
 ## 合规与责任边界
 

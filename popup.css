@@ -202,6 +202,13 @@ body.tab-mode .toolbar input{width:150px}
 }
 
 /* 授权方式 */
+.password-field{position:relative;min-width:0;margin-top:6px}
+.password-field input{margin-top:0;min-width:0;padding-right:48px}
+.password-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}
+.password-toggle:hover{background:var(--surface-2);color:var(--ink)}
+.password-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+.password-icon{width:18px;height:18px;background:currentColor;-webkit-mask:url("icons/eye.svg") no-repeat center/contain;mask:url("icons/eye.svg") no-repeat center/contain}
+.password-toggle[aria-pressed="true"] .password-icon{-webkit-mask-image:url("icons/eye-off.svg");mask-image:url("icons/eye-off.svg")}
 .form-grid.auth-top{grid-template-columns:1fr;margin-bottom:12px}
 .auth-hint{margin:7px 0 0;color:var(--faint);font-size:12px;line-height:1.5}
 select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a94a6' stroke-width='3'><path d='M6 9l6 6 6-6'/></svg>");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}

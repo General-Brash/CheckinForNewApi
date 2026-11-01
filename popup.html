@@ -69,7 +69,7 @@
       <details open class="tutorial">
         <summary>📖 如何获取 NewAPI 站点信息</summary>
         <div class="tutorial-body">
-          <p class="warn">⚠ 切勿向任何人泄露访问令牌。本扩展不会上传你的任何数据，配置仅存于本地；建议导出配置备份，更换浏览器或清理缓存后配置会消失。</p>
+          <p class="warn">⚠ 切勿向任何人泄露登录密码、访问令牌或 API Key。本扩展不会上传你的任何数据，配置仅存于本地；导出备份包含明文凭据，请妥善保管。</p>
           <p><strong>步骤 1 · 站点地址</strong>：NewAPI 首页 URL，如 <code>https://your-newapi-site.com</code>（结尾不要带 /）。</p>
           <p><strong>步骤 2 · 访问令牌</strong>：登录站点 → 右上角头像 →「个人设置」→ 生成「系统访问令牌」（约32位）并复制。⚠ 注意：必须是「个人设置」里的<u>系统访问令牌</u>，<u>不是</u>「令牌管理」里的 API 令牌（sk-开头）；签到接口只认前者，填错会报令牌无效或权限不足。</p>
           <p><strong>步骤 3 · 用户ID（可选）</strong>：部分兼容站点要求填写，可在个人中心查看（一串数字）；官方 NewAPI 用令牌即可识别用户，可留空。</p>
@@ -106,7 +106,13 @@
           <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
           <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点生成的系统访问令牌" /></label>
           <label id="loginUsernameField" style="display:none">邮箱 / 用户名<input id="loginUsername" autocomplete="username" placeholder="登录邮箱或用户名" /></label>
-          <label id="loginPasswordField" style="display:none">登录密码<input id="loginPassword" type="password" autocomplete="off" placeholder="仅存本地，导出不包含密码" /></label>
+          <div id="loginPasswordField" class="full" style="display:none">
+            <label for="loginPassword">登录密码</label>
+            <div class="password-field">
+              <input id="loginPassword" type="password" autocomplete="off" spellcheck="false" placeholder="登录密码" />
+              <button id="loginPasswordToggle" class="password-toggle" type="button" aria-label="显示登录密码" title="显示登录密码" aria-pressed="false" aria-controls="loginPassword"><span class="password-icon" aria-hidden="true"></span></button>
+            </div>
+          </div>
           <label id="visitOnlyField" class="full"><span class="keepalive-head"><span>仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">登录完成后在同一临时页刷新一次，读取最新额度再关闭，不会关闭后重新开页；仅跳过签到接口，其他功能保持正常。任务结束后关闭本轮临时页，是否退出账号由下方开关决定；不代表签到成功。</small></label>
           <label id="logoutAfterVisitField" class="full" style="display:none"><span class="keepalive-head"><span>访问结束后退出账号</span><span class="switch"><input id="logoutAfterVisit" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">默认关闭：不主动退出登录，只关闭本轮临时页。开启后，无论访问成功、失败或停止都会尝试退出；同站其他页面也会受影响。每个账号独立保存，对后续任务生效。</small></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>

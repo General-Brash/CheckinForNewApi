@@ -246,7 +246,7 @@ test('real background QUOTA refresh writes only its live response and removes un
   assert.equal(JSON.stringify(history).includes('deadbeef'), false);
 });
 
-test('real no-userId quota refresh identity is readable after its live account snapshot is saved', async () => {
+test('real no-userId quota refresh saves a chart-readable identity without waiting for the popup', async () => {
   const saved = platform('snapshot-fallback', {
     userId: '',
     baseUrl: 'https://history.example/deploy/',
@@ -265,12 +265,9 @@ test('real no-userId quota refresh identity is readable after its live account s
   assert.equal(JSON.stringify(liveHistory).includes('query'), false);
   assert.equal(JSON.stringify(liveHistory).includes('fragment'), false);
 
-  const stored = h.store[PLATFORMS][0];
-  await sendBackgroundMessage(h, {
-    type: 'savePlatforms',
-    platforms: [{ ...stored, account: { ...response.account } }],
-  });
   const updated = h.store[PLATFORMS][0];
+  assert.equal(updated.account.userId, '12', 'the service worker commits the live identity before responding');
+  assert.equal(updated.account.available, response.account.available);
   const now = Date.now() + 1;
   const series = HistoryView.collectSeries(h.store[HISTORY_KEY], [updated], { now });
   assert.equal(series.length, 1);
@@ -448,4 +445,81 @@ test('failed live quota request never samples cached platform account; history w
   const checkin = await sendBackgroundMessage(h, { type: 'checkin', platform: checkinPlatform });
   assert.equal(checkin.ok, true, 'history persistence is best-effort and cannot fail the actual check-in');
   assert.equal(h.store[HISTORY_KEY], undefined);
+});
+
+test('visit history records the final verified balance, not just the earlier pre-log balance', async () => {
+  const saved = platform('final-balance', { authMode: 'cookie', accessToken: '', visitOnly: true });
+  const h = harness('background.js', { [PLATFORMS]: [saved] });
+  const tab = await h.chrome.tabs.create({ url: saved.baseUrl, active: false });
+  h.ctx.saved = saved;
+  h.ctx.tabId = tab.id;
+  h.run(`fetchMonthlyTokens = async () => ({ tokens: 7, truncated: false });
+    let balanceRead = 0;
+    readBalance = () => ({ id: 12, quota: ++balanceRead * 500000, used_quota: 100, quota_per_unit: 500000 });`);
+  const account = await h.run('refreshLoginAccountOnTab(saved, tabId, readBalance, null)');
+  const latest = h.store[HISTORY_KEY].accounts[saved.id].samples.at(-1);
+  assert.equal(account.available, 1000000);
+  assert.equal(latest.balance, 2, 'the history must include the final read before the tab closes');
+  assert.equal(latest.monthlyTokens, 7);
+  assert.equal(h.store[PLATFORMS][0].account.available, account.available);
+});
+
+test('cancelling token statistics retains the already-published balance in history', async () => {
+  const saved = platform('cancel-logs', { authMode: 'cookie', accessToken: '', visitOnly: true });
+  const h = harness('background.js', { [PLATFORMS]: [saved] });
+  const tab = await h.chrome.tabs.create({ url: saved.baseUrl, active: false });
+  h.ctx.saved = saved;
+  h.ctx.tabId = tab.id;
+  h.run('fetchMonthlyTokens = async () => { throw checkinCancelledError(); }');
+  await assert.rejects(h.run(`refreshLoginAccountOnTab(saved, tabId,
+    () => ({ id: 12, quota: 0, used_quota: 500000, quota_per_unit: 500000 }), null)`),
+    (error) => error.code === 'CHECKIN_CANCELLED');
+  assert.equal(h.store[PLATFORMS][0].account.available, 0);
+  const latest = h.store[HISTORY_KEY]?.accounts[saved.id]?.samples.at(-1);
+  assert.ok(latest, 'a confirmed balance is sampled before the optional token statistics');
+  assert.equal(latest.balance, 0);
+  assert.equal(latest.used, 1);
+  assert.equal(latest.monthlyTokens, null, 'cancelled token statistics remain unknown, not zero');
+  assert.equal(h.store[PLATFORMS][0].lastVisitDate, undefined, 'the task is still cancelled, not marked successful');
+});
+
+test('switching visit-only retains account history but still rejects an old in-flight task', async () => {
+  const saved = platform('toggle-visit');
+  const h = harness('background.js', { [PLATFORMS]: [saved] });
+  installApi(h);
+  await sendBackgroundMessage(h, { type: 'account', platform: saved, month: '2026-10' });
+  const before = structuredClone(h.store[HISTORY_KEY]);
+  const changed = { ...h.store[PLATFORMS][0], visitOnly: true };
+  await h.run(`savePlatforms(${JSON.stringify([changed])})`);
+  assert.deepEqual(h.store[HISTORY_KEY], before, 'task mode does not change the account identity');
+  assert.equal(await h.run(`recordAccountHistorySample(${JSON.stringify(saved)},
+    { userId: '12', available: 0, used: 0, quotaPerUnit: 500000 }, '2026-10')`), false,
+    'the old task must not publish after its mode changed');
+});
+
+test('final balance verification across midnight keeps the month used for token statistics', async () => {
+  const saved = platform('month-boundary', { authMode: 'cookie', accessToken: '', visitOnly: true });
+  const h = harness('background.js', { [PLATFORMS]: [saved] });
+  const tab = await h.chrome.tabs.create({ url: saved.baseUrl, active: false });
+  let clock = new Date(2026, 9, 31, 23, 59, 59).getTime();
+  h.ctx.Date = class extends Date {
+    constructor(...args) { super(...(args.length ? args : [clock])); }
+    static now() { return clock; }
+  };
+  h.ctx.nextMonth = () => { clock += 2000; };
+  h.ctx.saved = saved;
+  h.ctx.tabId = tab.id;
+  h.run(`fetchMonthlyTokens = async (_platform, month) => {
+    requestedMonth = month;
+    nextMonth();
+    return { tokens: 7, truncated: false };
+  }`);
+  await h.run(`refreshLoginAccountOnTab(saved, tabId,
+    () => ({ id: 12, quota: 500000, used_quota: 0, quota_per_unit: 500000 }), null)`);
+  assert.equal(h.ctx.requestedMonth, '2026-10');
+  assert.equal(h.run('currentMonth()'), '2026-11');
+  const latest = h.store[HISTORY_KEY].accounts[saved.id].samples.at(-1);
+  assert.equal(latest.month, '2026-10', 'do not relabel the October token counter as November');
+  assert.equal(latest.monthlyTokens, 7);
+  assert.equal(latest.balance, 1);
 });

@@ -9,6 +9,7 @@ const DEFAULT_QUOTA_PER_UNIT = 500000;
 let platforms = [];
 let checkinStopVersion = 0;
 let editingId = null;
+let modalSession = 0;
 let connectionPromise = null;
 let connectionConfig = null;
 let connectionRequestId = 0;
@@ -394,7 +395,9 @@ function accountUpdatedLabel(account) {
 }
 function accountIdentity(p) {
   const id = p.account && p.account.userId || p.userId;
-  return id ? "用户 ID " + id : "尚未确认用户 ID";
+  const identity = id ? "用户 ID " + id : "尚未确认用户 ID";
+  const username = p.authMode === "password" ? String(p.loginUsername || "").trim() : "";
+  return username ? username + " · " + identity : identity;
 }
 function renderAccountPreview(p) {
   const [label, cls] = status(p);
@@ -403,7 +406,8 @@ function renderAccountPreview(p) {
   const visitOnly = isVisitOnly(p);
   const actionLabel = visitOnly ? (busy ? "访问中…" : "访问") : (busy ? "签到中…" : "签到");
   const actionName = visitOnly ? "访问" : "快捷签到";
-  return '<div class="account-preview-row"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small></span>' +
+  return '<div class="account-preview-row"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small>' +
+    (p.accountHistoryError ? '<small><span class="warn">历史写入告警：' + esc(p.accountHistoryError) + '</span></small>' : '') + '</span>' +
     '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account)) + '">' +
     '<span class="account-preview-value"><button type="button" class="btn btn-primary account-preview-checkin" data-action="checkin" data-id="' + esc(p.id) + '" aria-label="' + esc(actionName + "：" + p.name) + '" title="' + esc(actionName + "：" + p.name) + '"' +
     (busy ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
@@ -471,6 +475,7 @@ function renderPlatformCard(p) {
     "</div>" +
     '<p class="account-meta">' + esc(accountIdentity(p)) + ' · ' + esc(accountUpdatedLabel(acc)) + '</p>' +
     '<p class="message' + ((p.error || p.accountError) && !currentVisitProgress(p.id) && !cancelledCheckins.has(p.id) ? " err" : "") + '">' + esc(currentVisitProgress(p.id) || cancelledCheckins.get(p.id) || p.error || p.accountError || p.message || p.note || "尚未获取最新统计") + "</p>" +
+    (p.accountHistoryError ? '<p class="message err">历史写入告警：' + esc(p.accountHistoryError) + '</p>' : '') +
     '<div class="card-actions">' +
     '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">" + (isVisitOnly(p) ? (busy ? "访问中…" : "立即访问") : (busy ? "签到中…" : "立即签到")) + "</button>" +
     '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
@@ -582,10 +587,15 @@ async function refreshStats(id, silent) {
   const r = await getAccount(p);
   const current = platforms.find(x => x.id === id);
   if (!current || !sameConnectionConfig(config, slim(current))) return;
-  mergeStatsInto(id, null, r.ok ? "额度已更新" : r.message, r.ok, r.account || null);
+  const message = r.message || (r.ok ? "额度已更新" : "获取账户额度失败");
+  const historyWarning = typeof r.historyWarning === "string" ? r.historyWarning : (current.accountHistoryError || "");
+  mergeStatsInto(id, null, message, r.ok, r.account || null);
+  // ok 只表示额度读取成功；未返回历史状态时沿用后台快照，不推断写入成功。
+  if (typeof r.historyWarning === "string") current.accountHistoryError = historyWarning;
   await savePlatforms();
   render();
-  if (!silent) toast(p.name + "：" + (r.ok ? "额度已更新" : r.message), !r.ok);
+  const feedback = message + (historyWarning && !message.includes(historyWarning) ? "；历史写入告警：" + historyWarning : "");
+  if (!silent) toast(current.name + "：" + feedback, !r.ok || !!historyWarning);
 }
 
 async function runBatch(action, operation = null) {
@@ -612,7 +622,8 @@ async function refreshAll() {
   $("refreshBtn").disabled = true;
   try {
     await runBatch((id) => refreshStats(id, true));
-    toast("统计刷新完成");
+    const historyWarnings = platforms.filter((p) => p.accountHistoryError).length;
+    toast("统计刷新完成" + (historyWarnings ? "；" + historyWarnings + " 个账号存在历史写入告警，请查看账号提示" : ""), !!historyWarnings);
   } finally {
     $("refreshBtn").disabled = false;
   }
@@ -870,8 +881,25 @@ function formData() {
   };
 }
 
+function setLoginPasswordVisible(visible) {
+  visible = visible && $("authMode").value === "password";
+  $("loginPassword").type = visible ? "text" : "password";
+  const toggle = $("loginPasswordToggle");
+  toggle.setAttribute("aria-pressed", String(visible));
+  toggle.title = visible ? "隐藏登录密码" : "显示登录密码";
+  toggle.setAttribute("aria-label", toggle.title);
+}
+function closeModal() {
+  ++modalSession;
+  setLoginPasswordVisible(false);
+  $("loginPassword").value = "";
+  $("modal").classList.remove("open");
+}
+
 function openModal(p) {
+  ++modalSession;
   invalidateConnectionTest();
+  setLoginPasswordVisible(false);
   editingId = p ? p.id : null;
   $("modalTitle").textContent = p ? "编辑平台" : "添加平台";
   $("name").value = p ? p.name || "" : "";
@@ -879,7 +907,7 @@ function openModal(p) {
   $("userId").value = p ? p.userId || "" : "";
   $("accessToken").value = p ? p.accessToken || "" : "";
   $("loginUsername").value = p ? p.loginUsername || "" : "";
-  $("loginPassword").value = p ? p.loginPassword || "" : "";
+  $("loginPassword").value = p && p.authMode === "password" && typeof p.loginPassword === "string" ? p.loginPassword : "";
   $("visitOnly").checked = isVisitOnly(p);
   $("logoutAfterVisit").checked = NACheckinAuth.shouldLogoutAfterVisit(p);
   $("note").value = p ? p.note || "" : "";
@@ -910,6 +938,7 @@ function openModal(p) {
 }
 // 鉴权方式切换：Cookie 模式时令牌/用户ID可留空，并提示
 function toggleAuthFields() {
+  setLoginPasswordVisible(false);
   const mode = $("authMode").value;
   const password = mode === "password";
   const agent = isAgentRouterMode({ authMode: mode });
@@ -930,7 +959,7 @@ function toggleAuthFields() {
   $("authHint").textContent = visit
     ? "仅访问：正常登录后刷新首页一次，读取最新额度并更新卡片后关闭临时页；只跳过签到接口，额度、模型及已配置的保活保持正常。" + (password ? "邮箱密码会自动补登录；验证码需手动完成。" : agent ? provider + " 会启动本站 OAuth 登录，必要时请手动授权。" : "Cookie/令牌不能代替网页登录；会话失效时需在打开的页面手动登录。") + "访问结束后默认不退出账号，仅关闭本轮临时页；开启“访问结束后退出账号”才在收尾时退出（同站其他页面也会受影响）。切换账号或重新授权前的必要退出不受此开关影响；保存不自动测试账号，执行任务时核验身份和额度。"
     : password
-    ? "邮箱密码模式：仅支持 HTTPS，扩展会在本站 /login 页面打开邮箱/用户名表单并填写登录。密码仅存本地（未加密），导出不含密码；验证码需手动完成。"
+    ? "邮箱密码模式：仅支持 HTTPS，扩展会在本站 /login 页面打开邮箱/用户名表单并填写登录。密码在本地保存和导出文件中均为明文，请妥善保管；验证码需手动完成。"
     : agent
       ? "Agent Router 模式：填写数字用户ID，确保浏览器已登录对应账号；扩展会退出当前会话并通过 " + provider + " 重新登录。只有登录回调确认签到后才标记成功；Linux DO 本轮匹配的“允许”会自动点击，其他授权、登录或验证码需手动完成。"
       : mode === "cookie"
@@ -973,6 +1002,25 @@ function connectionStatus(text, type) {
   el.className = "connection-status show " + (type || "loading");
 }
 
+// 表单保存只比较账号身份/凭据；动作和显示选项不使在线账户快照失效。
+function sameAccountConfig(a, b) {
+  if (!a || !b) return false;
+  const site = (p) => {
+    const raw = String(p.baseUrl || "").trim().replace(/\/+$/, "");
+    const history = globalThis.AccountHistory;
+    // 使用固定用户 ID 取得站点规范化结果，避免把缓存的在线 userId 当成配置。
+    const identity = history && history.identityFor({ baseUrl: p.baseUrl, id: "account-config-check", userId: "0" });
+    const suffix = "|user:0";
+    return typeof identity === "string" && identity.endsWith(suffix) ? identity.slice(0, -suffix.length) : raw;
+  };
+  const mode = a.authMode || "token";
+  if (mode !== (b.authMode || "token") || site(a) !== site(b) ||
+      String(a.userId || "").trim() !== String(b.userId || "").trim()) return false;
+  if (mode === "password") return String(a.loginUsername || "").trim() === String(b.loginUsername || "").trim() &&
+    a.loginPassword === b.loginPassword;
+  if (mode === "token") return String(a.accessToken || "").trim() === String(b.accessToken || "").trim();
+  return true;
+}
 function sameConnectionConfig(a, b) {
   return ["baseUrl", "authMode", "userId", "accessToken", "loginUsername", "loginPassword", "visitOnly"].every((key) => a[key] === b[key]);
 }
@@ -1208,14 +1256,19 @@ async function renderLastAuto() {
 
 // ---------- 导入/导出 ----------
 function exportConfig() {
-  const clean = platforms.map(({ loading, error, loginPassword, reauthPending, reauthStartedAt, reauthCompletedAt, ...rest }) => rest);
+  const clean = platforms.map(({ loading, error, loginPassword, reauthPending, reauthStartedAt, reauthCompletedAt, ...rest }) => ({
+    ...rest,
+    ...(rest.authMode === "password" ? { loginPassword: typeof loginPassword === "string" ? loginPassword : "" } : {}),
+  }));
+  const hasPasswords = clean.some((p) => p.authMode === "password" && p.loginPassword !== "");
+  if (hasPasswords && !window.confirm("导出的 JSON 文件包含明文登录密码，也可能包含访问令牌和 API Key。请妥善保管，不要公开或发送给他人。\n\n确认导出？")) return;
   const blob = new Blob([JSON.stringify(clean, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "newapi-checkin-config.json";
   a.click();
   URL.revokeObjectURL(a.href);
-  toast("配置已导出");
+  toast("配置已导出" + (hasPasswords ? "（包含明文登录密码）" : ""));
 }
 async function importConfig(file) {
   try {
@@ -1237,7 +1290,7 @@ async function importConfig(file) {
         loginUsername: p.authMode === "password" ? String(p.loginUsername || "").trim() : "",
         visitOnly: p.visitOnly === true,
         logoutAfterVisit: NACheckinAuth.shouldLogoutAfterVisit(p),
-        loginPassword: "", // 永远不信任导入文件里的密码；需要在本地重新填写。
+        loginPassword: p.authMode === "password" && typeof p.loginPassword === "string" ? p.loginPassword : "",
         note: p.note || "",
         keepAlive: normalizeKeepAlive(p.keepAlive),
         stats: p.stats || {},
@@ -1246,7 +1299,7 @@ async function importConfig(file) {
     });
     await savePlatforms(true);
     render();
-    toast("已导入 " + platforms.length + " 个平台" + (platforms.some((p) => p.authMode === "password") ? "；邮箱密码平台需编辑补填密码" : ""));
+    toast("已导入 " + platforms.length + " 个平台" + (platforms.some((p) => p.authMode === "password" && !p.loginPassword) ? "；缺少密码的邮箱密码平台需编辑补填密码" : ""));
   } catch (e) {
     toast("导入失败：" + e.message, true);
   }
@@ -1351,23 +1404,29 @@ async function init() {
   }
   // 不根据地址输入自动覆盖用户主动选择的鉴权方式。
   $("addBtn").onclick = () => openModal();
-  $("closeBtn").onclick = () => $("modal").classList.remove("open");
-  $("cancelBtn").onclick = () => $("modal").classList.remove("open");
+  $("closeBtn").onclick = closeModal;
+  $("cancelBtn").onclick = closeModal;
+  $("loginPasswordToggle").onclick = () => setLoginPasswordVisible($("loginPassword").type !== "text");
   $("modal").onclick = (e) => {
-    if (e.target === $("modal")) $("modal").classList.remove("open");
+    if (e.target === $("modal")) closeModal();
   };
   $("testBtn").onclick = () => testConnection().catch(() => {});
   $("platformForm").onsubmit = async (e) => {
     e.preventDefault();
+    const session = modalSession;
     const data = formData();
     const submit = e.submitter;
     if (submit) submit.disabled = true;
     try {
       validatePlatform(data);
       const previousConfig = editingId && platforms.find((p) => p.id === editingId);
-      const sameAccount = previousConfig && sameConnectionConfig(slim(previousConfig), slim(data));
+      const sameAccount = sameAccountConfig(previousConfig, data);
       data.stats = sameAccount ? previousConfig.stats || {} : {};
-      if (!sameAccount) data.account = null;
+      if (!sameAccount) {
+        data.account = null;
+        data.accountHistoryError = "";
+        data.accountHistoryUpdatedAt = "";
+      }
       if (editingId) {
         const previous = platforms.find((p) => p.id === editingId) || {};
         if (!sameConnectionConfig(slim(previous), slim(data))) {
@@ -1380,7 +1439,7 @@ async function init() {
       }
       await savePlatforms();
       render();
-      $("modal").classList.remove("open");
+      if (session === modalSession) closeModal();
       toast("平台配置已保存（尚未验证登录），未自动检测账号；执行任务时将验证登录");
     } catch (e) {
       toast(e && e.message || "保存失败，请检查配置", true);
@@ -1465,8 +1524,14 @@ async function init() {
     if (e.key !== "Escape") return;
     for (const mid of ["modelModal", "modal", "deleteModal"]) {
       const el = $(mid);
-      if (el && el.classList.contains("open")) { el.classList.remove("open"); break; }
+      if (el && el.classList.contains("open")) {
+        if (mid === "modal") closeModal(); else el.classList.remove("open");
+        break;
+      }
     }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) setLoginPasswordVisible(false);
   });
 
   $("autoEnabled").onchange = saveSettings;

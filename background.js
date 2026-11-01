@@ -402,10 +402,13 @@ function setStore(obj) {
 }
 // 独立串行化 read-modify-write，防止并发额度刷新互相覆盖历史；历史故障不阻断业务。
 let accountHistoryWriteQueue = Promise.resolve();
-function enqueueAccountHistoryWrite(action) {
+function enqueueAccountHistoryWrite(action, onError = null) {
   const operation = accountHistoryWriteQueue.catch(() => {}).then(async () => {
     try { return await action(); }
-    catch { return false; }
+    catch (error) {
+      if (onError) { try { await onError(error); } catch {} }
+      return false;
+    }
   });
   accountHistoryWriteQueue = operation.then(() => undefined, () => undefined);
   return operation;
@@ -419,17 +422,27 @@ function readAccountHistory() {
     });
   });
 }
-function clearAccountHistoryEntries(platformIds) {
+async function clearAccountHistoryEntries(platformIds, expectedEpochs = null) {
   if (!ACCOUNT_HISTORY) return Promise.resolve(false);
   const ids = new Set((platformIds || []).map((id) => String(id)));
   if (!ids.size) return Promise.resolve(true);
+  const isCurrentEpoch = (id) => !expectedEpochs ||
+    expectedEpochs.get(id) === (accountHistoryEpochs.get(id) || 0);
+  let targets = [];
   return enqueueAccountHistoryWrite(async () => {
+    targets = (await getPlatforms()).filter((entry) => ids.has(String(entry.id)) &&
+      isCurrentEpoch(String(entry.id))).map(historyTaskSnapshot);
+    if (![...ids].some(isCurrentEpoch)) return true;
     const current = await readAccountHistory();
-    if (!current) return true;
+    // Recheck after the last asynchronous read, including IDs whose config was deleted.
+    const currentIds = [...ids].filter(isCurrentEpoch);
+    if (!current || !currentIds.length) return true;
     const now = Date.now();
     const history = ACCOUNT_HISTORY.sanitizeHistory(current, now);
-    let changed = false;
-    for (const id of ids) {
+    let changed = current.version !== ACCOUNT_HISTORY.CURRENT_VERSION || !current.accounts ||
+      typeof current.accounts !== "object" || Array.isArray(current.accounts) ||
+      !Number.isFinite(current.startedAt) || current.startedAt < 0;
+    for (const id of currentIds) {
       if (Object.prototype.hasOwnProperty.call(history.accounts, id)) {
         delete history.accounts[id];
         changed = true;
@@ -439,28 +452,96 @@ function clearAccountHistoryEntries(platformIds) {
     if (!Object.keys(history.accounts).length) history.startedAt = now;
     await setStore({ [ACCOUNT_HISTORY.STORAGE_KEY]: history });
     return true;
+  }, async (error) => {
+    const warning = "清理账户历史失败：" + (error && error.message || "无法读写本地账户历史");
+    // This warning belongs to this cleanup generation, never to a later/new config.
+    for (const target of targets) { try { await setAccountHistoryStatus(target, warning); } catch {} }
   });
 }
-function recordAccountHistorySample(platform, account, month) {
-  return enqueueAccountHistoryWrite(async () => {
-    if (!ACCOUNT_HISTORY || !platform || platform.id == null || !account) return false;
-    const currentPlatforms = await getPlatforms();
-    const currentPlatform = currentPlatforms.find((entry) => String(entry.id) === String(platform.id));
-    // A result from a task that finished after its config changed/was deleted is stale.
-    if (!currentPlatform || !sameHistoryTaskConfig(currentPlatform, platform)) return false;
-    const now = Date.now();
-    const identity = ACCOUNT_HISTORY.identityFor({
-      ...platform,
-      // Use this online response, not a potentially stale cached platform.account snapshot.
-      account,
-    });
-    const sample = ACCOUNT_HISTORY.createSample(account, month, now);
-    if (!identity || !sample) return false;
-    const current = await readAccountHistory();
-    const next = ACCOUNT_HISTORY.appendSample(current, String(platform.id), identity, sample, now);
-    await setStore({ [ACCOUNT_HISTORY.STORAGE_KEY]: next });
-    return true;
+// In-flight tasks cannot revive history/warnings after delete, credential changes or reset.
+const accountHistoryEpochs = new Map();
+const HISTORY_TASK_EPOCH = Symbol("accountHistoryTaskEpoch");
+const accountHistorySamples = new WeakMap();
+const autoHistoryBudgets = new WeakMap();
+function historyTaskSnapshot(platform) {
+  return { ...platform, [HISTORY_TASK_EPOCH]: platform[HISTORY_TASK_EPOCH] ??
+    (accountHistoryEpochs.get(String(platform.id)) || 0) };
+}
+function isCurrentHistoryTask(current, platform) {
+  return !!current && sameHistoryTaskConfig(current, platform) &&
+    !!current.triggerSelf === !!platform.triggerSelf &&
+    ["checkinPath", "checkinMethod", "apiUserKey"].every((key) => String(current[key] || "") === String(platform[key] || "")) &&
+    (platform[HISTORY_TASK_EPOCH] == null || platform[HISTORY_TASK_EPOCH] ===
+      (accountHistoryEpochs.get(String(platform.id)) || 0));
+}
+async function readValidatedAccountHistory() {
+  if (!ACCOUNT_HISTORY) throw new Error("账户历史组件不可用");
+  const history = await readAccountHistory();
+  // Version changes are intentionally a clean start, not a legacy migration source.
+  if (history != null && (typeof history !== "object" || Array.isArray(history) ||
+      !Number.isSafeInteger(history.version) || (history.version === ACCOUNT_HISTORY.CURRENT_VERSION &&
+      (!Number.isFinite(history.startedAt) || history.startedAt < 0 || !history.accounts ||
+       typeof history.accounts !== "object" || Array.isArray(history.accounts))))) {
+    throw new Error("本地账户历史格式无效，无法安全读写");
+  }
+  return history;
+}
+async function setAccountHistoryStatus(platform, error, updatedAt = "", account = null) {
+  let applied = false;
+  // Never invoke this while holding a platform mutation callback.
+  await mutatePlatforms((list) => {
+    const current = list.find((entry) => String(entry.id) === String(platform.id));
+    if (!isCurrentHistoryTask(current, platform)) return list;
+    current.accountHistoryError = error || "";
+    if (updatedAt) current.accountHistoryUpdatedAt = updatedAt;
+    if (account && current.account && current.account.updatedAt === account.updatedAt) {
+      current.account.historyWarning = error || "";
+    }
+    applied = true;
+    return list;
   });
+  return applied;
+}
+function recordAccountHistorySample(platform, account, month) {
+  if (!platform || platform.id == null || !account) return Promise.resolve(false);
+  const metadata = account && accountHistorySamples.get(account);
+  platform = metadata ? metadata.platform : historyTaskSnapshot(platform);
+  const reportFailure = async (error) => {
+    const warning = error && error.message ? error.message : "无法读写本地账户历史";
+    const current = (await getPlatforms()).find((entry) => String(entry.id) === String(platform.id));
+    if (!isCurrentHistoryTask(current, platform)) return; // Normal stale-task rejection.
+    account.historyWarning = warning;
+    await setAccountHistoryStatus(platform, warning, "", account);
+  };
+  return enqueueAccountHistoryWrite(async () => {
+    if (!platform || platform.id == null || !account || account.source === "cache") return false;
+    const currentPlatform = (await getPlatforms()).find((entry) => String(entry.id) === String(platform.id));
+    if (!isCurrentHistoryTask(currentPlatform, platform)) return false;
+    if (!ACCOUNT_HISTORY) throw new Error("账户历史组件不可用");
+    const now = Date.now();
+    // Reuse the exact online balance timestamp when only Token fields were enriched.
+    const at = metadata ? metadata.at : Date.parse(account.updatedAt);
+    const sampleMonth = metadata ? metadata.month : month;
+    if (Number.isFinite(at) && at < ACCOUNT_HISTORY.getSampleTimeRange(now).start) return false;
+    const identity = ACCOUNT_HISTORY.identityFor({ ...platform, account });
+    const sample = ACCOUNT_HISTORY.createSample(account, sampleMonth, at);
+    if (!identity || !sample || !Number.isFinite(sample.balance) || at > now) {
+      throw new Error("在线余额历史样本校验失败");
+    }
+    const current = await readValidatedAccountHistory();
+    const next = ACCOUNT_HISTORY.appendSample(current, String(platform.id), identity, sample, now);
+    const entry = next && next.accounts && next.accounts[String(platform.id)];
+    if (!entry || entry.identity !== identity || !entry.samples.some((item) => item.at === at && item.balance === sample.balance)) {
+      throw new Error("在线余额历史样本未通过存储校验");
+    }
+    // A configuration save may have happened while the history read was pending.
+    const latest = (await getPlatforms()).find((item) => String(item.id) === String(platform.id));
+    if (!isCurrentHistoryTask(latest, platform)) return false;
+    await setStore({ [ACCOUNT_HISTORY.STORAGE_KEY]: next });
+    account.historyWarning = "";
+    await setAccountHistoryStatus(platform, "", new Date().toISOString(), account);
+    return true;
+  }, reportFailure);
 }
 const getPlatforms = () => getStore(KEY_PLATFORMS, []);
 // 旧的批量/页面快照不能覆盖刚确认的 OAuth 结果。
@@ -470,9 +551,10 @@ function preserveCompletedReauth(next, stored) {
       String(next.userId || "") !== String(stored.userId || "") || next.baseUrl !== stored.baseUrl) return next;
   return { ...next, reauthPending: false, reauthCompletedAt: stored.reauthCompletedAt,
     reauthCheckedIn: stored.reauthCheckedIn, reauthAccountUpdated: stored.reauthAccountUpdated, message: stored.message,
-    error: stored.error, accountError: stored.accountError || "", stats: stored.stats, statsDate: stored.statsDate, account: stored.account, lastCheckinAt: stored.lastCheckinAt };
+    error: stored.error, accountError: stored.accountError || "", accountHistoryError: stored.accountHistoryError || "",
+    accountHistoryUpdatedAt: stored.accountHistoryUpdatedAt || "", stats: stored.stats, statsDate: stored.statsDate, account: stored.account, lastCheckinAt: stored.lastCheckinAt };
 }
-const PLATFORM_STATE_FIELDS = ["message", "error", "accountError", "account", "stats", "statsDate", "enabled",
+const PLATFORM_STATE_FIELDS = ["message", "error", "accountError", "accountHistoryError", "accountHistoryUpdatedAt", "account", "stats", "statsDate", "enabled",
   "lastVisitDate", "lastVisitedAt", "lastCheckinAt", "reauthPending", "reauthStartedAt", "reauthCompletedAt",
   "reauthCheckedIn", "reauthAccountUpdated", "taskResultRevision"];
 const stateRevision = (p) => Number.isSafeInteger(p && p.stateRevision) && p.stateRevision >= 0 ? p.stateRevision : 0;
@@ -505,6 +587,7 @@ function mutatePlatforms(fn) {
 }
 async function savePlatforms(list, resetState = false) {
   const historyIdsToClear = new Set();
+  const historyCleanupEpochs = new Map();
   await mutatePlatforms((current) => {
     const next = list.map(({ loading, ...p }) => p);
     const nextById = new Map(next.map((p) => [String(p.id), p]));
@@ -515,14 +598,30 @@ async function savePlatforms(list, resetState = false) {
       for (const previous of current) {
         const key = String(previous.id);
         const replacement = nextById.get(key);
-        if (!replacement || !sameHistoryTaskConfig(replacement, previous)) historyIdsToClear.add(key);
+        if (!replacement || !sameHistoryAccountConfig(replacement, previous)) historyIdsToClear.add(key);
       }
     }
-    return next.map((p) => resetState ? p : preserveNewerPlatformState(p, current.find((x) => x.id === p.id)));
+    for (const p of next) {
+      if (!current.some((entry) => String(entry.id) === String(p.id))) historyIdsToClear.add(String(p.id));
+    }
+    for (const id of historyIdsToClear) {
+      const epoch = (accountHistoryEpochs.get(id) || 0) + 1;
+      accountHistoryEpochs.set(id, epoch);
+      historyCleanupEpochs.set(id, epoch);
+    }
+    return next.map((p) => {
+      const preserved = resetState ? p : preserveNewerPlatformState(p, current.find((x) => x.id === p.id));
+      if (resetState || historyIdsToClear.has(String(p.id)) || !current.some((entry) => String(entry.id) === String(p.id))) {
+        preserved.accountHistoryError = "";
+        preserved.accountHistoryUpdatedAt = "";
+        if (preserved.account) preserved.account = { ...preserved.account, historyWarning: "" };
+      }
+      return preserved;
+    });
   });
   // Config is committed first. The shared history queue ensures an in-flight old sample
   // finishes before this cleanup, while later samples see the new/missing config above.
-  await clearAccountHistoryEntries([...historyIdsToClear]);
+  await clearAccountHistoryEntries([...historyIdsToClear], historyCleanupEpochs);
 }
 function normalizeSettings(s) {
   return { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true,
@@ -602,6 +701,11 @@ function sameHistoryTaskConfig(a, b) {
     { ...b, baseUrl: historyIdentityBase(b) },
   );
 }
+// Changing only the task action does not change the account whose balance we track.
+// Keep the stricter task comparison above for rejecting in-flight results.
+function sameHistoryAccountConfig(a, b) {
+  return !!a && !!b && sameHistoryTaskConfig({ ...a, visitOnly: isVisitOnly(b) }, b);
+}
 
 function isSiteHost(base, host) {
   try { return new URL(base).hostname.toLowerCase() === host; } catch { return false; }
@@ -612,6 +716,9 @@ function isAgentRouterMode(p) {
 }
 function isAgentRouterReauthMode(p) {
   return isAgentRouterMode(p) || (!!p && p.authMode === "cookie" && isSiteHost(p.baseUrl, "agentrouter.org"));
+}
+function isAgentRouterPasswordMode(p) {
+  return !!p && p.authMode === "password" && isSiteHost(p.baseUrl, "agentrouter.org");
 }
 function agentRouterProvider(p) { return AUTH_CONFIG.agentRouterProvider(p.authMode); }
 function agentRouterProviderLabel(provider) { return provider === "linuxdo" ? "Linux DO" : "GitHub"; }
@@ -886,14 +993,14 @@ async function callAgentRouterAccountViaTab(p, base, strict = false, control = n
     }
     verifyConfiguredUser(p, result.body);
     return {
-      body: result.body,
+      body: result.usedCachedAccount ? { ...result.body, data: { ...result.body.data, _accountSource: "cache" } } : result.body,
       warning: result.usedCachedAccount
         ? "用户接口连续返回异常零值，当前额度来自最近一次登录数据"
         : "",
     };
   }
   if (!strict && result && result.cachedUser && ![401, 403].includes(result.status) && !result.htmlResponse) {
-    const body = { success: true, data: result.cachedUser };
+    const body = { success: true, data: { ...result.cachedUser, _accountSource: "cache" } };
     verifyConfiguredUser(p, body);
     return { body, warning: "用户接口返回异常，当前额度来自最近一次登录数据" };
   }
@@ -993,24 +1100,52 @@ function waitTabComplete(tabId, control = null) {
 // args: [reqPath, method, month, userId, apiUserKey]
 function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query, checkinToken = "", expectedOrigin = "", bearer = "") {
   return (async () => {
+    const requestMethod = String(method || "GET").toUpperCase();
+    const safePath = (value) => {
+      try { return new URL(String(value || "/"), location.origin).pathname || "/"; } catch { return "/"; }
+    };
+    const safeUrl = (value) => {
+      try {
+        const parsed = new URL(String(value || "/"), location.origin);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return location.origin + "/";
+        return parsed.origin + parsed.pathname;
+      } catch { return location.origin + safePath(reqPath); }
+    };
+    const requestPath = safePath(reqPath);
+    const warnFailure = ({ status = 0, contentType = "", responseUrl = "", cancelled = false, timedOut = false } = {}) => {
+      try {
+        console.warn("[NewAPI checkin request]", {
+          method: requestMethod,
+          path: requestPath,
+          status: Number(status) || 0,
+          contentType: String(contentType || "").split(";")[0].slice(0, 100),
+          responseUrl: responseUrl ? safeUrl(responseUrl) : "",
+          cancelled: !!cancelled,
+          timedOut: !!timedOut,
+          strict: false,
+        });
+      } catch {}
+    };
     // 后台检查与注入之间仍可能导航；在实际执行的文档内再次锁定目标站点。
-    if (expectedOrigin && location.origin !== expectedOrigin) return { ok: false, status: 0, body: { success: false, message: "账户页面已跳转到其他站点，已停止取数" } };
-    const url = new URL(reqPath, location.origin);
-    if (url.origin !== location.origin) return { ok: false, status: 0, body: { success: false, message: "禁止向其他站点发送会话请求" } };
+    if (expectedOrigin && location.origin !== expectedOrigin) return { ok: false, status: 0, reqPath: requestPath, body: { success: false, message: "账户页面已跳转到其他站点，已停止取数" } };
+    let url;
+    try { url = new URL(reqPath, location.origin); }
+    catch { return { ok: false, status: 0, reqPath: requestPath, body: { success: false, message: "账户请求地址无效" } }; }
+    if (url.origin !== location.origin) return { ok: false, status: 0, reqPath: requestPath, body: { success: false, message: "禁止向其他站点发送会话请求" } };
     if (month) url.searchParams.set("month", month);
     if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
     const headers = {
       "Accept": "application/json, text/plain, */*",
       "Cache-Control": "no-store",
     };
-    if ((method || "GET").toUpperCase() !== "GET") headers["Content-Type"] = "application/json";
+    if (requestMethod !== "GET") headers["Content-Type"] = "application/json";
     if (!userId) {
       try { const user = JSON.parse(localStorage.getItem("user") || "null"); if (user && user.id != null) userId = String(user.id); } catch {}
     }
     if (userId) headers[(apiUserKey || "New-Api-User")] = String(userId);
     if (bearer) headers.Authorization = "Bearer " + bearer;
     if (checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken)) {
-      return { ok: false, status: 0, cancelled: true, body: { success: false, message: "本轮签到已停止" } };
+      return { ok: false, status: 0, reqPath: requestPath, cancelled: true, timedOut: false, body: { success: false, message: "本轮签到已停止" } };
     }
     const controller = new AbortController();
     let stopped = false;
@@ -1019,24 +1154,37 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query, chec
     };
     const abortResult = () => {
       const cancelled = stopped || !!(checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken));
-      return { ok: false, status: 0, cancelled, timedOut: !cancelled,
+      const responseUrl = res ? safeUrl(res.url || url.href) : "";
+      const result = { ok: false, status: 0, reqPath: requestPath, cancelled, timedOut: !cancelled,
         body: { success: false, message: cancelled ? "本轮签到已停止" : "账户请求超时，请稍后重试" } };
+      if (contentType) result.contentType = contentType;
+      if (responseUrl) result.responseUrl = responseUrl;
+      warnFailure({ status: 0, contentType, responseUrl, cancelled, timedOut: !cancelled });
+      return result;
     };
     window.addEventListener("nacheckin:checkin-stop", onStop);
-    const requestLimit = (method || "GET").toUpperCase() === "GET" ? 12000 : 60000;
+    const requestLimit = requestMethod === "GET" ? 12000 : 60000;
     const requestTimer = setTimeout(() => controller.abort(), requestLimit);
-    let res, text;
+    let res, text, contentType = "";
     try {
-      res = await fetch(url.toString(), { method, headers, credentials: "include", mode: "same-origin", signal: controller.signal });
+      res = await fetch(url.toString(), { method, headers, credentials: "include", mode: "same-origin", signal: controller.signal,
+        cache: requestMethod === "GET" && requestPath === "/api/user/self" ? "no-store" : "default" });
       if (controller.signal.aborted || (checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken))) return abortResult();
-      const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+      contentType = String(res.headers.get("content-type") || "").toLowerCase();
       text = await res.text();
       if (controller.signal.aborted) return abortResult();
-      // Preserve content type below while keeping timeout active through response-body reading.
-      return { ok: res.ok, status: res.status, body: parseResponseBody(text, contentType), htmlResponse: isHtmlResponse(text, contentType) };
+      const responseUrl = safeUrl(res.url || url.href);
+      const htmlResponse = isHtmlResponse(text, contentType);
+      const result = { ok: res.ok, status: res.status, body: parseResponseBody(text, contentType), htmlResponse, contentType, responseUrl, reqPath: requestPath };
+      if (!res.ok || htmlResponse) warnFailure({ status: res.status, contentType, responseUrl });
+      return result;
     } catch (e) {
       if (controller.signal.aborted) return abortResult();
-      return { ok: false, status: 0, body: { success: false, message: "网络请求失败：" + (e && e.message ? e.message : "无法连接站点") } };
+      const result = { ok: false, status: 0, reqPath: requestPath, body: { success: false, message: "网络请求失败：无法连接站点" } };
+      if (contentType) result.contentType = contentType;
+      if (res) result.responseUrl = safeUrl(res.url || url.href);
+      warnFailure({ status: 0, contentType, responseUrl: res ? (res.url || url.href) : "" });
+      return result;
     } finally {
       clearTimeout(requestTimer);
       window.removeEventListener("nacheckin:checkin-stop", onStop);
@@ -1104,6 +1252,54 @@ function tabFetchAgentRouterAccount(configuredUserId, strict = false, checkinTok
       return { userMismatch: true, configuredUserId: configured, actualUserId: actual };
     }
 
+    const requestPath = "/api/user/self";
+    const safeUrl = (value) => {
+      try {
+        const parsed = new URL(String(value || requestPath), location.origin);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return location.origin + requestPath;
+        return parsed.origin + parsed.pathname;
+      } catch { return location.origin + requestPath; }
+    };
+    const cancelled = () => !!checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken);
+    const warnFailure = ({ status = 0, contentType = "", responseUrl = "", cancelled: wasCancelled = false, timedOut = false } = {}) => {
+      try {
+        console.warn("[Agent Router account request]", {
+          method: "GET",
+          path: requestPath,
+          status: Number(status) || 0,
+          contentType: String(contentType || "").split(";")[0].slice(0, 100),
+          responseUrl: safeUrl(responseUrl || requestPath),
+          cancelled: !!wasCancelled,
+          timedOut: !!timedOut,
+          strict: !!strict,
+        });
+      } catch {}
+    };
+    const makeFailure = ({ status = 0, contentType = "", responseUrl = "", htmlResponse = false, message = "用户接口请求失败", body: responseBody = null, cancelled: wasCancelled = false, timedOut = false } = {}) => {
+      const errorMessage = typeof message === "string" && message
+        ? message
+        : responseBody && typeof responseBody.message === "string" && responseBody.message
+          ? responseBody.message
+          : "用户接口请求失败";
+      const body = responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)
+        ? { ...responseBody, success: false }
+        : { success: false };
+      if (typeof body.message !== "string" || !body.message) body.message = errorMessage;
+      const result = {
+        ok: false,
+        status: Number(status) || 0,
+        htmlResponse: !!htmlResponse,
+        contentType: String(contentType || "").toLowerCase(),
+        responseUrl: safeUrl(responseUrl || requestPath),
+        reqPath: requestPath,
+        cancelled: !!wasCancelled,
+        timedOut: !!timedOut,
+        message: errorMessage,
+        body,
+      };
+      warnFailure({ status: result.status, contentType: result.contentType, responseUrl: result.responseUrl, cancelled: result.cancelled, timedOut: result.timedOut });
+      return result;
+    };
     const userId = strict ? configured || actual || "-1" : actual || configured || "-1";
     const valueOf = (data, names) => {
       if (!data) return null;
@@ -1126,13 +1322,30 @@ function tabFetchAgentRouterAccount(configuredUserId, strict = false, checkinTok
       .some((value) => value != null && value !== "" && Number(value) !== 0);
 
     const requestUser = (cacheBust) => new Promise((resolveRequest) => {
-      let xhr, stopped = false;
-      const onStop = (event) => { if (checkinToken && event && event.detail === String(checkinToken)) { stopped = true; try { xhr.abort(); } catch {} } };
+      let xhr, stopped = false, settled = false;
+      const path = requestPath + (cacheBust ? "?_nacheckin=" + Date.now() : "");
+      const done = (result) => {
+        if (settled) return;
+        settled = true;
+        if (checkinToken) window.removeEventListener("nacheckin:checkin-stop", onStop);
+        resolveRequest(result);
+      };
+      const onStop = (event) => {
+        if (checkinToken && event && event.detail === String(checkinToken)) {
+          stopped = true;
+          try { xhr.abort(); } catch {}
+          done(makeFailure({ status: xhr.status || 0, responseUrl: xhr.responseURL || path,
+            message: "本轮签到已停止", cancelled: true }));
+        }
+      };
+      if (cancelled()) {
+        done(makeFailure({ cancelled: true, message: "本轮签到已停止" }));
+        return;
+      }
+      try { xhr = new XMLHttpRequest(); }
+      catch { done(makeFailure({ message: "无法创建账户请求" })); return; }
       if (checkinToken) window.addEventListener("nacheckin:checkin-stop", onStop);
-      const done = (result) => { if (checkinToken) window.removeEventListener("nacheckin:checkin-stop", onStop); resolveRequest(result); };
       try {
-        xhr = new XMLHttpRequest();
-        const path = "/api/user/self" + (cacheBust ? "?_nacheckin=" + Date.now() : "");
         xhr.open("GET", path, true);
         xhr.withCredentials = true;
         xhr.timeout = 15000;
@@ -1141,40 +1354,51 @@ function tabFetchAgentRouterAccount(configuredUserId, strict = false, checkinTok
         xhr.setRequestHeader("New-API-User", userId);
         xhr.setRequestHeader("Cache-Control", "no-cache, no-store, max-age=0");
         xhr.setRequestHeader("Pragma", "no-cache");
-      } catch (e) {
-        done({ ok: false, message: e && e.message ? e.message : "无法创建账户请求" });
+      } catch {
+        done(makeFailure({ message: "无法创建账户请求" }));
         return;
       }
 
       xhr.onload = () => {
         const text = String(xhr.responseText || "");
         const contentType = String(xhr.getResponseHeader("content-type") || "").toLowerCase();
+        const responseUrl = safeUrl(xhr.responseURL || path);
+        const status = Number(xhr.status) || 0;
         let body = null;
         try { body = text ? JSON.parse(text) : null; } catch {}
-        if (xhr.status >= 200 && xhr.status < 300 && body && body.success !== false && body.data) {
-          done({ ok: true, status: xhr.status, responseUrl: xhr.responseURL, contentType, body });
+        if (status >= 200 && status < 300 && body && body.success !== false && body.data) {
+          done({ ok: true, status, responseUrl, contentType, reqPath: requestPath, cancelled: false, timedOut: false, body });
           return;
         }
         const htmlResponse = contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text);
-        const message = body && body.message
+        const message = body && typeof body.message === "string" && body.message
           ? body.message
           : htmlResponse
-            ? "用户接口被重定向到网页（HTTP " + xhr.status + "，" + (xhr.responseURL || "/api/user/self") + "）"
-            : "用户接口返回无效数据（HTTP " + xhr.status + "）";
-        done({ ok: false, status: xhr.status, responseUrl: xhr.responseURL, contentType, htmlResponse, message });
+            ? "用户接口被重定向到网页（HTTP " + status + "）"
+            : "用户接口返回无效数据（HTTP " + status + "）";
+        done(makeFailure({ status, responseUrl, contentType, htmlResponse, message, body }));
       };
-      xhr.onerror = () => done({ ok: false, status: xhr.status || 0, message: "用户接口网络请求失败" });
-      xhr.ontimeout = () => done({ ok: false, status: 0, message: "用户接口请求超时" });
+      xhr.onerror = () => done(makeFailure({ status: xhr.status || 0, responseUrl: xhr.responseURL || path, message: "用户接口网络请求失败" }));
+      xhr.ontimeout = () => done(makeFailure({ status: xhr.status || 0, responseUrl: xhr.responseURL || path, message: "用户接口请求超时", timedOut: true }));
+      xhr.onabort = () => {
+        const wasCancelled = stopped || cancelled();
+        done(makeFailure({ status: xhr.status || 0, responseUrl: xhr.responseURL || path,
+          message: wasCancelled ? "本轮签到已停止" : "用户接口请求已中止", cancelled: wasCancelled }));
+      };
       try { xhr.send(); }
-      catch (e) { done({ ok: false, status: 0, message: e && e.message ? e.message : "用户接口请求失败" }); }
+      catch { done(makeFailure({ status: xhr.status || 0, responseUrl: xhr.responseURL || path, message: "用户接口请求失败" })); }
     });
 
     let result = await requestUser(false);
-    if (checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken)) return { ok: false, cancelled: true, message: "本轮签到已停止" };
+    if (cancelled()) {
+      if (result && result.cancelled) return strict ? { ...result, cachedUser: null } : result;
+      return makeFailure({ cancelled: true, message: "本轮签到已停止" });
+    }
     if (!result.ok || (cachedHasBalance && looksLikeEmptyAccount(result.body && result.body.data))) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
-      if (checkinToken && window.__nacheckinCancelledCheckinToken === String(checkinToken)) return { ok: false, cancelled: true, message: "本轮签到已停止" };
+      if (cancelled()) return makeFailure({ cancelled: true, message: "本轮签到已停止" });
       const retry = await requestUser(true);
+      if (retry.cancelled) return strict ? { ...retry, cachedUser: null } : retry;
       if (retry.ok || !result.ok) result = retry;
     }
 
@@ -1183,7 +1407,7 @@ function tabFetchAgentRouterAccount(configuredUserId, strict = false, checkinTok
     const id = onlineData ? onlineData.id : null;
     const onlineId = (typeof id === "number" || typeof id === "string") && /^\d+$/.test(String(id).trim()) ? String(id).trim() : null;
     if (configured && onlineId !== null && configured !== onlineId) {
-      return { userMismatch: true, configuredUserId: configured, actualUserId: String(onlineId) };
+      return { ...result, userMismatch: true, configuredUserId: configured, actualUserId: String(onlineId) };
     }
     // 回调/检测必须使用在线响应，不能用旧 user 缓存补额度或证明当前会话。
     if (strict && result.ok && onlineId === null) return { ...result, ok: false, invalidIdentity: true,
@@ -1312,8 +1536,73 @@ function sessionProbeUser(probe, allowUnauthenticated = false) {
   return user;
 }
 
+function agentRouterProbeDetails(probe, origin) {
+  let path = "/api/user/self";
+  try { path = new URL(probe && probe.responseUrl || path, origin).pathname || path; } catch {}
+  path = path.split("/").map((part) => {
+    if (!part) return "";
+    let decoded = part;
+    try { decoded = decodeURIComponent(part); } catch {}
+    if (decoded.length > 32 || /[@%?#]/.test(decoded) || /^\d+$/.test(decoded) || /^[\da-f-]{16,}$/i.test(decoded)) return ":redacted";
+    return decoded.replace(/[^a-zA-Z0-9._~-]/g, "_");
+  }).join("/").slice(0, 120);
+  const contentType = String(probe && probe.contentType || "").split(";")[0].trim().toLowerCase()
+    .replace(/[^a-z0-9.+/_-]/g, "").slice(0, 64);
+  return { status: Number(probe && probe.status || 0), contentType: contentType || "unknown", path };
+}
+
+function logAgentRouterPasswordStage(stage, probe, origin) {
+  try { console.info("[check-in] Agent Router password " + stage, agentRouterProbeDetails(probe, origin)); } catch {}
+}
+
+async function readAgentRouterPasswordSession(platform, tabId, allowUnauthenticated = false, control = null, allowAccountSwitch = false) {
+  const origin = new URL(platform.baseUrl).origin;
+  const page = await chrome.tabs.get(tabId).catch(() => null);
+  if (!page || !page.url || new URL(page.url).origin !== origin) throw new Error("账户页面已跳转到其他站点");
+  await dismissSiteNotice(tabId, origin, control);
+  const readyPage = await chrome.tabs.get(tabId).catch(() => null);
+  if (!readyPage || !readyPage.url || new URL(readyPage.url).origin !== origin) throw new Error("账户页面已跳转到其他站点");
+  const out = await executeCheckinScript({ target: { tabId }, world: "MAIN", func: tabFetchAgentRouterAccount,
+    args: [String(platform.userId || "").trim(), true, control && control.token || ""] }, control);
+  const probe = out && out[0] && out[0].result;
+  const latestPage = await chrome.tabs.get(tabId).catch(() => null);
+  if (!latestPage || !latestPage.url || new URL(latestPage.url).origin !== origin) throw new Error("账户页面已跳转到其他站点");
+  const details = agentRouterProbeDetails(probe, origin);
+  if (probe && (probe.cancelled || probe.timedOut)) sessionProbeUser(probe, allowUnauthenticated);
+  if (probe && probe.userMismatch) {
+    logAgentRouterPasswordStage("identity-mismatch", probe, origin);
+    if (allowAccountSwitch) return null;
+    throw accountMismatchError(probe.configuredUserId, probe.actualUserId);
+  }
+  if (probe && probe.htmlResponse) {
+    logAgentRouterPasswordStage("html-challenge", probe, origin);
+    throw makeCheckinError("SESSION_CHALLENGE", "Agent Router 账户接口返回网页而非账户数据（HTTP " + details.status + "，" + details.contentType + "，" + details.path + "），请在保留的页面完成登录或安全验证");
+  }
+  if (details.status === 401 && allowUnauthenticated) {
+    return null;
+  }
+  if (probe && probe.invalidIdentity) {
+    logAgentRouterPasswordStage("invalid-identity", probe, origin);
+    throw makeCheckinError("SESSION_RESPONSE_INVALID", "Agent Router 在线账户响应缺少有效用户 ID（HTTP " + details.status + "，" + details.contentType + "，" + details.path + "）");
+  }
+  if (!probe || !probe.ok || !probe.body || probe.body.success === false) {
+    logAgentRouterPasswordStage("request-failed", probe, origin);
+    const code = details.status === 401 ? "SESSION_EXPIRED" : "SESSION_REQUEST_FAILED";
+    throw makeCheckinError(code, "Agent Router 账户接口请求失败（HTTP " + details.status + "，" + details.contentType + "，" + details.path + "）");
+  }
+  const onlineUser = probe.body.data;
+  if (!onlineUser || !["string", "number"].includes(typeof onlineUser.id) || !/^\d+$/.test(String(onlineUser.id).trim())) {
+    logAgentRouterPasswordStage("invalid-identity", probe, origin);
+    throw makeCheckinError("SESSION_RESPONSE_INVALID", "Agent Router 在线账户响应缺少有效用户 ID（HTTP " + details.status + "，" + details.contentType + "，" + details.path + "）");
+  }
+  verifyConfiguredUser(platform, probe.body);
+  logAgentRouterPasswordStage("online-identity-verified", probe, origin);
+  return { user: onlineUser, body: probe.body, probe };
+}
+
 async function loginPasswordOnTab(p, tab, force = false, control = null) {
   const origin = new URL(p.baseUrl).origin;
+  const agentRouterPassword = isAgentRouterPasswordMode(p);
   const login = String(p.loginUsername || "").trim();
   const inject = async (func, args = [], main = false) => {
     const current = await chrome.tabs.get(tab.id);
@@ -1322,10 +1611,19 @@ async function loginPasswordOnTab(p, tab, force = false, control = null) {
     const out = await executeCheckinScript({ target: { tabId: tab.id }, ...(main ? { world: "MAIN" } : {}), func, args }, control);
     return out && out[0] && out[0].result;
   };
-  const probe = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(p.userId || ""), "New-Api-User"]);
-  const currentUser = sessionProbeUser(probe, true);
+  let currentUser = null;
+  if (agentRouterPassword && force) {
+    logAgentRouterPasswordStage("reauth-skip-old-session-probe", null, origin);
+  } else if (agentRouterPassword) {
+    const session = await readAgentRouterPasswordSession(p, tab.id, true, control, !force);
+    currentUser = session && session.user;
+  } else {
+    const probe = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(p.userId || ""), "New-Api-User"]);
+    currentUser = sessionProbeUser(probe, true);
+  }
   if (!force && passwordUserMatches(p, currentUser)) return currentUser;
   // 不沿用其他账号/无法确认归属的会话，也不能以旧 localStorage 证明登录成功。
+  if (agentRouterPassword) logAgentRouterPasswordStage("starting-native-password-login", null, origin);
   const logout = await inject(tabLogout, [], true);
   if (!logout || !logout.ok) throw new Error("无法退出旧登录会话，请在本站手动退出后重试");
   clearSiteSessionTokens(origin);
@@ -1340,16 +1638,21 @@ async function loginPasswordOnTab(p, tab, force = false, control = null) {
   // 成功必须同时有新的页面登录数据和在线 self，不能仅以提交按钮/跳转判断。
   for (let i = 0; i < 25; i++) {
     await wait(800, control);
-    let stored = null, online = null;
+    let stored = null, online = null, agentRouterSession = null;
     try {
       stored = await inject(tabReadAgentRouterStoredUser);
-      online = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(stored && stored.id || p.userId || ""), "New-Api-User"]);
+      if (agentRouterPassword) {
+        agentRouterSession = await readAgentRouterPasswordSession(p, tab.id, true, control, false);
+        online = agentRouterSession && agentRouterSession.probe;
+      } else {
+        online = await inject(tabFetchCheckin, ["/api/user/self", "GET", null, String(stored && stored.id || p.userId || ""), "New-Api-User"]);
+      }
     } catch (error) { assertCheckinActive(control); if (!isRemovedDocumentError(error)) throw error; continue; } // 仅导航中断可重试。
-    const user = online ? sessionProbeUser(online, true) : null;
+    const user = agentRouterPassword ? agentRouterSession && agentRouterSession.user : online ? sessionProbeUser(online, true) : null;
     if (!user || (stored && String(user.id) !== String(stored.id))) continue;
     verifyConfiguredUser(p, online.body);
     // 新表单登录完成后，若站点提供邮箱/用户名，进一步拒绝明确串号。
-    if ((!login.includes("@") || user.email) && !passwordUserMatches(p, user)) throw new Error("本站登录账号与配置的邮箱/用户名不一致");
+    if ((agentRouterPassword || !login.includes("@") || user.email) && !passwordUserMatches(p, user)) throw new Error("本站登录账号与配置的邮箱/用户名不一致");
     return { ...user, checked_in: !!stored && stored.checked_in === true, _freshLogin: true };
   }
   throw new Error("邮箱密码登录尚未完成：请在打开的页面检查密码、验证码或二次验证，完成后重试");
@@ -2265,7 +2568,8 @@ async function callApiPath(p, reqPath, method, opts) {
   if (uid && /^\d+$/.test(uid)) headers["New-Api-User"] = uid;
   let res;
   try {
-    res = await checkinFetch(url.toString(), { method, headers, credentials: "omit" }, control);
+    res = await checkinFetch(url.toString(), { method, headers, credentials: "omit",
+      cache: method === "GET" && reqPath === "/api/user/self" ? "no-store" : "default" }, control);
   } catch (e) {
     if (isCheckinControlError(e)) throw e;
     throw new Error("网络请求失败：" + (e && e.message ? e.message : "无法连接站点"));
@@ -2294,7 +2598,12 @@ async function callApiPath(p, reqPath, method, opts) {
 async function callApi(p, reqPath, method, opts) {
   await assertApiAllowed(p, reqPath);
   validatePlatform(p);
-  if (p.authMode === "password") await ensurePasswordSession(p, false, opts && opts.control);
+  const passwordUser = p.authMode === "password"
+    ? await ensurePasswordSession(p, false, opts && opts.control)
+    : null;
+  if (isAgentRouterPasswordMode(p) && method === "GET" && /^\/api\/user\/self\/?$/.test(String(reqPath || ""))) {
+    return { success: true, data: passwordUser };
+  }
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
   if (p.authMode === "cookie" || p.authMode === "password" || isAgentRouterMode(p)) {
     const st = cookieStrategy(p, base);
@@ -2356,17 +2665,24 @@ async function readVisitSession(platform, tabId, allowAccountSwitch = false, all
   if (current.status !== "complete") throw makeCheckinError("SESSION_PAGE_PENDING", "账户页面仍在导航，请稍候");
   try { await dismissSiteNotice(tabId, origin, control); }
   catch (error) { assertCheckinActive(control); if (isRemovedDocumentError(error)) throw makeCheckinError("SESSION_PAGE_PENDING", "账户页面正在切换文档"); throw error; }
-  let probe;
+  let probe, user;
   try {
-    const out = await executeCheckinScript({ target: { tabId }, world: "MAIN", func: tabFetchCheckin,
-      args: ["/api/user/self", "GET", null, String(platform.userId || ""), cookieStrategy(platform, platform.baseUrl).apiUserKey, null, "", origin] }, control);
-    probe = out && out[0] && out[0].result;
+    if (isAgentRouterPasswordMode(platform)) {
+      const session = await readAgentRouterPasswordSession(platform, tabId, allowAccountSwitch || allowLoginPage, control, allowAccountSwitch);
+      if (!session) return null;
+      probe = session.probe;
+      user = session.user;
+    } else {
+      const out = await executeCheckinScript({ target: { tabId }, world: "MAIN", func: tabFetchCheckin,
+        args: ["/api/user/self", "GET", null, String(platform.userId || ""), cookieStrategy(platform, platform.baseUrl).apiUserKey, null, "", origin] }, control);
+      probe = out && out[0] && out[0].result;
+      user = sessionProbeUser(probe, allowAccountSwitch || allowLoginPage);
+    }
   } catch (error) {
     assertCheckinActive(control);
     if (isRemovedDocumentError(error)) throw makeCheckinError("SESSION_PAGE_PENDING", "账户页面正在切换文档");
     throw error;
   }
-  const user = sessionProbeUser(probe, allowAccountSwitch || allowLoginPage);
   if (!user) return null;
   if (allowAccountSwitch && platform.authMode === "password" && !passwordUserMatches(platform, user)) return null;
   if (allowAccountSwitch && isAgentRouterReauthMode(platform) && platform.userId && String(platform.userId).trim() !== String(user.id)) return null;
@@ -2461,27 +2777,168 @@ function visitStage(platform, control, phase, message) {
       stopVersion: control ? control.stopVersion : latestCheckinStopVersion }, () => { void chrome.runtime.lastError; });
   } catch {}
 }
-async function publishVisitBalance(platform, account, control) {
+async function publishAccountSnapshot(platform, account, control, month = currentMonth()) {
   assertCheckinActive(control);
-  if (platform.id == null) return;
+  if (platform.id == null) return false;
+  let metadata = accountHistorySamples.get(account);
+  if (!metadata) {
+    metadata = { platform: historyTaskSnapshot(platform), at: Date.parse(account.updatedAt), month };
+    accountHistorySamples.set(account, metadata);
+  }
+  if (account.source === "cache") account.historyWarning = "当前额度来自缓存，未新增历史样本；请正常刷新或访问获取在线余额";
+  let published = false;
   await mutatePlatforms((list) => {
     assertCheckinActive(control);
     const current = list.find((entry) => entry.id === platform.id);
-    if (current && sameTaskConfig(current, platform)) {
+    if (isCurrentHistoryTask(current, metadata.platform)) {
       current.account = { ...account };
       current.accountError = "";
+      published = true;
     }
     return list;
   });
+  // Release platformWriteQueue before joining historyQueue. Once the balance is
+  // committed, a subsequent stop cannot discard its already-confirmed sample.
+  if (published && account.source !== "cache") metadata.recorded = await recordAccountHistorySample(metadata.platform, account, month);
+  return published;
+}
+
+function accountHistoryResponse(result) {
+  const warning = result && result.account && result.account.historyWarning || "";
+  if (!warning) return { ...result, historyWarning: result && result.historyWarning || "" };
+  const suffix = result.account.source === "cache" ? "历史未新增：" + warning : "余额已更新，但历史记录失败：" + warning;
+  return { ...result, historyWarning: warning,
+    message: String(result.message || "额度已更新") + (String(result.message || "").includes(suffix) ? "" : "｜" + suffix) };
+}
+function canSupplementAccountHistory(platform) {
+  if (isSelfTriggerMode(platform) || isAgentRouterMode(platform) || platform.triggerSelf ||
+      isSiteHost(platform.baseUrl, "agentrouter.org") || isSiteHost(platform.baseUrl, "ps.air-outer.com")) return false;
+  try {
+    if (new URL(platform.checkinPath || "/api/user/checkin", platform.baseUrl).pathname.replace(/\/+$/, "") === "/api/user/self") return false;
+  } catch { return false; }
+  return ["token", "cookie", "password"].includes(platform.authMode || "token");
+}
+function balanceSupplementControl(parent = null) {
+  return { stopVersion: parent ? parent.stopVersion : latestCheckinStopVersion,
+    controller: new AbortController(), waitingToStart: true,
+    token: "balance-" + Date.now() + "-" + Math.random().toString(36).slice(2),
+    pageTabIds: new Set(), pageWorlds: new Map() };
+}
+async function readSupplementBalance(platform, parent) {
+  const control = balanceSupplementControl(parent);
+  const stop = () => control.controller.abort();
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; stop(); }, 12000);
+  control.controller.signal.addEventListener("abort", () => broadcastCheckinPageStop(control), { once: true });
+  parent.controller.signal.addEventListener("abort", stop, { once: true });
+  detachedOauthControls.add(control); // The existing stop-version listener aborts this read too.
+  try {
+    return await awaitReadOrStop((async () => {
+      assertCheckinActive(parent);
+      const current = (await getPlatforms()).find((entry) => String(entry.id) === String(platform.id));
+      if (!isCurrentHistoryTask(current, platform) || !canSupplementAccountHistory(current)) return null;
+      const base = platform.baseUrl.trim().replace(/\/+$/, "");
+      if (isTokenAuthMode(platform)) return callApiPath(platform, "/api/user/self", "GET", { control });
+      // Session modes: reuse a settled existing page only. No page creation/navigation,
+      // login, refresh-token retry, cache fallback or reward-producing account route.
+      const origin = new URL(base).origin;
+      const tabs = await chrome.tabs.query({ url: origin + "/*" });
+      const tab = tabs.find((entry) => entry.url && entry.status === "complete" && !entry.pendingUrl &&
+        !/^\/(login|signin|register|oauth)(\/|$)/i.test(new URL(entry.url).pathname));
+      if (!tab) return null;
+      await assertApiAllowed(platform, "/api/user/self");
+      assertCheckinActive(control);
+      const latest = (await getPlatforms()).find((entry) => String(entry.id) === String(platform.id));
+      if (!isCurrentHistoryTask(latest, platform) || !canSupplementAccountHistory(latest)) return null;
+      const out = await executeCheckinScriptRaw({ target: { tabId: tab.id }, func: tabFetchCheckin,
+        args: ["/api/user/self", "GET", null, String(platform.userId || ""),
+          cookieStrategy(platform, base).apiUserKey, null, "", origin] }, control);
+      const page = await chrome.tabs.get(tab.id);
+      if (page.url !== tab.url || page.pendingUrl || page.status !== "complete") return null;
+      const result = out && out[0] && out[0].result;
+      return result && result.ok && !result.htmlResponse && result.body && result.body.success !== false ? result.body : null;
+    })(), control);
+  } catch (error) {
+    assertCheckinActive(parent);
+    if (expired) return null; // A failed optional read never changes the check-in result.
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    parent.controller.signal.removeEventListener("abort", stop);
+    detachedOauthControls.delete(control);
+  }
+}
+async function supplementMissingBalance(platform, control = null, budget = null) {
+  await checkinStopVersionReady;
+  control = control || balanceSupplementControl();
+  budget = budget || { attempted: new Set() };
+  const key = String(platform.id);
+  if (platform.id == null || budget.attempted.has(key) || !canSupplementAccountHistory(platform)) return null;
+  budget.attempted.add(key);
+  platform = historyTaskSnapshot(platform);
+  assertCheckinActive(control);
+  const current = (await getPlatforms()).find((entry) => String(entry.id) === key);
+  if (!isCurrentHistoryTask(current, platform) || !canSupplementAccountHistory(current)) return null;
+  platform = { ...current, [HISTORY_TASK_EPOCH]: platform[HISTORY_TASK_EPOCH] };
+  const origin = new URL(platform.baseUrl).origin;
+  if (visitOnlyOrigins.has(origin) || passwordLoginInflight.has(origin) || agentRouterStarting.has(origin)) return null;
+  try {
+    await accountHistoryWriteQueue; // Never called from a platform mutation callback.
+    assertCheckinActive(control);
+    const now = Date.now();
+    const history = ACCOUNT_HISTORY.sanitizeHistory(await readValidatedAccountHistory(), now);
+    const identity = ACCOUNT_HISTORY.identityFor(platform);
+    const entry = history.accounts[key];
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    if (entry && entry.identity === identity && /\|user:\d+$/.test(identity) && entry.samples.some((sample) =>
+        sample.at >= start.getTime() && sample.at <= now && Number.isFinite(sample.balance))) return null;
+  } catch (error) {
+    if (isCheckinControlError(error)) throw error;
+    try { await setAccountHistoryStatus(platform, error && error.message || "无法读取本地账户历史"); } catch {}
+    return null; // Without readable history we cannot safely decide to backfill.
+  }
+  try {
+    assertCheckinActive(control);
+    const latest = (await getPlatforms()).find((entry) => String(entry.id) === key);
+    if (!isCurrentHistoryTask(latest, platform) || !canSupplementAccountHistory(latest)) return null;
+    validatePlatform(platform);
+    const body = await readSupplementBalance(platform, control);
+    assertCheckinActive(control);
+    const data = body && body.data;
+    if (!data || !/^(?:0|[1-9]\d*)$/.test(String(data.id)) || !hasAccountQuota(data)) return null;
+    verifyConfiguredUser(platform, body);
+    // Session pages share cookies: an online-confirmed snapshot must still identify this account.
+    const snapshotUserId = platform.account && platform.account.source !== "cache"
+      ? String(platform.account.userId ?? "").trim() : "";
+    if (!isTokenAuthMode(platform) && /^\d+$/.test(snapshotUserId) && snapshotUserId !== String(data.id)) return null;
+    if (platform.authMode === "password" && !passwordUserMatches(platform, data)) return null;
+    const account = accountFromSelf(data);
+    const published = await publishAccountSnapshot(platform, account, control, currentMonth());
+    return published ? account : null;
+  } catch (error) {
+    if (isCheckinControlError(error)) throw error;
+    return null; // Account read failures preserve the original skip/check-in outcome.
+  }
 }
 
 // 登录完成后只刷新本轮页面一次；所有取数均复用它，关闭后不再开页补取。
-async function refreshLoginAccountOnTab(platform, tabId, readUser = null, control = null) {
+async function refreshLoginAccountOnTab(platform, tabId, readUser = null, control = null, verifiedUser = null) {
+  platform = historyTaskSnapshot(platform);
   const page = await chrome.tabs.get(tabId);
   const origin = new URL(platform.baseUrl).origin;
   if (!page.url || new URL(page.url).origin !== origin) throw new Error("账户页面已跳转到其他站点");
   const onLoginPage = /^\/(login|signin|register|oauth)(\/|$)/i.test(new URL(page.url).pathname);
-  const dashboard = isAgentRouterReauthMode(platform);
+  const agentRouterPassword = isAgentRouterPasswordMode(platform);
+  if (agentRouterPassword) {
+    verifiedUser = verifiedUser || await waitVisitSession(platform, tabId, false, false, false, control);
+    verifyConfiguredUser(platform, { data: verifiedUser });
+    if (!passwordUserMatches(platform, verifiedUser)) {
+      throw new Error("Agent Router 在线账号与配置的邮箱/用户名不一致");
+    }
+  }
+  const verifiedUserId = agentRouterPassword ? String(verifiedUser.id) : "";
+  const dashboardPlatform = agentRouterPassword ? { ...platform, userId: verifiedUserId } : platform;
+  const dashboard = isAgentRouterReauthMode(platform) || agentRouterPassword;
   visitStage(platform, control, "visit-refresh", "登录已确认，正在刷新本轮页面（仅一次）");
   // OAuth 常落在令牌页；在本轮页硬导航到看板，已在看板时只刷新一次。
   await waitVisitComplete(tabId, () => dashboard && !/^\/console\/?$/.test(new URL(page.url).pathname)
@@ -2490,21 +2947,35 @@ async function refreshLoginAccountOnTab(platform, tabId, readUser = null, contro
       ? chrome.tabs.update(tabId, { url: origin + "/", active: false })
       : chrome.tabs.reload(tabId, { bypassCache: true }), control);
   // 公告由下面的身份/看板读取循环检查，避免一次性注入在刷新竞态中提前终止任务。
-  const user = readUser || (dashboard
-    ? () => waitAgentRouterAccountOnTab(platform, tabId, control)
-    : () => waitVisitSession(platform, tabId, false, false, true, control));
+  const user = agentRouterPassword
+    ? async () => {
+      const dashboardUser = await waitAgentRouterAccountOnTab(dashboardPlatform, tabId, control);
+      if (String(dashboardUser.id) !== verifiedUserId) throw accountMismatchError(verifiedUserId, dashboardUser.id);
+      return { ...dashboardUser, id: verifiedUser.id,
+        username: verifiedUser.username || dashboardUser.username,
+        display_name: verifiedUser.display_name || dashboardUser.display_name,
+        email: verifiedUser.email || dashboardUser.email };
+    }
+    : readUser || (dashboard
+      ? () => waitAgentRouterAccountOnTab(platform, tabId, control)
+      : () => waitVisitSession(platform, tabId, false, false, true, control));
   visitStage(platform, control, "visit-balance", "登录已确认，正在核验刷新后的账号并读取余额");
   const freshUser = await user();
+  const month = currentMonth();
   // 余额独立落盘；日志失败或最终复核失败不丢失这个已核验、有时间戳的快照。
-  await publishVisitBalance(platform, accountFromSelf(freshUser), control);
+  const balanceAccount = accountFromSelf(freshUser);
+  await publishAccountSnapshot(platform, balanceAccount, control, month);
   visitStage(platform, control, "visit-logs", "余额已获取，正在统计本月 Token（最多 20 秒）");
   const read = (reqPath, query, readControl = control) => readVisitApi(platform, tabId, reqPath, query, readControl);
-  const account = await fetchAccount(platform, currentMonth(), freshUser, read, control);
+  const account = await fetchAccount(platform, month, freshUser, read, control, balanceAccount);
   if (freshUser._dashboardWarning) account._warn = [freshUser._dashboardWarning, account._warn].filter(Boolean).join("；");
   // 日志取数期间会话可能变化；关闭前再次核验同一页面显示的身份及余额。
   visitStage(platform, control, "visit-final-identity", "余额已保存，正在最终核验账号");
   const finalUser = await user();
-  return Object.assign(account, accountFromSelf(finalUser, account.monthlyTokens, account.tokensTruncated, account._warn));
+  Object.assign(account, accountFromSelf(finalUser, account.monthlyTokens, account.tokensTruncated, account._warn));
+  accountHistorySamples.delete(account); // Final online reread is genuinely a new balance sample.
+  await publishAccountSnapshot(platform, account, control, month);
+  return account;
 }
 
 // 只读刷新后的数据看板 DOM；localStorage 仅用于身份/显示单位，不从中取余额。
@@ -2695,10 +3166,14 @@ async function runVisitOnly(platform, options, control = null) {
     tab = await chrome.tabs.create({ url: home, active: false });
     if (!tab || tab.id == null) throw new Error("无法创建访问页面");
     await waitVisitComplete(tab.id, null, control);
-    visitStage(platform, control, "visit-session", "页面已打开，正在检查公告和登录账号");
-    const user = await initialVisitSession(platform, tab.id, control);
     // 与普通任务一致：依赖登录回调的站点需要重新登录，不能用旧会话跳过该动作。
     const reauth = !!(options && options.reauth);
+    const skipOldAgentRouterPasswordProbe = reauth && isAgentRouterPasswordMode(platform);
+    visitStage(platform, control, "visit-session", skipOldAgentRouterPasswordProbe
+      ? "页面已打开，准备按要求重新登录，不检查旧会话"
+      : "页面已打开，正在检查公告和登录账号");
+    let user = skipOldAgentRouterPasswordProbe ? null : await initialVisitSession(platform, tab.id, control);
+    if (skipOldAgentRouterPasswordProbe) logAgentRouterPasswordStage("reauth-skip-initial-session-probe", null, origin);
     const forceLogin = reauth && (isAgentRouterReauthMode(platform) ||
       (platform.authMode === "password" && isSelfTriggerMode(platform)));
     if (!user || forceLogin) {
@@ -2721,10 +3196,10 @@ async function runVisitOnly(platform, options, control = null) {
         await chrome.tabs.update(tab.id, { url: origin + "/login", active: true });
         await waitVisitComplete(tab.id, null, control);
       }
-      await waitVisitSession(platform, tab.id, oauth, true, false, control);
+      user = await waitVisitSession(platform, tab.id, oauth, true, false, control);
     }
     assertCheckinActive(control);
-    const account = await refreshLoginAccountOnTab(platform, tab.id, null, control);
+    const account = await refreshLoginAccountOnTab(platform, tab.id, null, control, user);
     const previous = platform.account && platform.account.available;
     const quotaDelta = previous != null && previous !== "" && Number.isFinite(Number(previous))
       ? Number(account.available) - Number(previous) : null;
@@ -2733,7 +3208,8 @@ async function runVisitOnly(platform, options, control = null) {
     await mutatePlatforms((list) => {
       assertCheckinActive(control);
       const current = list.find((entry) => entry.id === platform.id);
-      if (current && sameTaskConfig(current, platform)) {
+      const accountTask = accountHistorySamples.get(account);
+      if (isCurrentHistoryTask(current, platform) && (!accountTask || isCurrentHistoryTask(current, accountTask.platform))) {
         current.account = Object.assign({}, current.account || {}, account);
         current.accountError = "";
       }
@@ -2742,8 +3218,8 @@ async function runVisitOnly(platform, options, control = null) {
     if (oauth) { await updateAgentRouterPending(tab.id, null); oauth = false; }
     visitStage(platform, control, "visit-close", AUTH_CONFIG.shouldLogoutAfterVisit(platform)
       ? "最新余额已保存，正在退出账号并关闭本轮临时页" : "最新余额已保存，正在关闭本轮临时页（不退出账号）");
-    outcome = { ok: true, visited: true, outcome: "visited", message: "登录及刷新完成，最新额度已更新（已跳过签到接口）" + (account._warn ? "；" + account._warn : ""),
-      data: null, account, quotaDelta, lastVisitedAt: new Date().toISOString(), lastVisitDate: todayStr() };
+    outcome = accountHistoryResponse({ ok: true, visited: true, outcome: "visited", message: "登录及刷新完成，最新额度已更新（已跳过签到接口）" + (account._warn ? "；" + account._warn : ""),
+      data: null, account, quotaDelta, lastVisitedAt: new Date().toISOString(), lastVisitDate: todayStr() });
     return outcome;
   } catch (error) {
     failure = error;
@@ -2772,7 +3248,7 @@ async function runCheckin(platform, options) {
   const control = options && options.control || null;
   try {
     assertCheckinActive(control);
-    platform = await resolveSavedVisitOnly(platform);
+    platform = historyTaskSnapshot(await resolveSavedVisitOnly(platform));
     if (isVisitOnly(platform)) return await runVisitOnly(platform, options, control);
     // Agent Router 通过退出并重新登录签到；其他自触发兼容站点仍使用 GET 请求。
     const isSelfTrigger = isSelfTriggerMode(platform);
@@ -2815,7 +3291,7 @@ async function runCheckin(platform, options) {
     let account = null, accountWarning = "";
     try { account = await fetchAccount(platform, currentMonth(), null, null, control); }
     catch (e) { accountWarning = "签到已完成，但额度刷新失败：" + e.message; }
-    return {
+    return accountHistoryResponse({
       ok: true,
       message: accountWarning ? msg + "｜" + accountWarning : msg,
       data,
@@ -2823,10 +3299,12 @@ async function runCheckin(platform, options) {
       accountWarning,
       reauthRequired: !!body._reauthRequired,
       githubLoginStarted: !!body._githubLoginStarted,
-    };
+    });
   } catch (e) {
     if (control && isCheckinControlError(e)) throw e;
-    return { ok: false, message: e.message, error: e.message };
+    const account = isAlreadyCheckinMessage(e && e.message) && canSupplementAccountHistory(platform)
+      ? await supplementMissingBalance(platform, control, options && options.historyBudget) : null;
+    return { ok: false, message: e.message, error: e.message, ...(account ? { account, historyWarning: account.historyWarning || "" } : {}) };
   }
 }
 
@@ -2879,7 +3357,9 @@ async function fetchMonthlyTokens(platform, month, read, control = null) {
   return { tokens, truncated };
 }
 
-async function fetchAccount(platform, month, reuseSelfData, read, control = null) {
+async function fetchAccount(platform, month, reuseSelfData, read, control = null, balanceAccount = null) {
+  platform = historyTaskSnapshot(platform);
+  month = month || currentMonth();
   validatePlatform(platform);
   if (!read && await isAgentRouterReauthPending(platform)) {
     throw new Error("Agent Router 正在重新登录，请在登录完成后刷新额度");
@@ -2911,6 +3391,8 @@ async function fetchAccount(platform, month, reuseSelfData, read, control = null
     }
   }
   if (!selfData || !hasAccountQuota(selfData)) throw new Error("获取账户额度失败：" + (selfErr || "在线账户未返回有效额度"));
+  const account = balanceAccount || accountFromSelf(selfData, null, false, accountWarn);
+  if (!balanceAccount) await publishAccountSnapshot(platform, account, control, month);
   let monthlyTokens = null, tokensTruncated = false, tokenErr = "";
   try {
     const r = await fetchMonthlyTokens(platform, month, read, control);
@@ -2921,8 +3403,9 @@ async function fetchAccount(platform, month, reuseSelfData, read, control = null
   if (accountWarn) warnings.push(accountWarn);
   if (tokensTruncated) warnings.push("本月Token为前若干页累计估算（超出截断）");
   else if (monthlyTokens == null) warnings.push("本月Token接口不可用" + (tokenErr ? "（" + tokenErr + "）" : ""));
-  const account = accountFromSelf(selfData, monthlyTokens, tokensTruncated, warnings.join("；"));
-  await recordAccountHistorySample(platform, account, month);
+  // month identifies the Token counter; WeakMap metadata preserves the real balance time.
+  Object.assign(account, { monthlyTokens, tokensTruncated, _warn: warnings.join("；") });
+  await publishAccountSnapshot(platform, account, control, month);
   return account;
 }
 
@@ -2970,6 +3453,8 @@ function accountFromSelf(selfData, monthlyTokens = null, tokensTruncated = false
     tokensTruncated,
     displayName: selfData ? (selfData.display_name || selfData.displayName || selfData.username) : null,
     _warn: warning,
+    historyWarning: "",
+    ...(selfData && selfData._accountSource === "cache" ? { source: "cache" } : {}),
     ...(selfData && selfData._accountSource === "dashboard" ? {
       source: "dashboard", availableDisplay: selfData._availableDisplay,
     } : {}),
@@ -2982,7 +3467,7 @@ function unverifiedOauthConfig(platform) {
 }
 
 async function runStats(platform, month) {
-  platform = await resolveSavedVisitOnly(platform);
+  platform = historyTaskSnapshot(await resolveSavedVisitOnly(platform));
   // 配置校验失败不能靠账户缓存降级为连接成功。
   try { validatePlatform(platform); }
   catch (e) { return { ok: false, message: e.message, error: e.message }; }
@@ -4032,13 +4517,15 @@ async function runBatchCheckinOne(partial, control = null) {
   return r;
 }
 async function collectAutoTodo(platforms) {
-  const unchecked = await findUncheckedPlatforms(platforms);
+  const historyBudget = { attempted: new Set() };
+  const unchecked = await findUncheckedPlatforms(platforms, historyBudget);
   const todo = unchecked.slice();
   const have = {};
   for (const p of todo) have[p.id] = true;
   for (const p of platforms) {
     if (!have[p.id] && needsKeepAliveToday(p)) todo.push(p);
   }
+  autoHistoryBudgets.set(todo, historyBudget); // Precheck and its resulting batch share each config ID's allowance.
   return todo;
 }
 
@@ -4241,11 +4728,13 @@ async function waitForCheckinCompletion(platform, result, control = null) {
 }
 
 async function persistCheckinResult(platform, result, alive = null, control = activeCheckinControl) {
+  Object.assign(result, accountHistoryResponse(result));
   assertCheckinActive(control);
   await mutatePlatforms((list) => {
     assertCheckinActive(control);
     const p = list.find((entry) => entry.id === platform.id);
-    if (!p || !sameTaskConfig(p, platform)) return list;
+    const accountTask = result.account && accountHistorySamples.get(result.account);
+    if (!isCurrentHistoryTask(p, platform) || (accountTask && !isCurrentHistoryTask(p, accountTask.platform))) return list;
     if (alive) p.keepAlive = normalizeKeepAlive(platform.keepAlive);
     delete p.loading;
     p.taskResultRevision = (Number(p.taskResultRevision) || 0) + 1;
@@ -4276,9 +4765,10 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null,
   if (!platforms.length) return { skipped: true };
   const today = todayStr();
   const results = [];
+  const historyBudget = autoHistoryBudgets.get(platforms) || { attempted: new Set() };
   for (let p of platforms) {
     const item = await enqueueCheckinTask(p, async (queuedPlatform, control) => {
-      p = await resolveSavedVisitOnly(queuedPlatform); // 出队后重读，不能让等待期间开启的仅访问失效。
+      p = historyTaskSnapshot(await resolveSavedVisitOnly(queuedPlatform)); // 出队后重读，不能让等待期间开启的仅访问失效。
       let alive = null;
       if (needsKeepAliveToday(p)) {
         alive = await runKeepAliveCall(p, control);
@@ -4293,7 +4783,11 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null,
         ? { ok: true, visited: true, message: "今日已访问", data: null, lastVisitDate: p.lastVisitDate, lastVisitedAt: p.lastVisitedAt }
         : explicitSelection && alreadyToday
         ? { ok: true, message: "今日已签到", data: null, _alreadySkipped: true }
-        : await waitForCheckinCompletion(p, await runCheckin(p, { reauth: true, control }), control);
+        : await waitForCheckinCompletion(p, await runCheckin(p, { reauth: true, control, historyBudget }), control);
+      if (explicitSelection && (alreadyVisited || alreadyToday)) {
+        const account = await supplementMissingBalance(p, control, historyBudget);
+        if (account) r.account = account;
+      }
       if (alive) {
         const part = alive.ok
           ? "自动调用API成功" + (alive.model ? "（模型 " + alive.model + "）" : "")
@@ -4353,19 +4847,30 @@ function autoTimeReached(value) {
   return now.getHours() * 60 + now.getMinutes() >= Number(m[1]) * 60 + Number(m[2]);
 }
 
-async function findUncheckedPlatforms(platforms) {
+async function findUncheckedPlatforms(platforms, historyBudget = { attempted: new Set() }) {
+  await checkinStopVersionReady;
+  const control = balanceSupplementControl();
   const results = [];
   for (let p of platforms) results.push(await withPlatformSession(p, async () => {
+    assertCheckinActive(control);
     p = await resolveSavedVisitOnly(p);
-    if (isVisitOnly(p)) return p.lastVisitDate === todayStr() ? null : p;
-    if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return null;
-    // /api/user/self 本身会触发 Agent Router 签到，不能把它当作只读预检接口调用。
+    if ((isVisitOnly(p) && p.lastVisitDate === todayStr()) ||
+        (!isVisitOnly(p) && p.stats && p.stats.checked_in_today && p.statsDate === todayStr())) {
+      await supplementMissingBalance(p, control, historyBudget);
+      return null;
+    }
+    if (isVisitOnly(p)) return p;
+    // Reward-producing /api/user/self routes are never automatic account prechecks.
     if (isSelfTriggerMode(p)) return p;
     try {
-      const body = await callCheckin(p, "GET", currentMonth());
-      if (body && body.data && body.data.stats && body.data.stats.checked_in_today) return null;
-    } catch {
-      // 只读状态不可用时仍尝试签到，由签到接口返回最终结果。
+      const body = await callCheckin(p, "GET", currentMonth(), { control });
+      if (body && body.data && body.data.stats && body.data.stats.checked_in_today) {
+        await supplementMissingBalance(p, control, historyBudget);
+        return null;
+      }
+    } catch (error) {
+      if (isCheckinControlError(error)) throw error;
+      // Read-only status unavailable: preserve the existing check-in flow.
     }
     return p;
   }));
@@ -4476,7 +4981,7 @@ getAgentRouterPending().then(async (all) => {
   }
 }).catch(() => {});
 
-// 同源会话全操作排队，不仅序列化表单填写，防止批量请求在账号切换后串号。
+// 同源会话操作排队，防止账号切换后串号；普通 Token 读取不共享 Cookie，无需排队。
 const platformSessionQueues = new Map();
 function withPlatformSession(platform, fn) {
   if (!platform || (isTokenAuthMode(platform) && !isVisitOnly(platform))) return Promise.resolve().then(fn);
@@ -4516,12 +5021,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "stats" || msg.type === "test") {
         const r = await runStats(msg.platform, msg.month);
-        sendResponse(r);
+        sendResponse(accountHistoryResponse(r));
       } else if (msg.type === "account") {
         try {
           const acc = await fetchAccount(msg.platform, msg.month || currentMonth(), null);
           const warn = acc && acc._warn ? acc._warn : "";
-          sendResponse({ ok: true, message: warn ? "额度已更新（" + warn + "）" : "额度已更新", account: acc });
+          const historyWarning = acc && acc.historyWarning || "";
+          sendResponse({ ok: true, historyWarning,
+            message: (historyWarning ? (acc.source === "cache" ? "额度已更新，但历史未新增：" : "余额已更新，但历史记录失败：") + historyWarning : "额度已更新") + (warn ? "（" + warn + "）" : ""), account: acc });
         } catch (e) {
           sendResponse({ ok: false, message: e && e.message ? e.message : "无法获取账户额度" });
         }

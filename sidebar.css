@@ -213,6 +213,13 @@ select:focus{border-color:var(--primary);box-shadow:var(--focus-ring)}
   .full{grid-column:1/-1}
 }
 .auth-top{grid-template-columns:1fr !important;margin-bottom:8px}
+.password-field{position:relative;min-width:0;margin-top:5px}
+.password-field input{margin-top:0;min-width:0;padding-right:48px}
+.password-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}
+.password-toggle:hover{background:var(--surface-2);color:var(--ink)}
+.password-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+.password-icon{width:18px;height:18px;background:currentColor;-webkit-mask:url("icons/eye.svg") no-repeat center/contain;mask:url("icons/eye.svg") no-repeat center/contain}
+.password-toggle[aria-pressed="true"] .password-icon{-webkit-mask-image:url("icons/eye-off.svg");mask-image:url("icons/eye-off.svg")}
 .auth-hint{margin:6px 0 0;color:var(--faint);font-size:11px;line-height:1.55}
 
 /* ---------- 自动调用 API（防僵尸号）保活 ---------- */

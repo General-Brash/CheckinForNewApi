@@ -200,8 +200,9 @@ function uiHarness(html = 'popup.html') {
   }
   const h = harness('popup.js');
   const toasts = [];
-  h.ctx.document = { getElementById(id) { return nodes.get(id) || null; }, createElement() { return { click() {} }; }, querySelector() { return null; }, addEventListener() {}, body: { classList: { contains() { return true; }, add() {} } }, documentElement: {getAttribute() {return 'dark';}, setAttribute() {}} };
-  h.ctx.window = { matchMedia() { return { matches: false }; } };
+  const confirmations = [], documentEvents = {};
+  h.ctx.document = { getElementById(id) { return nodes.get(id) || null; }, createElement() { return { click() {} }; }, querySelector() { return null; }, addEventListener(name, fn) { documentEvents[name] = fn; }, body: { classList: { contains() { return true; }, add() {} } }, documentElement: {getAttribute() {return 'dark';}, setAttribute() {}} };
+  h.ctx.window = { matchMedia() { return { matches: false }; }, confirm(message) { confirmations.push(message); return true; } };
   h.ctx.location = { search: '' };
   h.ctx.localStorage = { getItem() { return null; }, setItem() {} };
   h.ctx.CSS = { escape: (s) => s };
@@ -209,7 +210,7 @@ function uiHarness(html = 'popup.html') {
   h.run('toast = toastCapture');
   nodes.get('authMode').value = 'token';
   nodes.get('keepAliveFormat').value = 'chat';
-  return { ...h, nodes, toasts, source };
+  return { ...h, nodes, toasts, confirmations, documentEvents, source };
 }
 
 for (const html of ['popup.html', 'sidebar.html']) {
@@ -242,18 +243,122 @@ test('username trims, password stays exact, non-password messages omit credentia
   const output = h.run('slim(input)');
   assert.equal('loginPassword' in output, false); assert.equal(output.accessToken, '');
 });
-test('export omits password for every mode; import ignores file password and warns', async () => {
-  const h = uiHarness();
-  let blob; h.ctx.URL = { createObjectURL(b) { blob = b; return 'blob:fake'; }, revokeObjectURL() {} };
-  h.ctx.input = [passwordPlatform(), passwordPlatform({id:'legacy',authMode:'cookie'})];
-  h.run('platforms = input; exportConfig()');
-  const output = JSON.parse(await blob.text());
-  assert.ok(output.every((p) => !('loginPassword' in p))); assert.ok(!(await blob.text()).includes('secret with spaces'));
-  h.ctx.file = { async text() { return JSON.stringify([passwordPlatform({loginUsername:' alice@example.com ',loginPassword:'injected'})]); } };
-  await h.run('importConfig(file)');
-  assert.equal(h.store[PLATFORMS][0].loginPassword, ''); assert.equal(h.store[PLATFORMS][0].loginUsername,'alice@example.com');
-  assert.ok(h.toasts.some((t) => t.includes('补填密码')));
-});
+for (const html of ['popup.html', 'sidebar.html']) {
+  test(`${html}: export/import keeps exact passwords only for password accounts`, async () => {
+    const h = uiHarness(html);
+    let blob;
+    h.ctx.URL = { createObjectURL(b) { blob = b; return 'blob:fake'; }, revokeObjectURL() {} };
+    const exact = ' secret "<&> with spaces ';
+    h.ctx.input = [
+      passwordPlatform({loginPassword: exact, loading: true, error: 'old', reauthPending: true, reauthStartedAt: 1, reauthCompletedAt: 2}),
+      passwordPlatform({id: 'bob', loginUsername: ' bob@example.com ', loginPassword: '  '}),
+      ...['token', 'cookie', 'agentrouter_token', 'agentrouter_linuxdo'].map((authMode) => passwordPlatform({id: authMode, authMode, loginPassword: 'stale-password'})),
+    ];
+    h.run('platforms = input; exportConfig()');
+    const output = JSON.parse(await blob.text());
+    assert.equal(output[0].loginPassword, exact);
+    assert.equal(output[1].loginPassword, '  ');
+    assert.ok(output.slice(2).every((p) => !('loginPassword' in p)));
+    for (const key of ['loading', 'error', 'reauthPending', 'reauthStartedAt', 'reauthCompletedAt']) assert.equal(key in output[0], false);
+    assert.equal(h.confirmations.length, 1);
+    assert.match(h.confirmations[0], /明文登录密码/);
+    assert.equal(h.confirmations[0].includes(exact), false);
+    h.ctx.file = { async text() { return JSON.stringify(output); } };
+    await h.run('importConfig(file)');
+    assert.equal(h.store[PLATFORMS][0].loginPassword, exact);
+    assert.equal(h.store[PLATFORMS][1].loginUsername, 'bob@example.com');
+    assert.equal(h.store[PLATFORMS][1].loginPassword, '  ');
+    assert.ok(h.store[PLATFORMS].slice(2).every((p) => p.loginPassword === ''));
+    assert.ok(!h.toasts.some((t) => t.includes('补填密码')));
+    assert.ok(!h.messages.some((m) => ['test', 'account', 'checkin'].includes(m.type)), 'import must not log in or test an account');
+  });
+
+  test(`${html}: password export can be cancelled; legacy and invalid passwords remain missing`, async () => {
+    const h = uiHarness(html);
+    let created = 0;
+    h.ctx.URL = { createObjectURL() { created++; return 'blob:fake'; }, revokeObjectURL() {} };
+    h.ctx.window.confirm = () => false;
+    h.ctx.input = [passwordPlatform()];
+    h.run('platforms = input; exportConfig()');
+    assert.equal(created, 0);
+    assert.equal(h.toasts.length, 0);
+
+    h.ctx.file = { async text() { return JSON.stringify([undefined, null, 123, false, {}, [], ''].map((loginPassword, index) => passwordPlatform({id: `missing-${index}`, loginPassword}))); } };
+    await h.run('importConfig(file)');
+    assert.ok(h.store[PLATFORMS].every((p) => p.loginPassword === ''));
+    assert.ok(h.toasts.some((t) => t.includes('补填密码')));
+    h.run('exportConfig()');
+    assert.equal(created, 1, 'a backup without passwords does not need password confirmation');
+  });
+
+  test(`${html}: viewing a saved password does not change or submit account data and resets on close`, async () => {
+    const h = uiHarness(html);
+    await h.run('init()');
+    h.ctx.input = passwordPlatform();
+    const exact = h.ctx.input.loginPassword;
+    h.run('platforms = [input]; openModal(input)');
+    const field = h.nodes.get('loginPassword');
+    const toggle = h.nodes.get('loginPasswordToggle');
+    const before = plain(h.run('formData()'));
+    assert.match(h.source, /id="loginPasswordToggle"[^>]*type="button"/);
+    assert.equal(field.type, 'password');
+    assert.equal(toggle.getAttribute('aria-pressed'), 'false');
+    const messagesBefore = h.messages.length;
+    toggle.onclick();
+    assert.equal(field.type, 'text');
+    assert.equal(field.value, exact);
+    assert.equal(toggle.getAttribute('aria-label'), '隐藏登录密码');
+    assert.deepEqual(plain(h.run('formData()')), before);
+    assert.equal(h.messages.length, messagesBefore);
+    toggle.onclick();
+    assert.equal(field.type, 'password');
+
+    const closers = [
+      () => h.nodes.get('closeBtn').onclick(),
+      () => h.nodes.get('cancelBtn').onclick(),
+      () => h.nodes.get('modal').onclick({target: h.nodes.get('modal')}),
+      () => h.documentEvents.keydown({key: 'Escape'}),
+    ];
+    for (const close of closers) {
+      h.run('openModal(input)'); toggle.onclick(); close();
+      assert.equal(field.type, 'password');
+      assert.equal(field.value, '');
+      assert.equal(h.nodes.get('modal').classList.contains('open'), false);
+      h.run('openModal(input)');
+      assert.equal(field.type, 'password');
+      assert.equal(field.value, exact);
+    }
+
+    toggle.onclick();
+    h.nodes.get('authMode').value = 'cookie'; h.nodes.get('authMode').onchange();
+    assert.equal(field.type, 'password');
+    toggle.onclick(); assert.equal(field.type, 'password', 'other auth modes cannot reveal stale passwords');
+    h.run('openModal(input)'); toggle.onclick();
+    h.ctx.document.hidden = true; h.documentEvents.visibilitychange();
+    assert.equal(field.type, 'password');
+    assert.equal(field.value, exact);
+
+    h.ctx.next = passwordPlatform({id: 'bob', loginUsername: 'bob@example.com', loginPassword: 'bob-password'});
+    h.run('openModal(next)');
+    assert.equal(field.type, 'password');
+    assert.equal(field.value, 'bob-password');
+    h.run('openModal()');
+    assert.equal(field.value, '');
+  });
+
+  test(`${html}: account identities show escaped login names without putting passwords in cards`, () => {
+    const h = uiHarness(html);
+    h.ctx.input = passwordPlatform({loginUsername: ' alice<&>@example.com '});
+    const card = h.run('renderPlatformCard(input)'), preview = h.run('renderAccountPreview(input)');
+    for (const markup of [card, preview]) {
+      assert.match(markup, /alice&#60;&#38;&#62;@example\.com/);
+      assert.match(markup, /用户 ID 12/);
+      assert.equal(markup.includes(h.ctx.input.loginPassword), false);
+    }
+    h.ctx.input.authMode = 'cookie';
+    assert.equal(h.run('accountIdentity(input)').includes('alice'), false);
+  });
+}
 test('front/back validations support new modes and reject unsafe/missing fields', () => {
   for (const file of ['background.js','popup.js']) {
     const h = file === 'popup.js' ? uiHarness() : harness(file);
@@ -535,8 +640,9 @@ test('OAuth alarm retries slow callbacks and expires abandoned flows',async()=>{
   const expired=harness('background.js',{[PLATFORMS]:[oauthPlatform({reauthPending:true,reauthStartedAt:100})]});await new Promise(setImmediate);expired.ctx.pending={tabId:9,platformId:'ld',origin:'https://agentrouter.org',authMode:'agentrouter_linuxdo',userId:'12',provider:'linuxdo',createdAt:100};await expired.run('updateAgentRouterPending(9,pending,null,true)');await expired.run('handleAgentRouterReauthTab(9,"https://connect.linux.do/oauth2/authorize")');assert.equal(expired.store[PLATFORMS][0].reauthPending,false);assert.match(expired.store[PLATFORMS][0].message,/连续 60 秒无有效进展/);assert.equal(Object.keys(expired.store[PENDING]).length,0);
 });
 test('duplicate imported IDs are replaced before state synchronization',async()=>{
-  const h=uiHarness();h.ctx.file={async text(){return JSON.stringify([passwordPlatform(),passwordPlatform({loginUsername:'bob@example.com'})]);}};await h.run('importConfig(file)');
+  const h=uiHarness();h.ctx.file={async text(){return JSON.stringify([passwordPlatform(),passwordPlatform({loginUsername:'bob@example.com',loginPassword:'bob-password'})]);}};await h.run('importConfig(file)');
   const list=h.store[PLATFORMS];assert.equal(new Set(list.map((p)=>p.id)).size,2);assert.notEqual(h.run('platforms[0]===platforms[1]'),true);assert.equal(list[0].loginUsername,'alice@example.com');assert.equal(list[1].loginUsername,'bob@example.com');
+  assert.equal(list[0].loginPassword,' secret with spaces ');assert.equal(list[1].loginPassword,'bob-password');
 });
 test('original token and cookie checkin paths remain intact',async()=>{
   const h=harness('background.js');const requests=[];h.ctx.input={baseUrl:'https://token.example',authMode:'token',accessToken:'access',userId:'12'};
@@ -763,18 +869,19 @@ for (const html of ['popup.html', 'sidebar.html']) {
     assert.equal(ui.nodes.get('keepAliveEnabled').checked, true);
   });
 }
-test('visit-only export/import preserves the option without exporting or importing passwords', async () => {
+test('visit-only export/import preserves the option and the corresponding password', async () => {
   const h = uiHarness();
   let blob;
   h.ctx.URL = {createObjectURL(b) {blob = b; return 'blob:test';}, revokeObjectURL() {}};
   h.ctx.input = [visitPlatform()]; h.run('platforms=input;exportConfig()');
   const exported = JSON.parse(await blob.text());
-  assert.equal(exported[0].visitOnly, true); assert.equal('loginPassword' in exported[0], false);
+  assert.equal(exported[0].visitOnly, true); assert.equal(exported[0].loginPassword, ' secret with spaces ');
   h.ctx.file = {async text() {return JSON.stringify([visitPlatform(), passwordPlatform({id: 'cookie', authMode: 'cookie', visitOnly: true})]);}};
   await h.run('importConfig(file)');
   assert.equal(h.store[PLATFORMS][0].visitOnly, true);
-  assert.equal(h.store[PLATFORMS][0].loginPassword, '');
+  assert.equal(h.store[PLATFORMS][0].loginPassword, ' secret with spaces ');
   assert.equal(h.store[PLATFORMS][1].visitOnly, true);
+  assert.equal(h.store[PLATFORMS][1].loginPassword, '');
 });
 test('visit-only opens and closes one new home tab, preserving existing user tabs', async () => {
   const h = harness('background.js'), counts = allowVisitReads(h);
