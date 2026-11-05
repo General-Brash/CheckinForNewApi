@@ -290,12 +290,17 @@ select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-i
 .keepalive-model-note{color:var(--faint);font-size:12px}
 /* 同一 API 实例的多账号折叠展示；账号操作仍以独立 ID 路由。 */
 .account-group{grid-column:1/-1;min-width:0;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);overflow:hidden}
-.account-group-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left;padding:16px;border:0;background:var(--surface-2);color:var(--ink);cursor:pointer;font:inherit}
-.account-group-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:-3px}
+.account-group-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px;background:var(--surface-2)}
+.account-group-toggle{display:flex;flex:1;min-width:0;align-items:center;text-align:left;padding:0;border:0;background:transparent;color:var(--ink);cursor:pointer;font:inherit}
+.account-group-toggle:focus-visible{outline:2px solid var(--primary);outline-offset:3px}
 .account-group-toggle strong{font-size:14px;overflow-wrap:anywhere}
-.account-group-toggle small,.account-preview-row small{display:block;font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}
-.account-group-total{flex-shrink:0;text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+.account-group-toggle small,.account-group-total small,.account-preview-row small{display:block;font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}
+.account-group-actions{display:flex;align-items:center;gap:10px;min-width:0}
+.account-group-total{min-width:0;text-align:right;font-weight:700;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .account-group-total small{font-weight:400}
+.account-group-checkin{flex:none;min-width:78px;height:32px;margin:0;padding:6px 10px;border-radius:7px;font-size:11px;line-height:1.3;letter-spacing:0}
+.account-group-checkin:focus-visible{outline:2px solid var(--primary);outline-offset:3px}
+.account-group-checkin:disabled{cursor:wait;opacity:.68;transform:none}
 .account-group-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;padding:12px}
 .account-group-cards[hidden]{display:none}
 .account-group-preview{padding:0 16px}
@@ -303,7 +308,7 @@ select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-i
 .account-preview-row>span:first-child{min-width:0;overflow-wrap:anywhere}
 .account-preview-row>span:last-child{text-align:right;font-variant-numeric:tabular-nums}
 .account-meta{font-size:11px;color:var(--muted);line-height:1.6;margin:0 0 10px;overflow-wrap:anywhere}
-@media(max-width:420px){.account-group-toggle{align-items:flex-start;flex-direction:column}.account-group-total{text-align:left}.account-group-cards{padding:8px}}
+@media(max-width:420px){.account-group-header{align-items:stretch;flex-direction:column}.account-group-actions{justify-content:space-between}.account-group-total{text-align:left}.account-group-cards{padding:8px}}
 /* 折叠账号行：快捷操作使用独立按钮，点击不会触发展开。 */
 .account-preview-row{align-items:center}
 .account-preview-name{flex:1;min-width:0;overflow-wrap:anywhere}

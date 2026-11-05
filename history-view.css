@@ -31,16 +31,25 @@
 .history-charts{display:grid;grid-template-columns:1fr;gap:10px}
 .history-chart-section,.history-table-section{min-width:0;padding:12px 0 0;border-top:1px solid var(--border-soft,var(--border))}
 .history-chart-section h3,.history-table-section h3{margin:0 0 6px;color:var(--ink);font-size:13px}
-.history-chart-container{min-height:112px;overflow:hidden}
+.history-chart-container{position:relative;min-height:112px;overflow:visible}
 .history-chart-container svg{display:block;width:100%;height:214px;min-height:0;overflow:visible}
 .history-grid-line{stroke:var(--border);stroke-width:1;stroke-dasharray:3 4}
 .history-axis-label{fill:var(--muted);font-size:11px;font-family:inherit}
 .history-chart-line{fill:none;stroke:var(--history-series-color,var(--primary));stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
 .history-chart-line-missing{stroke:var(--history-missing-color);stroke-dasharray:5 5}
+.history-chart-line-carried{stroke-dasharray:5 5}
 .history-chart-dot{fill:var(--surface-2,var(--surface));stroke:var(--history-series-color,var(--primary));stroke-width:2;vector-effect:non-scaling-stroke}
 .history-chart-dot-missing{fill:var(--history-missing-color);stroke:var(--history-missing-color)}
+.history-chart-dot-carried{fill:var(--history-series-color,var(--primary))}
+.history-chart-hit-area{fill:transparent;pointer-events:all;cursor:pointer}
 .history-chart-dot[role="button"]{cursor:pointer}
 .history-chart-dot:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+.history-chart-tooltip{position:absolute;z-index:4;display:flex;flex-direction:column;gap:3px;width:max-content;max-width:min(280px,calc(100% - 12px));max-height:calc(100dvh - 12px);overflow:auto;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--modal-bg,var(--surface-2,var(--surface)));box-shadow:0 6px 20px rgba(0,0,0,.18);color:var(--ink);font-size:11px;line-height:1.5;overflow-wrap:anywhere;pointer-events:auto}
+.history-chart-tooltip[hidden]{display:none}
+.history-tooltip-label{font-size:11px;font-weight:600}
+.history-tooltip-date{color:var(--muted);font-size:10px}
+.history-tooltip-value{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
+.history-tooltip-details{display:flex;flex-direction:column;gap:2px;color:var(--muted);font-size:10px}
 .history-chart-legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin:0 0 6px}
 .history-legend-item{display:inline-flex;align-items:baseline;gap:6px;min-width:0;max-width:100%;padding:4px 0;border:0;background:none;color:var(--ink);font:inherit;text-align:left;cursor:pointer}
 .history-legend-item:hover{color:var(--primary)}

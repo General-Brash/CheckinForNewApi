@@ -6,7 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
-const previewStart = source.indexOf('function renderAccountPreview(p) {');
+const previewStart = source.indexOf('function accountBatchLocked(p) {');
 const groupStart = source.indexOf('function renderAccountGroup(group, index) {', previewStart);
 const groupEnd = source.indexOf('\nfunction toggleAccountGroup(key) {', groupStart);
 assert.notEqual(previewStart, -1, 'account preview renderer should exist');
@@ -18,10 +18,12 @@ function testContext(overrides = {}) {
   const context = {
     URL,
     expandedAccountGroups: new Set(),
+    activeBatchRun: null,
     startingCheckins: new Map(),
     activeCheckins: new Map(),
     cancelledCheckins: new Map(),
     currentVisitProgress: () => '',
+    accountGroupKey: (p) => p.baseUrl,
     isVisitOnly: (p) => p.visitOnly === true,
     status: () => ['就绪', 'badge-success'],
     accountGroupSummary: () => ({ total: 0, known: 1, unknown: 0, duplicates: 0 }),
@@ -70,4 +72,32 @@ test('account labels and IDs are escaped, and the click remains routed through c
   assert.match(html, /快捷签到：&#60;img src=x onerror=1&#62;/);
   assert.match(source, /else if \(action === "checkin"\) checkin\(id\);/);
   assert.doesNotMatch(source, /function quickCheckin|data-action="quick-checkin"/);
+});
+
+test('the group check-in button follows the total and remains outside the toggle when collapsed or expanded', () => {
+  const group = { key: 'https://site.example.test', accounts: [{ id: 'first' }, { id: 'second' }] };
+  for (const expanded of [false, true]) {
+    const context = testContext({ expandedAccountGroups: new Set(expanded ? [group.key] : []) });
+    const html = context.renderAccountGroup(group, 0);
+    assert.equal((html.match(/data-action="checkin-group"/g) || []).length, 1);
+    assert.match(html, /type="button" class="btn btn-primary account-group-checkin" data-action="checkin-group" data-group="https:\/\/site\.example\.test"/);
+    assert.match(html, /aria-expanded="(?:true|false)"/);
+    const toggleEnd = html.indexOf('</button>');
+    const total = html.indexOf('account-group-total');
+    const groupButton = html.indexOf('account-group-checkin');
+    assert.ok(toggleEnd < total && total < groupButton, 'toggle, total and group action are separate, ordered controls');
+    assert.match(html, />一键签到<\/button>/);
+  }
+  assert.doesNotMatch(testContext().renderAccountGroup({ ...group, accounts: [group.accounts[0]] }, 0), /checkin-group/);
+});
+
+test('the group check-in button escapes its URL and is disabled during account or batch work', () => {
+  const group = { key: 'https://site.example.test/<x>"', accounts: [{ id: 'first' }, { id: 'second' }] };
+  const safeHtml = testContext().renderAccountGroup(group, 0);
+  assert.doesNotMatch(safeHtml, /<x>/);
+  assert.match(safeHtml, /data-group="https:\/\/site\.example\.test\/&#60;x&#62;&#34;"/);
+  const accountBusy = testContext({ startingCheckins: new Map([['first', {}]]) }).renderAccountGroup(group, 0);
+  assert.match(accountBusy, /data-action="checkin-group"[^>]* disabled>一键签到<\/button>/);
+  const batchBusy = testContext({ activeBatchRun: { groupKey: group.key } }).renderAccountGroup(group, 0);
+  assert.match(batchBusy, /data-action="checkin-group"[^>]* disabled>签到中…<\/button>/);
 });

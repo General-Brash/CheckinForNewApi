@@ -27,6 +27,7 @@
   const SITE_SCOPE_PREFIX = "site:";
   const SERIES_COLORS = ["var(--primary)", "var(--accent)", "var(--warning)", "var(--danger)", "#a78bfa", "#e879b5"];
   const HISTORY_REFRESH_GUIDANCE = "请使用账号卡片的“刷新”后重试。";
+  const tooltipControls = new WeakMap();
 
   function finite(value) {
     return typeof value === "number" && Number.isFinite(value);
@@ -92,7 +93,23 @@
     const byTime = new Map();
     for (const sample of samples) {
       const previous = byTime.get(sample.at);
-      if (!previous || sampleQuality(sample) >= sampleQuality(previous)) byTime.set(sample.at, sample);
+      if (!previous) {
+        byTime.set(sample.at, sample);
+        continue;
+      }
+      const preferred = sampleQuality(sample) >= sampleQuality(previous) ? sample : previous;
+      const other = preferred === sample ? previous : sample;
+      const tokenSource = preferred.monthlyTokens === null && (preferred.month === null || preferred.month === other.month)
+        ? other : preferred;
+      // Complementary reads at the same time must not discard a known balance.
+      byTime.set(sample.at, {
+        ...preferred,
+        balance: preferred.balance ?? other.balance,
+        used: preferred.used ?? other.used,
+        monthlyTokens: tokenSource.monthlyTokens,
+        month: tokenSource.month,
+        truncated: tokenSource.truncated || (preferred.month === other.month && (preferred.truncated || other.truncated)),
+      });
     }
     const sorted = [...byTime.values()].sort((a, b) => a.at - b.at);
     const result = [];
@@ -196,6 +213,15 @@
     return found;
   }
 
+  function latestBalanceAtOrBefore(samples, at) {
+    let found = null;
+    for (const sample of samples) {
+      if (sample.at > at) break;
+      if (finite(sample.balance)) found = sample;
+    }
+    return found;
+  }
+
   function addMetricDelta(pointMap, at, metric, amount, totalSeries, breakBefore = false) {
     let point = pointMap.get(at);
     if (!point) {
@@ -292,8 +318,9 @@
       const nextDay = new Date(at);
       nextDay.setDate(nextDay.getDate() + 1);
       const end = Math.min(now, nextDay.getTime() - 1);
-      const sample = latestAtOrBefore(observations, end);
-      const observed = !!sample && sample.at >= at;
+      const observation = latestAtOrBefore(observations, end);
+      const sample = metric === "balance" ? latestBalanceAtOrBefore(observations, end) : observation;
+      const observed = !!observation && observation.at >= at;
       const change = latestAtOrBefore(changes, end);
       const dayChanges = changes.filter((point) => point.at >= at && point.at <= end);
       const effectiveSample = latestAtOrBefore(account.samples, end);
@@ -302,7 +329,8 @@
         : metric === "used" ? finite(sample.used)
         : finite(sample.monthlyTokens) && !!sample.month && !sample.truncated);
       const value = metric === "balance" ? (sample ? sample.balance : null) : (change ? change.cumulative : null);
-      const missing = !observed || !available || (metric !== "balance" && !comparable);
+      const carried = metric === "balance" && available && (sample.at < at || !finite(observation.balance));
+      const missing = metric === "balance" ? !available : !observed || !available || !comparable;
       return {
         at,
         value,
@@ -311,11 +339,15 @@
         uncollected: Number(!observed),
         missing: Number(missing),
         missingLabels: missing ? [account.label] : [],
+        carried: Number(carried),
+        carriedLabels: carried ? [account.label] : [],
         totalSeries: 1,
         sampleAt: sample ? sample.at : null,
         stale: Number(!!sample && end - sample.at > STALE_SNAPSHOT_MS),
         breakBefore: dayChanges.some((point) => point.breakBefore),
-        status: !observed ? "当日未采集" : !available ? "当日字段缺失或不可比较"
+        status: metric === "balance" && carried
+          ? sample.at < at ? "当日未更新，沿用最近已确认余额" : "最新记录未含余额，保留当日已确认余额"
+          : !observed ? "当日未采集" : !available ? "当日字段缺失或不可比较"
           : metric !== "balance" && !comparable ? "当日无可比较变化" : "当日已采集",
       };
     });
@@ -325,6 +357,7 @@
     return dates.map((at, index) => {
       const points = accounts.map((account) => account[metric][index]);
       const known = points.filter((point) => finite(point.value));
+      const sampleTimes = known.map((point) => point.sampleAt).filter(finite);
       return {
         at,
         value: known.length ? known.reduce((total, point) => total + point.value, 0) : null,
@@ -333,7 +366,11 @@
         uncollected: points.reduce((total, point) => total + point.uncollected, 0),
         missing: points.reduce((total, point) => total + point.missing, 0),
         missingLabels: points.flatMap((point) => point.missingLabels),
+        carried: points.reduce((total, point) => total + point.carried, 0),
+        carriedLabels: points.flatMap((point) => point.carriedLabels),
         totalSeries: accounts.length,
+        sampleAt: sampleTimes.length ? Math.max(...sampleTimes) : null,
+        oldestSampleAt: sampleTimes.length ? Math.min(...sampleTimes) : null,
         stale: points.reduce((total, point) => total + point.stale, 0),
         breakBefore: points.some((point) => point.breakBefore),
       };
@@ -360,20 +397,10 @@
         return entry;
       });
     }
-    return Object.fromEntries(metrics.map((metric) => [metric, entries.map((entry, index) => {
-      const points = [];
-      let previousIndex = -1;
-      // Filter only after computing the full-range deltas, retaining gaps as line breaks.
-      for (const [pointIndex, point] of entry[metric].entries()) {
-        if (point.uncollected === point.totalSeries) continue;
-        points.push({ ...point, breakBefore: point.breakBefore || (previousIndex >= 0 && pointIndex > previousIndex + 1) });
-        previousIndex = pointIndex;
-      }
-      return {
+    return Object.fromEntries(metrics.map((metric) => [metric, entries.map((entry, index) => ({
         key: entry.key, siteKey: entry.siteKey, label: entry.label, kind: entry.kind, accountCount: entry.accountCount,
-        color: SERIES_COLORS[index % SERIES_COLORS.length], points,
-      };
-    })]));
+        color: SERIES_COLORS[index % SERIES_COLORS.length], points: entry[metric],
+    }))]));
   }
 
   /** Pure view-model builder, also used by the offline regression tests. */
@@ -398,7 +425,7 @@
     const balancePoints = events.map((at) => {
       let total = 0, known = 0, stale = 0;
       for (const account of series) {
-        const sample = latestAtOrBefore(account.observations, at);
+        const sample = latestBalanceAtOrBefore(account.observations, at);
         if (!sample || sample.balance === null) continue;
         total += sample.balance;
         known++;
@@ -409,7 +436,7 @@
 
     let balanceTotal = 0, balanceKnown = 0, balanceStale = 0;
     const latestSnapshots = series.map((account) => {
-      const sample = latestAtOrBefore(account.observations, now);
+      const sample = latestBalanceAtOrBefore(account.observations, now);
       if (sample && sample.balance !== null) {
         balanceTotal += sample.balance;
         balanceKnown++;
@@ -442,7 +469,11 @@
       hasSamples: series.some((account) => account.observations.length > 0),
       inRangeSamples,
       balancePoints,
-      latestBalance: { value: balanceKnown ? balanceTotal : null, known: balanceKnown, missing: Math.max(0, series.length - balanceKnown), stale: balanceStale, totalSeries: series.length },
+      latestBalance: {
+        value: balanceKnown ? balanceTotal : null, known: balanceKnown,
+        missing: Math.max(0, series.length - balanceKnown), stale: balanceStale, totalSeries: series.length,
+        sampleAt: latestSnapshots.reduce((latest, { sample }) => sample ? Math.max(latest, sample.at) : latest, 0) || null,
+      },
       latestSnapshots,
       newestSampleAt: series.reduce((latest, account) => account.observations.length ? Math.max(latest, account.observations[account.observations.length - 1].at) : latest, 0) || null,
       used,
@@ -547,18 +578,32 @@
     }).format(value);
   }
 
-  function chartPointText(series, point, formatter, daily) {
-    const parts = [series.label, daily ? formatDate(point.at) : formatDateTime(point.at), formatter(point.value)].filter(Boolean);
+  function chartPointDetails(series, point, daily) {
+    const parts = [];
     if (point.status) parts.push(point.status);
+    if (series.kind === "site") {
+      parts.push(`${point.known}/${point.totalSeries} 个账号有已知金额`);
+    }
     if (point.missing && series.kind === "site") {
-      parts.push(`当日 ${point.totalSeries - point.missing}/${point.totalSeries} 个账号数据完整`);
       if (point.missingLabels && point.missingLabels.length) parts.push(`缺测或不可比较：${point.missingLabels.join("、")}`);
     }
+    if (point.carried) {
+      parts.push(`${point.carried} 个账号沿用此前已确认余额，不代表当日实时额度`);
+    }
     if (point.missing && finite(point.value)) parts.push("包含之前的已知读数，仅作位置参考，并非当日完整读数");
-    if (point.sampleAt) parts.push(`最近采集 ${formatDateTime(point.sampleAt)}`);
+    if (finite(point.sampleAt)) parts.push(`最近采集 ${formatDateTime(point.sampleAt)}`);
+    if (finite(point.oldestSampleAt) && point.oldestSampleAt !== point.sampleAt) {
+      parts.push(`最早余额快照 ${formatDateTime(point.oldestSampleAt)}`);
+    }
     if (point.breakBefore) parts.push("与前段不可比较");
     if (point.stale) parts.push(`${point.stale} 个快照较旧`);
     if (point.missing && !daily) parts.push(`${point.missing} 个账号缺失`);
+    return parts;
+  }
+
+  function chartPointText(series, point, formatter, daily) {
+    const parts = [series.label, daily ? formatDate(point.at) : formatDateTime(point.at), formatter(point.value)].filter(Boolean);
+    parts.push(...chartPointDetails(series, point, daily));
     return parts.join(" · ");
   }
 
@@ -581,7 +626,7 @@
       item.append(swatch, element(doc, "span", "history-legend-label", series.label));
       const latest = series.points[series.points.length - 1];
       const detail = series.kind === "site" ? `${series.accountCount} 个账号`
-        : latest && latest.uncollected ? "当日未采集" : "";
+        : latest && latest.carried ? "沿用已确认余额" : latest && latest.uncollected ? "当日未采集" : "";
       if (detail) item.appendChild(element(doc, "small", "history-legend-detail", detail));
       legend.appendChild(item);
     }
@@ -603,8 +648,8 @@
 
     // The viewBox is expressed in the container's CSS-pixel width. This keeps
     // 11px SVG labels readable on a phone and in the half-width desktop charts.
-    const hasUnknownSeries = daily && seriesList.some((series) => !series.points.some((point) => finite(point.value)));
-    const width = measuredChartWidth(container), height = 214, right = 8, top = 16, bottom = hasUnknownSeries ? 54 : 34;
+    const hasUnknownPoints = daily && seriesList.some((series) => series.points.some((point) => !finite(point.value)));
+    const width = measuredChartWidth(container), height = 214, right = 14, top = 16, bottom = hasUnknownPoints ? 54 : 34;
     const compact = width < 520;
     const axisFormatter = typeof options.axisFormatter === "function" ? options.axisFormatter : formatter;
     let min = valid.length ? Math.min(...valid.map((point) => point.value)) : 0;
@@ -632,7 +677,7 @@
       ? left + dateIndices.get(at) / Math.max(1, dates.length - 1) * plotWidth
       : left + (lastAt === firstAt ? plotWidth / 2 : (at - firstAt) / (lastAt - firstAt) * plotWidth);
     const y = (value) => top + (max - value) / (max - min) * plotHeight;
-    const svg = svgElement(doc, "svg", { viewBox: `0 0 ${width} ${height}`, role: typeof options.onSelect === "function" ? "group" : "img", "aria-label": label, focusable: "false" });
+    const svg = svgElement(doc, "svg", { viewBox: `0 0 ${width} ${height}`, role: "group", "aria-label": label, focusable: "false" });
     const title = svgElement(doc, "title");
     title.textContent = label;
     svg.appendChild(title);
@@ -646,11 +691,87 @@
     }
 
     const unknownY = valid.length ? height - 34 : top + plotHeight / 2;
-    if (hasUnknownSeries) {
+    if (hasUnknownPoints) {
       const unknownLabel = svgElement(doc, "text", { x: left - 8, y: unknownY + 4, "text-anchor": "end", class: "history-axis-label" });
       unknownLabel.textContent = "无数据";
       svg.appendChild(unknownLabel);
     }
+
+    const tooltip = element(doc, "div", "history-chart-tooltip");
+    tooltip.setAttribute("role", "tooltip");
+    tooltip.hidden = true;
+    let hoveredPoint = null, focusedPoint = null, displayedPoint = null, tooltipHovered = false, dismissed = false;
+    let hideTimer = null;
+    const cancelHide = () => {
+      if (hideTimer !== null) root.clearTimeout(hideTimer);
+      hideTimer = null;
+    };
+    const dismissTooltip = () => {
+      cancelHide();
+      dismissed = true;
+      tooltip.hidden = true;
+    };
+    const positionTooltip = () => {
+      if (tooltip.hidden || !displayedPoint) return;
+      const bounds = container.getBoundingClientRect();
+      const marker = displayedPoint.circle.getBoundingClientRect();
+      const panel = typeof container.closest === "function" ? container.closest(".history-panel") : null;
+      const panelBounds = panel ? panel.getBoundingClientRect() : bounds;
+      const viewportWidth = root.innerWidth || panelBounds.right;
+      const viewportHeight = root.innerHeight || panelBounds.bottom;
+      const inset = 6;
+      const visibleLeft = Math.max(inset, bounds.left + inset, panelBounds.left + inset);
+      const visibleRight = Math.min(viewportWidth - inset, bounds.right - inset, panelBounds.right - inset);
+      const visibleTop = Math.max(inset, panelBounds.top + inset);
+      const visibleBottom = Math.min(viewportHeight - inset, panelBounds.bottom - inset);
+      if (marker.bottom < visibleTop || marker.top > visibleBottom) {
+        tooltip.hidden = true;
+        return;
+      }
+      tooltip.style.maxWidth = `${Math.max(1, Math.min(280, visibleRight - visibleLeft))}px`;
+      tooltip.style.maxHeight = `${Math.max(1, visibleBottom - visibleTop)}px`;
+      const popup = tooltip.getBoundingClientRect();
+      const center = marker.left + marker.width / 2;
+      const left = Math.max(visibleLeft, Math.min(center - popup.width / 2, visibleRight - popup.width));
+      const above = marker.top - popup.height - 10;
+      const top = above >= visibleTop ? above : marker.bottom + 10;
+      tooltip.style.left = `${left - bounds.left}px`;
+      tooltip.style.top = `${Math.max(visibleTop, Math.min(top, visibleBottom - popup.height)) - bounds.top}px`;
+    };
+    const updateTooltip = () => {
+      cancelHide();
+      const selected = tooltipHovered ? displayedPoint : hoveredPoint || focusedPoint;
+      if (dismissed || !selected) {
+        tooltip.hidden = true;
+        return;
+      }
+      if (selected !== displayedPoint) {
+        const { series, point } = selected;
+        const details = element(doc, "div", "history-tooltip-details");
+        for (const text of chartPointDetails(series, point, daily)) details.appendChild(element(doc, "span", "", text));
+        tooltip.replaceChildren(
+          element(doc, "strong", "history-tooltip-label", series.label || label),
+          element(doc, "span", "history-tooltip-date", daily ? formatDate(point.at) : formatDateTime(point.at)),
+          element(doc, "strong", "history-tooltip-value", formatter(point.value)),
+          details,
+        );
+        displayedPoint = selected;
+      }
+      tooltip.hidden = false;
+      positionTooltip();
+    };
+    const leavePoint = () => {
+      if (focusedPoint || tooltipHovered) updateTooltip();
+      else {
+        cancelHide();
+        hideTimer = root.setTimeout(() => { hideTimer = null; updateTooltip(); }, 100);
+      }
+    };
+    tooltip.addEventListener("mouseenter", () => { tooltipHovered = true; updateTooltip(); });
+    tooltip.addEventListener("mouseleave", () => { tooltipHovered = false; leavePoint(); });
+    tooltipControls.set(tooltip, { dismiss: dismissTooltip, position: positionTooltip });
+    const hitAreas = [], circles = [];
+    const hitRadius = Math.min(10, plotWidth / Math.max(1, dates.length - 1) / 2);
 
     for (const series of seriesList) {
       const firstKnown = daily ? null : series.points.find((point) => finite(point.value));
@@ -658,32 +779,33 @@
       const plotted = series.points.map((point) => {
         if (finite(point.value)) reference = point.value;
         // Unknown values stay null in the model and tooltip; a reference only positions the gray marker.
-        return { point, py: finite(reference) ? y(reference) : unknownY, missing: !!point.missing || !finite(point.value) };
+        return { point, py: finite(reference) ? y(reference) : unknownY, missing: !!point.missing || !finite(point.value), carried: !!point.carried };
       });
       const segments = [];
-      let segment = [], segmentMissing = null;
+      let segment = [], segmentStyle = null;
       for (const plottedPoint of plotted) {
         const previous = segment[segment.length - 1];
         if (plottedPoint.point.breakBefore && segment.length) {
-          segments.push({ points: segment, missing: segmentMissing });
+          segments.push({ points: segment, style: segmentStyle });
           segment = [];
-          segmentMissing = null;
+          segmentStyle = null;
         } else if (previous) {
-          const edgeMissing = previous.missing || plottedPoint.missing;
-          if (segmentMissing !== null && segmentMissing !== edgeMissing) {
-            segments.push({ points: segment, missing: segmentMissing });
+          const edgeStyle = previous.missing || plottedPoint.missing ? "missing"
+            : previous.carried || plottedPoint.carried ? "carried" : "observed";
+          if (segmentStyle !== null && segmentStyle !== edgeStyle) {
+            segments.push({ points: segment, style: segmentStyle });
             segment = [previous];
           }
-          segmentMissing = edgeMissing;
+          segmentStyle = edgeStyle;
         }
         segment.push(plottedPoint);
       }
-      if (segment.length) segments.push({ points: segment, missing: segmentMissing });
+      if (segment.length) segments.push({ points: segment, style: segmentStyle });
       const color = series.color || "var(--primary)";
       for (const part of segments) {
         const pathData = part.points.map((item, index) => `${index ? "L" : "M"}${x(item.point.at).toFixed(2)},${item.py.toFixed(2)}`).join(" ");
         svg.appendChild(svgElement(doc, "path", {
-          d: pathData, class: `history-chart-line${part.missing ? " history-chart-line-missing" : ""}`,
+          d: pathData, class: `history-chart-line${part.style === "missing" ? " history-chart-line-missing" : part.style === "carried" ? " history-chart-line-carried" : ""}`,
           style: `--history-series-color:${color}`, "data-series": series.key,
         }));
       }
@@ -692,30 +814,55 @@
         const point = item.point;
         if (daily || plotted.length <= 36 || point.breakBefore || isolatedPoints.has(item)) {
           const text = chartPointText(series, point, formatter, daily);
+          const hitArea = svgElement(doc, "rect", {
+            x: x(point.at) - hitRadius, y: item.py - hitRadius, width: hitRadius * 2, height: hitRadius * 2, rx: hitRadius,
+            class: "history-chart-hit-area", "aria-hidden": "true",
+          });
           const circle = svgElement(doc, "circle", {
             cx: x(point.at), cy: item.py, r: daily ? 4 : 3.5,
-            class: `history-chart-dot${item.missing ? " history-chart-dot-missing" : ""}`,
+            class: `history-chart-dot${item.missing ? " history-chart-dot-missing" : item.carried ? " history-chart-dot-carried" : ""}`,
             style: `--history-series-color:${color}`, "data-series": series.key, "data-at": point.at,
+            tabindex: "0", "aria-label": text,
           });
-          const tooltip = svgElement(doc, "title");
-          tooltip.textContent = text;
-          circle.appendChild(tooltip);
-          if (typeof options.onSelect === "function") {
-            circle.setAttribute("role", "button");
-            circle.setAttribute("tabindex", "0");
-            circle.setAttribute("aria-label", text);
-            circle.addEventListener("click", () => options.onSelect(series, point));
-            circle.addEventListener("keydown", (event) => {
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                options.onSelect(series, point);
-              }
+          const interaction = { circle, series, point };
+          for (const target of [hitArea, circle]) {
+            target.addEventListener("mouseenter", () => {
+              hoveredPoint = interaction;
+              dismissed = false;
+              updateTooltip();
+            });
+            target.addEventListener("mouseleave", (event) => {
+              if (event && [hitArea, circle].includes(event.relatedTarget)) return;
+              if (hoveredPoint === interaction) hoveredPoint = null;
+              leavePoint();
             });
           }
-          svg.appendChild(circle);
+          circle.addEventListener("focus", () => { focusedPoint = interaction; dismissed = false; updateTooltip(); });
+          circle.addEventListener("blur", () => { if (focusedPoint === interaction) focusedPoint = null; updateTooltip(); });
+          circle.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && !tooltip.hidden) {
+              dismissTooltip();
+              event.preventDefault();
+              event.stopPropagation();
+            } else if (typeof options.onSelect === "function" && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault();
+              options.onSelect(series, point);
+            }
+          });
+          if (typeof options.onSelect === "function") {
+            circle.setAttribute("role", "button");
+            circle.addEventListener("click", () => options.onSelect(series, point));
+            hitArea.addEventListener("click", () => options.onSelect(series, point));
+          } else {
+            circle.setAttribute("role", "img");
+          }
+          hitAreas.push(hitArea);
+          circles.push(circle);
         }
       }
     }
+    // Keep every visible marker above every enlarged pointer target.
+    svg.append(...hitAreas, ...circles);
     const dateLabelMinGap = compact ? 72 : 92;
     const desiredCount = Math.min(5, dates.length, Math.max(dates.length > 1 ? 2 : 1, Math.floor(plotWidth / dateLabelMinGap) + 1));
     const labelIndices = [0];
@@ -734,6 +881,7 @@
       svg.appendChild(axisLabel);
     }
     container.appendChild(svg);
+    container.appendChild(tooltip);
     if (options.footnote) container.appendChild(element(doc, "p", "history-chart-note", options.footnote));
   }
 
@@ -854,8 +1002,9 @@
 
   function renderModel(view, model) {
     const doc = view.panel.ownerDocument;
+    const balanceAt = model.latestBalance.sampleAt;
     const balanceDetail = model.latestBalance.totalSeries
-      ? `最新快照${model.newestSampleAt ? ` · ${formatDateTime(model.newestSampleAt)}（${timeAgo(model.newestSampleAt)}）` : ""}${model.latestBalance.stale ? ` · ${model.latestBalance.stale} 个较旧` : ""}`
+      ? `${model.latestBalance.known}/${model.latestBalance.totalSeries} 个账号有已知余额${balanceAt !== null ? ` · ${formatDateTime(balanceAt)}（${timeAgo(balanceAt)}）` : ""}${model.latestBalance.stale ? ` · ${model.latestBalance.stale} 个较旧` : ""}`
       : "尚无可用余额快照";
     const usedValue = model.used.total === null ? "—" : `+${formatCurrency(model.used.total)}`;
     const tokenValue = model.tokens.total === null ? "—" : `+${formatNumber(model.tokens.total)}`;
@@ -1127,7 +1276,13 @@
     view.doc = doc;
     view.configs = safeConfigs;
     view.onKeydown = (event) => {
-      if (event.key === "Escape") { event.preventDefault(); close(); return; }
+      if (event.key === "Escape") {
+        const tooltip = [...view.panel.querySelectorAll(".history-chart-tooltip")].find((node) => !node.hidden);
+        event.preventDefault();
+        if (tooltip) tooltipControls.get(tooltip).dismiss();
+        else close();
+        return;
+      }
       if (event.key !== "Tab") return;
       const focusable = [...view.panel.querySelectorAll('button:not([disabled]), select, [href], [tabindex]:not([tabindex="-1"])')]
         .filter((node) => !node.hidden && node.getAttribute("aria-hidden") !== "true");
@@ -1146,6 +1301,9 @@
       refresh(view);
     });
     view.overlay.addEventListener("click", (event) => { if (event.target === view.overlay) close(); });
+    view.panel.addEventListener("scroll", () => {
+      for (const tooltip of view.panel.querySelectorAll(".history-chart-tooltip")) tooltipControls.get(tooltip).position();
+    });
     view.accountSelect.addEventListener("change", () => refresh(view));
     view.periodSelect.addEventListener("change", () => refresh(view));
     doc.addEventListener("keydown", view.onKeydown);

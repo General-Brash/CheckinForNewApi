@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
@@ -38,4 +39,44 @@ test('Popup and sidebar local HTML assets exist', () => {
       assertLocalFile(asset.split(/[?#]/, 1)[0], `${page} asset`);
     }
   }
+});
+
+test('Git excludes private configuration and browser data without excluding public source', {
+  skip: !fs.existsSync(path.join(root, '.git')),
+}, () => {
+  const privateFiles = [
+    '.env', '.env.production', 'local.key', 'local.p12', 'local.pfx',
+    'settings.local.json', 'settings.private.yaml', 'settings.secret.toml',
+    '.config/settings.json', '.local/accounts.json', 'config/accounts.json',
+    'configs/accounts.yaml', 'private/accounts.json', 'secrets/token.txt',
+    'exports/accounts.json', 'backups/accounts.json',
+    'config.json', 'config.production.json', 'config.yaml', 'config.yml', 'config.toml', 'config.ini',
+    'credentials.json', 'credentials.yaml', 'credentials.yml',
+    'secrets.json', 'secrets.yaml', 'secrets.yml',
+    'newapi-checkin-config.json', 'newapi-checkin-config (1).json',
+    'newapi-checkin-config-2026-11-05.json', 'backups/newapi-checkin-config.json',
+    'nacheckin.platforms.json', 'nacheckin.accountHistory.json',
+    '.playwright-cli/page-private.yml', '.playwright/session.json', 'playwright/.auth/user.json',
+    'output/playwright/account.png', 'screenshots/account.png', 'artifacts/page.yml',
+    'browser-profile/Preferences', 'user-data/Default/Cookies',
+    'storage-state.json', 'storage-state.local.json', 'storageState.json', 'auth.json',
+    'cookies.json', 'cookies.txt', 'network.har', 'debug.log',
+  ];
+  const publicFiles = [
+    '.env.example', 'auth-config.js', 'manifest.json', '.github/workflows/ci.yml',
+    'account-history.js', 'history-view.js', 'popup.js', 'popup.html', 'sidebar.html',
+    'icons/icon128.png', 'tests/repo-integrity.test.cjs',
+  ];
+  const ignored = execFileSync('git', ['check-ignore', '--no-index', '--stdin', '-z'], {
+    cwd: root,
+    input: [...privateFiles, ...publicFiles].join('\0') + '\0',
+    encoding: 'utf8',
+  }).split('\0').filter(Boolean);
+  assert.deepEqual(ignored, privateFiles, 'private files must be ignored and required source must stay publishable');
+
+  const trackedPrivateFiles = execFileSync('git', ['ls-files', '--cached', '--ignored', '--exclude-standard', '-z'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).split('\0').filter(Boolean);
+  assert.deepEqual(trackedPrivateFiles, [], 'ignored private files must also be removed from the Git index');
 });

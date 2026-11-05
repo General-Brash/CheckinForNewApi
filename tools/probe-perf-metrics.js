@@ -84,11 +84,10 @@
       TOKEN = deepFind(rf.body, ['access_token', 'accessToken', 'token']);
       USER_ID = deepFindId(rf.body) || '';
       if (TOKEN) {
-        good('换取成功！token 前缀:', TOKEN.slice(0, 12) + '…', '| 用户ID:', USER_ID || '(未取到)');
+        good('换取成功（不输出令牌或用户 ID）。');
         log('refresh 响应结构:', Object.keys(rf.body), rf.body.data ? '| data 内: ' + Object.keys(rf.body.data) : '');
       } else {
-        bad('refresh 成功但没找到 token 字段。完整响应见下，请贴给我：');
-        console.log(rf.body);
+        bad('refresh 成功但没找到 token 字段；为避免泄露凭据，不输出原始响应。');
         return;
       }
     } else {
@@ -103,7 +102,7 @@
   const self = await req('/api/user/self');
   if (self.ok && self.body && self.body.data) {
     if (!USER_ID && self.body.data.id != null) USER_ID = String(self.body.data.id);
-    good('鉴权通过。用户:', self.body.data.username || self.body.data.display_name, '| ID:', USER_ID);
+    good('鉴权通过（不输出用户名或用户 ID）。');
   } else {
     bad('/api/user/self → HTTP ' + self.status + ' ' + ((self.body && self.body.message) || ''));
     bad('token 可能无效，后续结果仅供参考。');

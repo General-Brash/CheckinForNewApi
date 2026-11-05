@@ -30,11 +30,16 @@ class MockElement {
     this.textContent = '';
     this.clientWidth = 390;
     this.listeners = Object.create(null);
+    this.style = {};
     this.value = undefined;
     this.isConnected = false;
   }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  getBoundingClientRect() {
+    const width = this.className === 'history-chart-tooltip' ? Math.min(280, this.clientWidth - 12) : this.clientWidth;
+    return { left: 0, top: 0, right: width, bottom: 214, width, height: 214 };
+  }
   appendChild(child) {
     this.children.push(child);
     child.parentNode = this;
@@ -468,7 +473,7 @@ test('drilling into a website exposes separate account curves and scopes all sum
   assert.equal(account.latestBalance.value, 13);
 });
 
-test('marks missing calendar days independently of snapshot age and keeps a real zero valid', () => {
+test('distinguishes known balances carried across days from truly missing balances and keeps zero valid', () => {
   const now = localTime(29, 18);
   const a = platform('a', 'Account A', 'token-a');
   const b = platform('b', 'Account B', 'token-b', { userId: '13' });
@@ -484,19 +489,77 @@ test('marks missing calendar days independently of snapshot age and keeps a real
   assert.equal(points[0].value, null, 'no earlier snapshot is invented from future observations');
   assert.equal(points[0].missing, 1);
   assert.equal(points[2].at, localTime(25, 0));
-  assert.equal(points[2].value, 10, 'the last confirmed value only locates the missing marker');
+  assert.equal(points[2].value, 10, 'an uncollected day retains the most recent confirmed balance');
   assert.equal(points[2].observed, false);
-  assert.equal(points[2].missing, 1);
+  assert.equal(points[2].missing, 0, 'a known balance is not a missing amount');
+  assert.equal(points[2].carried, 1);
+  assert.equal(points[2].sampleAt, localTime(24));
   assert.equal(points[3].value, 0);
   assert.equal(points[3].missing, 0, 'zero is a real collection, not an absent value');
-  assert.equal(points.at(-1).missing, 1);
-  assert.equal(points.at(-1).stale, 0, 'a sample less than 36 hours old can still miss today');
+  assert.equal(points.at(-1).missing, 0);
+  assert.equal(points.at(-1).carried, 1);
+  assert.equal(points.at(-1).uncollected, 1, 'known balance does not imply a new daily collection');
+  assert.equal(points.at(-1).stale, 0, 'carry-forward and snapshot age remain distinct');
   const overview = HistoryView.buildViewModel(data, [a, b], { now, days: 7 });
   const today = overview.charts.balance[0].points.at(-1);
   assert.equal(today.value, 31);
   assert.equal(today.known, 2);
-  assert.equal(today.missing, 1);
-  assert.deepEqual(today.missingLabels, ['Account A']);
+  assert.equal(today.missing, 0);
+  assert.equal(today.carried, 1);
+  assert.deepEqual(today.carriedLabels, ['Account A']);
+  assert.equal(today.sampleAt, localTime(29, 11));
+  assert.equal(today.oldestSampleAt, localTime(28));
+  assert.equal(overview.inRangeSamples.length, 11, 'displaying carried values creates no synthetic observations');
+});
+
+test('later partial observations do not erase confirmed balances from daily charts or the latest summary', () => {
+  const now = localTime(29, 18);
+  const config = platform('a', 'Account A', 'token');
+  const data = history(localTime(20), {
+    a: { identity: identity(config), samples: [
+      sample(localTime(27), 10, 2, 100),
+      sample(localTime(28), null, 3, 110),
+      sample(localTime(29, 10), 0, 4, 120),
+      sample(localTime(29, 16), null, 5, 130),
+    ] },
+  });
+  const before = JSON.stringify(data);
+  const model = HistoryView.buildViewModel(data, [config], { now, days: 7, site: config.baseUrl });
+  const points = model.charts.balance[0].points;
+  assert.equal(points.at(-2).value, 10);
+  assert.equal(points.at(-2).carried, 1);
+  assert.equal(points.at(-2).missing, 0);
+  assert.equal(points.at(-2).sampleAt, localTime(27));
+  assert.equal(points.at(-1).value, 0, 'the last valid zero replaces an earlier positive balance');
+  assert.equal(points.at(-1).carried, 1);
+  assert.match(points.at(-1).status, /最新记录未含余额/);
+  assert.equal(model.latestBalance.value, 0);
+  assert.equal(model.latestBalance.sampleAt, localTime(29, 10), 'the summary timestamp belongs to the balance, not the partial read');
+  assert.equal(model.balancePoints.at(-1).value, 0);
+  assert.equal(model.inRangeSamples.length, 4);
+  assert.equal(model.inRangeSamples[0].sample.balance, null, 'raw partial observations remain honest');
+  assert.equal(JSON.stringify(data), before, 'the read-only view does not change stored history');
+});
+
+test('same-time complementary reads preserve a known balance regardless of duplicate configuration order', () => {
+  const now = localTime(29, 18);
+  const a = platform('a', 'Account A', 'token');
+  const alias = platform('alias', 'Alias A', 'token');
+  const at = localTime(29, 10);
+  const data = history(localTime(20), {
+    a: { identity: identity(a), samples: [sample(at, 10, 2, null)] },
+    alias: { identity: identity(alias), samples: [sample(at, null, 3, 110)] },
+  });
+  for (const configs of [[a, alias], [alias, a]]) {
+    const model = HistoryView.buildViewModel(data, configs, { now, days: 7 });
+    assert.equal(model.series.length, 1);
+    assert.equal(model.series[0].samples.length, 1);
+    assert.equal(model.series[0].samples[0].balance, 10);
+    assert.equal(model.series[0].samples[0].monthlyTokens, 110);
+    assert.equal(model.latestBalance.value, 10);
+    assert.equal(model.charts.balance[0].points.at(-1).missing, 0);
+    assert.equal(model.charts.balance[0].points.at(-1).carried, 0);
+  }
 });
 
 test('retains raw observation dates when identical reads straddle midnight', () => {
@@ -616,12 +679,13 @@ test('renders missing markers and both adjacent edges gray and dashed, then rest
   const dots = svg.children.filter((node) => node.tagName === 'circle' && node.getAttribute('data-series') === 'a');
   assert.equal(hasClass(dots[1], 'history-chart-dot-missing'), true);
   assert.equal(hasClass(dots[2], 'history-chart-dot-missing'), false, 'real zero does not get a gray marker');
-  assert.match(deepText(dots[1]), /当日未采集/);
-  assert.match(deepText(dots[1]), /仅作位置参考/);
+  assert.match(dots[1].getAttribute('aria-label'), /当日未采集/);
+  assert.match(dots[1].getAttribute('aria-label'), /仅作位置参考/);
+  assert.match(dots[1].getAttribute('aria-label'), /\$10\.0000/);
   const absentDots = svg.children.filter((node) => node.tagName === 'circle' && node.getAttribute('data-series') === 'b');
   assert.equal(absentDots.length, 4, 'accounts with no readings still have gray markers in the no-data lane');
   assert.ok(absentDots.every((node) => hasClass(node, 'history-chart-dot-missing')));
-  assert.match(deepText(absentDots[0]), /—/);
+  assert.match(absentDots[0].getAttribute('aria-label'), /—/);
   assert.ok(svg.children.some((node) => node.textContent === '无数据'));
   dots[1].listeners.click[0]();
   dots[2].listeners.keydown[0]({ key: 'Enter', preventDefault() {} });
@@ -629,6 +693,58 @@ test('renders missing markers and both adjacent edges gray and dashed, then rest
   const css = fs.readFileSync(path.join(root, 'history-view.css'), 'utf8');
   assert.match(css, /\.history-chart-line-missing\{[^}]*stroke:var\(--history-missing-color\);stroke-dasharray:5 5/);
   assert.match(css, /\.history-chart-dot-missing\{[^}]*fill:var\(--history-missing-color\);stroke:var\(--history-missing-color\)/);
+});
+
+test('known carry-forward amounts keep their series color and tooltips show full money values on hover and focus', async () => {
+  const doc = mockDocument();
+  const container = doc.createElement('div');
+  const points = [
+    { at: localTime(27, 0), value: 1234.5678, known: 2, totalSeries: 2, missing: 0, sampleAt: localTime(27, 16) },
+    { at: localTime(28, 0), value: 1234.5678, known: 2, totalSeries: 2, missing: 0, carried: 1, sampleAt: localTime(28, 10), oldestSampleAt: localTime(27, 16) },
+    { at: localTime(29, 0), value: 0, known: 2, totalSeries: 2, missing: 0, sampleAt: localTime(29, 10) },
+  ];
+  HistoryView.renderChart(container, [], '网址额度总和', HistoryView.formatCurrency, '暂无数据', {
+    series: [{ key: 'site', label: 'https://site.example.test', kind: 'site', accountCount: 2, color: '#10b981', points }],
+  });
+  const tooltip = container.querySelector('.history-chart-tooltip');
+  const dots = descendants(container, (node) => node.tagName === 'circle');
+  assert.equal(tooltip.hidden, true);
+  assert.equal(hasClass(dots[1], 'history-chart-dot-carried'), true);
+  assert.equal(hasClass(dots[1], 'history-chart-dot-missing'), false);
+  assert.equal(dots[1].getAttribute('tabindex'), '0');
+  assert.ok(descendants(container, (node) => hasClass(node, 'history-chart-line-carried')).length);
+  dots[1].listeners.mouseenter[0]();
+  assert.equal(tooltip.hidden, false);
+  assert.match(deepText(tooltip), /\$1,234\.5678/);
+  assert.match(deepText(tooltip), /2\/2 个账号有已知金额/);
+  assert.match(deepText(tooltip), /1 个账号沿用此前已确认余额/);
+  assert.match(deepText(tooltip), /2026\/10\/28/);
+  assert.match(deepText(tooltip), /最早余额快照/);
+  assert.ok(Number.parseFloat(tooltip.style.left) >= 6);
+  dots[1].listeners.mouseleave[0]();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(tooltip.hidden, true);
+  dots[2].listeners.focus[0]();
+  assert.equal(tooltip.hidden, false);
+  assert.match(deepText(tooltip), /\$0\.0000/);
+  dots[2].listeners.keydown[0]({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+  assert.equal(tooltip.hidden, true);
+  dots[2].listeners.focus[0]();
+  dots[1].listeners.mouseenter[0]();
+  assert.match(deepText(tooltip), /\$1,234\.5678/);
+  dots[1].listeners.mouseleave[0]();
+  assert.equal(tooltip.hidden, false, 'leaving another hovered point restores the keyboard-focused point');
+  assert.match(deepText(tooltip), /\$0\.0000/);
+  const targets = descendants(container, (node) => hasClass(node, 'history-chart-hit-area'));
+  targets[0].listeners.mouseenter[0]();
+  assert.equal(tooltip.hidden, false, 'the larger pointer target also opens the amount tooltip');
+  assert.match(deepText(tooltip), /\$1,234\.5678/);
+  const svg = container.querySelector('svg');
+  const firstCircle = svg.children.findIndex((node) => node.tagName === 'circle');
+  const lastTarget = svg.children.findLastIndex((node) => hasClass(node, 'history-chart-hit-area'));
+  assert.ok(firstCircle > lastTarget, 'all visible markers remain above all enlarged hit areas');
+  const css = fs.readFileSync(path.join(root, 'history-view.css'), 'utf8');
+  assert.match(css, /\.history-chart-line-carried\{stroke-dasharray:5 5\}/);
 });
 
 test('an entirely unknown daily curve renders gray markers without a numeric zero axis', () => {
@@ -645,6 +761,11 @@ test('an entirely unknown daily curve renders gray markers without a numeric zer
   assert.equal(descendants(container, (node) => hasClass(node, 'history-chart-line-missing')).length, 1);
   assert.equal(descendants(container, (node) => hasClass(node, 'history-grid-line')).length, 0);
   assert.doesNotMatch(deepText(container), /\$0\.0000/);
+  dots[0].listeners.mouseenter[0]();
+  const tooltip = container.querySelector('.history-chart-tooltip');
+  assert.equal(tooltip.hidden, false);
+  assert.match(deepText(tooltip), /—/);
+  assert.doesNotMatch(deepText(tooltip), /\$0\.0000/);
 });
 
 test('selecting an account with no history keeps its gray calendar curve in the empty-state panel', async () => {
@@ -673,7 +794,7 @@ test('selecting an account with no history keeps its gray calendar curve in the 
     assert.equal(descendants(chart, (node) => node.tagName === 'circle').length, 7);
     assert.ok(descendants(chart, (node) => node.tagName === 'circle').every((node) => hasClass(node, 'history-chart-dot-missing')));
     assert.equal(doc.body.querySelector('.history-summary').children.length, 0, 'missing data never invents a zero balance');
-    assert.match(deepText(doc.body.querySelector('.history-coverage')), /尚无真实历史样本/);
+    assert.match(deepText(doc.body.querySelector('.history-range')), /尚无真实历史样本/);
   } finally {
     HistoryView.close();
     if (previousDocument === undefined) delete global.document; else global.document = previousDocument;

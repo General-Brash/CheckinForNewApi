@@ -399,6 +399,9 @@ function accountIdentity(p) {
   const username = p.authMode === "password" ? String(p.loginUsername || "").trim() : "";
   return username ? username + " · " + identity : identity;
 }
+function accountBatchLocked(p) {
+  return !!activeBatchRun && (activeBatchRun.groupKey === null || activeBatchRun.groupKey === accountGroupKey(p));
+}
 function renderAccountPreview(p) {
   const [label, cls] = status(p);
   const account = p.account || {};
@@ -410,20 +413,25 @@ function renderAccountPreview(p) {
     (p.accountHistoryError ? '<small><span class="warn">历史写入告警：' + esc(p.accountHistoryError) + '</span></small>' : '') + '</span>' +
     '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account)) + '">' +
     '<span class="account-preview-value"><button type="button" class="btn btn-primary account-preview-checkin" data-action="checkin" data-id="' + esc(p.id) + '" aria-label="' + esc(actionName + "：" + p.name) + '" title="' + esc(actionName + "：" + p.name) + '"' +
-    (busy ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
+    (busy || accountBatchLocked(p) ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
     '<small class="' + esc(cls) + '">' + esc(label) + '</small></span></div>';
 }
 function renderAccountGroup(group, index) {
   if (group.accounts.length === 1) return renderPlatformCard(group.accounts[0]);
   const summary = accountGroupSummary(group.accounts);
   const expanded = expandedAccountGroups.has(group.key);
+  const running = activeBatchRun && activeBatchRun.groupKey === group.key;
+  const busy = !!activeBatchRun || group.accounts.some((p) => p.loading || startingCheckins.has(p.id) || activeCheckins.has(p.id) || !!currentVisitProgress(p.id));
   const amount = summary.known && Number.isFinite(summary.total) ? "$" + summary.total.toFixed(4) : "—";
   const warnings = (summary.unknown ? " · " + summary.unknown + " 个余额未知" : "") +
     (summary.duplicates ? " · " + summary.duplicates + " 个重复身份配置未重复累计" : "");
-  return '<section class="account-group"><button class="account-group-toggle" data-action="toggle-group" data-group="' + esc(group.key) +
+  return '<section class="account-group"><div class="account-group-header"><button type="button" class="account-group-toggle" data-action="toggle-group" data-group="' + esc(group.key) +
     '" aria-expanded="' + expanded + '" aria-controls="account-group-' + index + '">' +
-    '<span><strong>' + (expanded ? "▾ " : "▸ ") + esc(group.key) + '</strong><small>' + group.accounts.length + ' 个账号配置' + esc(warnings) + '</small></span>' +
-    '<span class="account-group-total">' + amount + '<small>已知余额合计（最近快照）</small></span></button>' +
+    '<span><strong>' + (expanded ? "▾ " : "▸ ") + esc(group.key) + '</strong><small>' + group.accounts.length + ' 个账号配置' + esc(warnings) + '</small></span></button>' +
+    '<div class="account-group-actions"><span class="account-group-total">' + amount + '<small>已知余额合计（最近快照）</small></span>' +
+    '<button type="button" class="btn btn-primary account-group-checkin" data-action="checkin-group" data-group="' + esc(group.key) +
+    '" aria-label="' + esc("一键签到：" + group.key) + '" title="' + esc("依次处理此网址的全部账号：" + group.key) + '"' +
+    (busy ? " disabled" : "") + '>' + (running ? "签到中…" : "一键签到") + '</button></div></div>' +
     (expanded ? "" : '<div class="account-group-preview">' + group.accounts.map(renderAccountPreview).join("") + '</div>') +
     '<div id="account-group-' + index + '" class="account-group-cards"' + (expanded ? "" : " hidden") + '>' +
     (expanded ? group.accounts.map(renderPlatformCard).join("") : "") + '</div></section>';
@@ -477,7 +485,7 @@ function renderPlatformCard(p) {
     '<p class="message' + ((p.error || p.accountError) && !currentVisitProgress(p.id) && !cancelledCheckins.has(p.id) ? " err" : "") + '">' + esc(currentVisitProgress(p.id) || cancelledCheckins.get(p.id) || p.error || p.accountError || p.message || p.note || "尚未获取最新统计") + "</p>" +
     (p.accountHistoryError ? '<p class="message err">历史写入告警：' + esc(p.accountHistoryError) + '</p>' : '') +
     '<div class="card-actions">' +
-    '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">" + (isVisitOnly(p) ? (busy ? "访问中…" : "立即访问") : (busy ? "签到中…" : "立即签到")) + "</button>" +
+    '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (busy || accountBatchLocked(p) ? " disabled" : "") + ">" + (isVisitOnly(p) ? (busy ? "访问中…" : "立即访问") : (busy ? "签到中…" : "立即签到")) + "</button>" +
     '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
     (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
     '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
@@ -490,7 +498,7 @@ function renderPlatformCard(p) {
 async function checkin(id, options) {
   options = options || {};
   const p = platforms.find((x) => x.id === id);
-  if (!p || p.loading || activeCheckins.has(id) || startingCheckins.has(id)) return;
+  if (!p || p.loading || activeCheckins.has(id) || startingCheckins.has(id) || (!options.batch && accountBatchLocked(p))) return;
   const taskConfig = slim(p);
   const hasRunVersion = validStopVersion(options.stopVersion);
   const starting = { stopVersion: checkinStopVersion, cancelled: false };
@@ -598,8 +606,8 @@ async function refreshStats(id, silent) {
   if (!silent) toast(current.name + "：" + feedback, !r.ok || !!historyWarning);
 }
 
-async function runBatch(action, operation = null) {
-  for (const id of platforms.map((p) => p.id)) {
+async function runBatch(action, operation = null, ids = platforms.map((p) => p.id)) {
+  for (const id of ids) {
     if (operation && (operation.cancelled || operation.stopVersion !== checkinStopVersion)) {
       operation.cancelled = true;
       return { cancelled: true };
@@ -615,6 +623,34 @@ async function runBatch(action, operation = null) {
     }
   }
   return { cancelled: false };
+}
+
+async function batchCheckin(groupKey = null) {
+  if (activeBatchRun) return;
+  const accounts = groupKey === null ? platforms : platforms.filter((p) => accountGroupKey(p) === groupKey);
+  if (!accounts.length) return toast(groupKey === null ? "请先添加平台" : "此网址下没有账号", true);
+  if (groupKey !== null && accounts.some((p) => p.loading || startingCheckins.has(p.id) || activeCheckins.has(p.id) || !!currentVisitProgress(p.id))) return;
+  const ids = [...new Set(accounts.map((p) => p.id))];
+  const run = { id: ++batchRunSequence, stopVersion: checkinStopVersion, cancelled: false, groupKey };
+  activeBatchRun = run;
+  $("batchBtn").disabled = true;
+  render();
+  try {
+    run.stopVersion = await latestStopVersion();
+    if (activeBatchRun !== run || run.cancelled) return;
+    const outcome = await runBatch((id) => {
+      // 固定本轮账号列表；排队期间被删除或移到其他网址的账号不再执行。
+      if (groupKey !== null && !platforms.some((p) => p.id === id && accountGroupKey(p) === groupKey)) return;
+      return checkin(id, { batch: true, stopVersion: run.stopVersion });
+    }, run, ids);
+    if (activeBatchRun === run) toast((groupKey === null ? "批量签到" : "此网址签到") + (outcome.cancelled ? "已终止" : "完成"));
+  } finally {
+    if (activeBatchRun === run) {
+      activeBatchRun = null;
+      $("batchBtn").disabled = false;
+      render();
+    }
+  }
 }
 
 async function refreshAll() {
@@ -1382,10 +1418,11 @@ async function init() {
       return;
     }
     const btn = e.target.closest("button[data-action]");
-    if (!btn) return;
+    if (!btn || btn.disabled) return;
     const action = btn.dataset.action;
     const id = btn.dataset.id;
     if (action === "toggle-group") toggleAccountGroup(btn.dataset.group);
+    else if (action === "checkin-group") return batchCheckin(btn.dataset.group);
     else if (action === "checkin") checkin(id);
     else if (action === "stats") fetchStats(id, btn);
     else if (action === "edit") editPlatform(id);
@@ -1487,25 +1524,7 @@ async function init() {
   }
 
   if ($("stopCheckinBtn")) $("stopCheckinBtn").onclick = () => stopCheckin();
-  $("batchBtn").onclick = async () => {
-    if (!platforms.length) return toast("请先添加平台", true);
-    if (activeBatchRun) return;
-    const run = { id: ++batchRunSequence, stopVersion: checkinStopVersion, cancelled: false };
-    activeBatchRun = run;
-    $("batchBtn").disabled = true;
-    try {
-      run.stopVersion = await latestStopVersion();
-      if (activeBatchRun !== run || run.cancelled) return;
-      // 逐项等待后台全局队列完成登录、额度取数与保存，不并发发起签到。
-      const outcome = await runBatch((id) => checkin(id, { batch: true, stopVersion: run.stopVersion }), run);
-      if (activeBatchRun === run) toast(outcome.cancelled ? "批量签到已终止" : "批量签到完成");
-    } finally {
-      if (activeBatchRun === run) {
-        activeBatchRun = null;
-        $("batchBtn").disabled = false;
-      }
-    }
-  };
+  $("batchBtn").onclick = () => batchCheckin();
   $("refreshBtn").onclick = refreshAll;
 
   $("exportBtn").onclick = exportConfig;

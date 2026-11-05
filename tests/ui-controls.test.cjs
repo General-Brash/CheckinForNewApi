@@ -49,6 +49,14 @@ function platform(id, extra = {}) {
   };
 }
 
+function clickGroupCheckin(ui, key) {
+  const button = { dataset: { action: 'checkin-group', group: key }, disabled: false };
+  return ui.nodes.get('platformGrid').events.click({
+    target: { closest(selector) { return selector === 'button[data-action]' ? button : null; } },
+    preventDefault() {},
+  });
+}
+
 function uiHarness(htmlFile, initial = {}, options = {}) {
   const html = fs.readFileSync(path.join(root, htmlFile), 'utf8');
   const nodes = new Map();
@@ -525,6 +533,119 @@ for(const htmlFile of ['popup.html','sidebar.html']) {
     const html=h.nodes.get('platformGrid').innerHTML;
     assert.match(html,/1 个余额未知/);assert.match(html,/1 个重复身份配置未重复累计/);assert.match(html,/最近快照/);assert.match(h.nodes.get('totalQuota').innerHTML,/2\.0000/);
     h.value('toggleAccountGroup("https://api.example.test")');assert.match(h.nodes.get('platformGrid').innerHTML,/余额更新时间/);
+  });
+
+  test(`${htmlFile}: group check-in submits every matching configuration sequentially without toggling the group`, async () => {
+    const key = 'https://api.example.test';
+    const list = [
+      platform('first', { baseUrl: 'https://API.example.test/', userId: '12', account: { userId: '12', available: 500000 } }),
+      platform('other-path', { baseUrl: `${key}/other` }),
+      platform('visit', { baseUrl: key, visitOnly: true }),
+      platform('other-host'),
+      platform('duplicate', { baseUrl: key, userId: '12', account: { userId: '12', available: 500000 } }),
+      platform('other-protocol', { baseUrl: 'http://api.example.test' }),
+      platform('other-port', { baseUrl: 'https://api.example.test:8443' }),
+    ];
+    const ui = uiHarness(htmlFile, { [PLATFORMS]: list }); await ui.init();
+    const requests = [];
+    ui.setHandler((message, fallback) => {
+      if (message.type !== 'checkin') return fallback(message);
+      const task = deferred(); requests.push({ message, task }); return task.promise;
+    });
+    const run = clickGroupCheckin(ui, key);
+    await waitFor(() => requests.length === 1);
+    await clickGroupCheckin(ui, key);
+    await ui.nodes.get('batchBtn').onclick();
+    await ui.value('checkin("duplicate")');
+    await settle();
+    assert.equal(requests.length, 1, 'the first task must finish before any other group account is submitted');
+    assert.equal(ui.nodes.get('batchBtn').disabled, true, 'group and global batches share a lock');
+    assert.equal(ui.nodes.get('stopCheckinBtn').disabled, false);
+    assert.match(ui.nodes.get('platformGrid').innerHTML, /data-action="checkin-group"[^>]* disabled>签到中…<\/button>/);
+    assert.match(ui.nodes.get('platformGrid').innerHTML, /data-action="checkin" data-id="duplicate"[^>]* disabled>签到<\/button>/);
+    ui.value('toggleAccountGroup("https://api.example.test")');
+    assert.match(ui.nodes.get('platformGrid').innerHTML, /data-action="checkin" data-id="duplicate" disabled>立即签到<\/button>/);
+    await ui.value('checkin("duplicate")');
+    ui.value('toggleAccountGroup("https://api.example.test")');
+    assert.equal(ui.value('expandedAccountGroups.has("https://api.example.test")'), false);
+
+    requests[0].task.resolve({ ok: false, message: 'first failed' });
+    await waitFor(() => requests.length === 2);
+    assert.equal(ui.store[PLATFORMS][0].error, 'first failed', 'the first result is saved before the next account finishes');
+    assert.equal(requests[1].message.platform.visitOnly, true, 'visit-only settings are not overridden');
+    requests[1].task.resolve({ ok: true, visited: true, lastVisitDate: localToday(), message: '已访问' });
+    await waitFor(() => requests.length === 3);
+    requests[2].task.resolve({ ok: false, message: '今日已签到' });
+    await run;
+
+    assert.deepEqual(requests.map(({ message }) => message.platform.id), ['first', 'visit', 'duplicate']);
+    assert.ok(requests.every(({ message }) => message.batch === true && message.stopVersion === 0));
+    assert.equal(ui.value('platforms.find(p => p.id === "duplicate").stats.checked_in_today'), true);
+    assert.equal(ui.store[PLATFORMS].find((p) => p.id === 'visit').lastVisitDate, localToday());
+    assert.equal(ui.nodes.get('batchBtn').disabled, false);
+    assert.equal(ui.value('activeBatchRun'), null);
+    assert.equal(ui.value('expandedAccountGroups.has("https://api.example.test")'), false);
+    assert.match(ui.toasts.at(-1).text, /此网址签到完成/);
+
+    ui.value('toggleAccountGroup("https://api.example.test")');
+    ui.setHandler((message, fallback) => message.type === 'checkin' ? { ok: true, message: '完成' } : fallback(message));
+    await clickGroupCheckin(ui, key);
+    assert.equal(ui.value('expandedAccountGroups.has("https://api.example.test")'), true, 'expanded groups also keep their state');
+  });
+
+  test(`${htmlFile}: a group batch skips deleted or moved accounts and does not add new configurations mid-run`, async () => {
+    const key = 'https://api.example.test';
+    const list = ['first', 'moved', 'deleted', 'last'].map((id) => platform(id, { baseUrl: key }));
+    const ui = uiHarness(htmlFile, { [PLATFORMS]: list }); await ui.init();
+    const first = deferred();
+    ui.setHandler((message, fallback) => message.type === 'checkin'
+      ? message.platform.id === 'first' ? first.promise : { ok: true, message: '完成' }
+      : fallback(message));
+    const run = clickGroupCheckin(ui, key);
+    await waitFor(() => ui.messages.some((message) => message.type === 'checkin'));
+    ui.setStorage({ [PLATFORMS]: [list[0], { ...list[1], baseUrl: 'https://elsewhere.example.test' }, list[3], platform('new', { baseUrl: key })] });
+    first.resolve({ ok: true, message: '完成' }); await run;
+    assert.deepEqual(ui.messages.filter((message) => message.type === 'checkin').map((message) => message.platform.id), ['first', 'last']);
+    const count = ui.messages.length;
+    await clickGroupCheckin(ui, 'https://missing.example.test');
+    assert.equal(ui.messages.length, count, 'an unknown group never falls back to all platforms');
+  });
+
+  test(`${htmlFile}: group stop and restart preserve stop generations and an old result cannot unlock a new batch`, async () => {
+    const key = 'https://api.example.test';
+    const list = ['first', 'second', 'third'].map((id) => platform(id, { baseUrl: key }));
+    const ui = uiHarness(htmlFile, { [PLATFORMS]: list }); await ui.init();
+    const requests = [];
+    ui.setHandler((message, fallback) => {
+      if (message.type !== 'checkin') return fallback(message);
+      const task = deferred(); requests.push({ message, task }); return task.promise;
+    });
+    const oldRun = clickGroupCheckin(ui, key);
+    await waitFor(() => requests.length === 1);
+    await ui.nodes.get('stopCheckinBtn').onclick();
+    assert.equal(ui.value('activeBatchRun'), null);
+    assert.equal(ui.nodes.get('batchBtn').disabled, false);
+    const newRun = clickGroupCheckin(ui, key);
+    await waitFor(() => requests.length === 2);
+    assert.deepEqual(requests.map(({ message }) => message.stopVersion), [0, 1]);
+    requests[0].task.resolve({ ok: true, message: '迟到的旧结果', account: { available: 999999 } });
+    await oldRun;
+    assert.equal(ui.nodes.get('batchBtn').disabled, true);
+    assert.match(ui.nodes.get('platformGrid').innerHTML, /data-action="checkin-group"[^>]* disabled>签到中…<\/button>/);
+    assert.equal(ui.store[PLATFORMS][0].account.available, list[0].account.available);
+    assert.equal(ui.messages.filter((message) => message.type === 'savePlatforms').length, 0);
+
+    requests[1].task.resolve({ ok: true, message: '签到成功' });
+    await waitFor(() => requests.length === 3);
+    assert.equal(requests[2].message.platform.id, 'second');
+    assert.equal(requests[2].message.stopVersion, 1);
+    ui.setStorage({ [STOP_VERSION]: 2 });
+    requests[2].task.resolve({ ok: false, cancelled: true, code: 'CHECKIN_CANCELLED', message: '签到已终止' });
+    await newRun;
+    assert.equal(requests.length, 3, 'a stop from another window prevents the third account from starting');
+    assert.equal(ui.value('activeBatchRun'), null);
+    assert.equal(ui.nodes.get('batchBtn').disabled, false);
+    assert.doesNotMatch(ui.nodes.get('platformGrid').innerHTML, /disabled>签到中…<\/button>/);
   });
 }
 
