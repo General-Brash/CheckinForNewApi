@@ -248,7 +248,9 @@ async function executeCheckinScriptRaw(spec, control = null) {
     else if (name === "tabSubmitPasswordLogin") args[3] = control.token;
     else if (name === "tabLogout") args[0] = control.token;
     else if (name === "tabDismissSiteNotice") args[1] = control.token;
+    else if (name === "tabRefreshNewApiDashboard") args[2] = control.token;
     else if (name === "tabFetchTurnstileCheckin") args[2] = control.token;
+    else if (name === "tabIkuuuPage") args[4] = control.token;
     injection.args = args;
     if (spec.target && spec.target.tabId != null) {
       control.pageTabIds.add(spec.target.tabId);
@@ -275,7 +277,14 @@ async function executeCheckinScriptRaw(spec, control = null) {
   }
   // executeScript itself cannot be aborted; injected request/wait bodies listen for stop,
   // and their returned values are checked before any follow-up click, navigation or write.
-  assertCheckinActive(control);
+  try { assertCheckinActive(control); }
+  catch (error) {
+    const trafficResult = result && result[0] && result[0].result;
+    if (spec.func === tabIkuuuPage && spec.args[1] === "checkin" && trafficResult && trafficResult.ok && trafficResult.checkedIn) {
+      error.trafficCheckinEvidence = trafficResult;
+    }
+    throw error;
+  }
   return result;
 }
 // 只处理目标站点的公告专用按钮，绝不按泛化的“关闭/允许”文本点击。
@@ -469,8 +478,8 @@ function historyTaskSnapshot(platform) {
 }
 function isCurrentHistoryTask(current, platform) {
   return !!current && sameHistoryTaskConfig(current, platform) &&
-    !!current.triggerSelf === !!platform.triggerSelf &&
-    ["checkinPath", "checkinMethod", "apiUserKey"].every((key) => String(current[key] || "") === String(platform[key] || "")) &&
+    (isTrafficSite(platform) || (!!current.triggerSelf === !!platform.triggerSelf &&
+      ["checkinPath", "checkinMethod", "apiUserKey"].every((key) => String(current[key] || "") === String(platform[key] || "")))) &&
     (platform[HISTORY_TASK_EPOCH] == null || platform[HISTORY_TASK_EPOCH] ===
       (accountHistoryEpochs.get(String(platform.id)) || 0));
 }
@@ -525,19 +534,33 @@ function recordAccountHistorySample(platform, account, month) {
     if (Number.isFinite(at) && at < ACCOUNT_HISTORY.getSampleTimeRange(now).start) return false;
     const identity = ACCOUNT_HISTORY.identityFor({ ...platform, account });
     const sample = ACCOUNT_HISTORY.createSample(account, sampleMonth, at);
-    if (!identity || !sample || !Number.isFinite(sample.balance) || at > now) {
+    const traffic = account.kind === "traffic";
+    const validSample = sample && (traffic
+      ? sample.kind === "traffic" && Number.isFinite(sample.remainingTrafficBytes) && sample.remainingTrafficBytes >= 0
+      : sample.kind !== "traffic" && Number.isFinite(sample.balance));
+    const matchesSample = (item) => item.at === at && (sample.kind === "traffic"
+      ? item.kind === "traffic" && item.remainingTrafficBytes === sample.remainingTrafficBytes
+      : item.kind !== "traffic" && item.balance === sample.balance);
+    if (!identity || !validSample || !Number.isFinite(at) || at > now) {
       throw new Error("在线余额历史样本校验失败");
     }
     const current = await readValidatedAccountHistory();
     const next = ACCOUNT_HISTORY.appendSample(current, String(platform.id), identity, sample, now);
     const entry = next && next.accounts && next.accounts[String(platform.id)];
-    if (!entry || entry.identity !== identity || !entry.samples.some((item) => item.at === at && item.balance === sample.balance)) {
+    if (!entry || entry.identity !== identity || !entry.samples.some(matchesSample)) {
       throw new Error("在线余额历史样本未通过存储校验");
     }
     // A configuration save may have happened while the history read was pending.
     const latest = (await getPlatforms()).find((item) => String(item.id) === String(platform.id));
     if (!isCurrentHistoryTask(latest, platform)) return false;
     await setStore({ [ACCOUNT_HISTORY.STORAGE_KEY]: next });
+    if (traffic) {
+      const saved = await readValidatedAccountHistory();
+      const savedEntry = saved && saved.accounts && saved.accounts[String(platform.id)];
+      if (!savedEntry || savedEntry.identity !== identity || !Array.isArray(savedEntry.samples) || !savedEntry.samples.some(matchesSample)) {
+        throw new Error("在线流量历史样本未通过存后核验");
+      }
+    }
     account.historyWarning = "";
     await setAccountHistoryStatus(platform, "", new Date().toISOString(), account);
     return true;
@@ -589,7 +612,10 @@ async function savePlatforms(list, resetState = false) {
   const historyIdsToClear = new Set();
   const historyCleanupEpochs = new Map();
   await mutatePlatforms((current) => {
-    const next = list.map(({ loading, ...p }) => p);
+    const next = list.map(({ loading, ...p }) => {
+      if (isTrafficSite(p)) { validatePlatform(p); p = { ...p, baseUrl: new URL(p.baseUrl).origin, authMode: "cookie" }; }
+      return p;
+    });
     const nextById = new Map(next.map((p) => [String(p.id), p]));
     if (resetState) {
       for (const p of current) historyIdsToClear.add(String(p.id));
@@ -632,11 +658,21 @@ const saveSettings = (s) => setStore({ [KEY_SETTINGS]: normalizeSettings(s) });
 
 // ---------- 校验 ----------
 function validatePlatform(p) {
+  if (!AUTH_CONFIG.siteTypes.includes(AUTH_CONFIG.siteType(p))) throw new Error("不支持的站点类型");
   let url;
   try {
     url = new URL(p.baseUrl);
   } catch {
-    throw new Error("NewAPI 站点地址格式不正确");
+    throw new Error(isTrafficSite(p) ? "iKuuu 站点地址格式不正确" : "NewAPI 站点地址格式不正确");
+  }
+  if (isTrafficSite(p)) {
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("iKuuu 必须使用无内嵌凭据的 HTTPS 地址");
+    if (p.authMode && !["cookie", "password"].includes(p.authMode)) throw new Error("iKuuu 仅支持浏览器 Cookie 和可选登录凭据");
+    const username = String(p.loginUsername || "").trim();
+    const password = p.loginPassword;
+    if (password != null && typeof password !== "string") throw new Error("iKuuu 登录密码格式不正确");
+    if (!!username !== !!password) throw new Error("iKuuu 可选邮箱和密码必须同时填写或同时留空");
+    return;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
@@ -657,6 +693,7 @@ function validatePlatform(p) {
 }
 
 const isVisitOnly = (p) => AUTH_CONFIG.isVisitOnly(p);
+const isTrafficSite = (p) => AUTH_CONFIG.isTrafficSite(p);
 async function resolveSavedVisitOnly(p) {
   if (!p || p.id == null) return p;
   const stored = (await getPlatforms()).find((entry) => entry.id === p.id);
@@ -664,6 +701,7 @@ async function resolveSavedVisitOnly(p) {
 }
 async function assertApiAllowed(p, reqPath = "/api/user/checkin") {
   const current = await resolveSavedVisitOnly(p);
+  if (isTrafficSite(p) || isTrafficSite(current)) throw new Error("iKuuu 不使用 NewAPI 接口");
   if (!isVisitOnly(p) && !isVisitOnly(current)) return;
   // 仅访问只跳过签到动作，不禁止正常登录、额度、日志、模型或用户已配置的保活。
   const pathOf = (path) => decodeURIComponent(new URL(path, current.baseUrl).pathname).replace(/\/+$/, "");
@@ -676,6 +714,15 @@ async function assertApiAllowed(p, reqPath = "/api/user/checkin") {
 
 function sameTaskConfig(a, b) {
   if (!a || !b || isVisitOnly(a) !== isVisitOnly(b)) return false;
+  if (AUTH_CONFIG.siteType(a) !== AUTH_CONFIG.siteType(b)) return false;
+  if (isTrafficSite(a)) {
+    try {
+      return new URL(a.baseUrl).origin === new URL(b.baseUrl).origin &&
+        [a, b].every((p) => !p.authMode || ["cookie", "password"].includes(p.authMode)) &&
+        String(a.loginUsername || "").trim() === String(b.loginUsername || "").trim() &&
+        String(a.loginPassword || "") === String(b.loginPassword || "");
+    } catch { return false; }
+  }
   const mode = a.authMode || "token";
   if (mode !== (b.authMode || "token") ||
       String(a.baseUrl || "").trim().replace(/\/+$/, "") !== String(b.baseUrl || "").trim().replace(/\/+$/, "") ||
@@ -688,6 +735,7 @@ function sameTaskConfig(a, b) {
 }
 function historyIdentityBase(platform) {
   const raw = String(platform && platform.baseUrl || "").trim();
+  if (isTrafficSite(platform)) { try { return new URL(raw).origin; } catch { return raw; } }
   if (!raw || !ACCOUNT_HISTORY) return raw;
   // Use a fixed valid ID to ask the shared identity normalizer for only the site prefix.
   const identity = ACCOUNT_HISTORY.identityFor({ ...platform, id: "history-config-check", userId: "0", account: null });
@@ -712,17 +760,19 @@ function isSiteHost(base, host) {
 }
 // 两种显式 Agent Router 模式共享校验、账户检测及重登录链路，均不需要访问令牌。
 function isAgentRouterMode(p) {
-  return !!p && AUTH_CONFIG.isAgentRouterMode(p.authMode);
+  return !!p && !isTrafficSite(p) && AUTH_CONFIG.isAgentRouterMode(p.authMode);
 }
 function isAgentRouterReauthMode(p) {
+  if (isTrafficSite(p)) return false;
   return isAgentRouterMode(p) || (!!p && p.authMode === "cookie" && isSiteHost(p.baseUrl, "agentrouter.org"));
 }
 function isAgentRouterPasswordMode(p) {
-  return !!p && p.authMode === "password" && isSiteHost(p.baseUrl, "agentrouter.org");
+  return !!p && !isTrafficSite(p) && p.authMode === "password" && isSiteHost(p.baseUrl, "agentrouter.org");
 }
 function agentRouterProvider(p) { return AUTH_CONFIG.agentRouterProvider(p.authMode); }
 function agentRouterProviderLabel(provider) { return provider === "linuxdo" ? "Linux DO" : "GitHub"; }
 function isSelfTriggerMode(p) {
+  if (isTrafficSite(p)) return false;
   return isAgentRouterReauthMode(p) || (!!p && p.authMode === "password" && isSiteHost(p.baseUrl, "agentrouter.org")) ||
     (!!p && p.authMode === "cookie" && (isSiteHost(p.baseUrl, "ps.air-outer.com") || !!p.triggerSelf));
 }
@@ -2791,6 +2841,11 @@ async function publishAccountSnapshot(platform, account, control, month = curren
     assertCheckinActive(control);
     const current = list.find((entry) => entry.id === platform.id);
     if (isCurrentHistoryTask(current, metadata.platform)) {
+      if (isTrafficSite(platform)) {
+        const existing = current.account && current.account.kind === "traffic" && current.account.trafficAccountKey;
+        if (account.kind !== "traffic" || account.source !== "page" || !account.trafficAccountKey ||
+            existing && existing !== account.trafficAccountKey) throw new Error("iKuuu 保存的流量身份与页面不一致，未覆盖账户");
+      }
       current.account = { ...account };
       current.accountError = "";
       published = true;
@@ -2811,6 +2866,7 @@ function accountHistoryResponse(result) {
     message: String(result.message || "额度已更新") + (String(result.message || "").includes(suffix) ? "" : "｜" + suffix) };
 }
 function canSupplementAccountHistory(platform) {
+  if (isTrafficSite(platform)) return false;
   if (isSelfTriggerMode(platform) || isAgentRouterMode(platform) || platform.triggerSelf ||
       isSiteHost(platform.baseUrl, "agentrouter.org") || isSiteHost(platform.baseUrl, "ps.air-outer.com")) return false;
   try {
@@ -2921,13 +2977,13 @@ async function supplementMissingBalance(platform, control = null, budget = null)
   }
 }
 
-// 登录完成后只刷新本轮页面一次；所有取数均复用它，关闭后不再开页补取。
+// 所有 NewAPI 登录后的网页流程共用原生看板刷新，不重载文档。
 async function refreshLoginAccountOnTab(platform, tabId, readUser = null, control = null, verifiedUser = null) {
   platform = historyTaskSnapshot(platform);
+  if (isTrafficSite(platform)) throw new Error("原生看板刷新仅适用于 NewAPI 站点");
   const page = await chrome.tabs.get(tabId);
   const origin = new URL(platform.baseUrl).origin;
   if (!page.url || new URL(page.url).origin !== origin) throw new Error("账户页面已跳转到其他站点");
-  const onLoginPage = /^\/(login|signin|register|oauth)(\/|$)/i.test(new URL(page.url).pathname);
   const agentRouterPassword = isAgentRouterPasswordMode(platform);
   if (agentRouterPassword) {
     verifiedUser = verifiedUser || await waitVisitSession(platform, tabId, false, false, false, control);
@@ -2938,14 +2994,24 @@ async function refreshLoginAccountOnTab(platform, tabId, readUser = null, contro
   }
   const verifiedUserId = agentRouterPassword ? String(verifiedUser.id) : "";
   const dashboardPlatform = agentRouterPassword ? { ...platform, userId: verifiedUserId } : platform;
-  const dashboard = isAgentRouterReauthMode(platform) || agentRouterPassword;
-  visitStage(platform, control, "visit-refresh", "登录已确认，正在刷新本轮页面（仅一次）");
-  // OAuth 常落在令牌页；在本轮页硬导航到看板，已在看板时只刷新一次。
-  await waitVisitComplete(tabId, () => dashboard && !/^\/console\/?$/.test(new URL(page.url).pathname)
-    ? chrome.tabs.update(tabId, { url: origin + "/console", active: false })
-    : onLoginPage
-      ? chrome.tabs.update(tabId, { url: origin + "/", active: false })
-      : chrome.tabs.reload(tabId, { bypassCache: true }), control);
+  const dashboardBalance = isAgentRouterReauthMode(platform) || agentRouterPassword;
+  visitStage(platform, control, "visit-refresh", "登录已确认，正在刷新看板数据（不刷新页面）");
+  // 登录常落在首页或令牌页；只在需要时进入本轮标签页的看板。
+  if (!/^\/console\/?$/.test(new URL(page.url).pathname)) {
+    await waitVisitComplete(tabId, () => chrome.tabs.update(tabId, { url: origin + "/console", active: false }), control);
+  } else if (page.status !== "complete" || page.pendingUrl) {
+    await waitVisitComplete(tabId, null, control);
+  }
+  await dismissSiteNotice(tabId, origin, control);
+  // 新内核不再把 user 写入 localStorage；仅传递已在线核验的身份，不传额度或凭据。
+  const identity = verifiedUser ? { id: verifiedUser.id,
+    username: verifiedUser.username || "", display_name: verifiedUser.display_name || "" } : null;
+  const out = await executeCheckinScript({ target: { tabId }, world: "MAIN", func: tabRefreshNewApiDashboard,
+    args: [origin, String(dashboardPlatform.userId || "").trim(), "", identity] }, control);
+  const result = out && out[0] && out[0].result;
+  if (result && result.cancelled) throw checkinCancelledError();
+  if (result && result.userMismatch) throw accountMismatchError(dashboardPlatform.userId, result.actualUserId);
+  if (!result || !result.ok) throw new Error(result && result.message || "看板数据刷新失败，页面已保留");
   // 公告由下面的身份/看板读取循环检查，避免一次性注入在刷新竞态中提前终止任务。
   const user = agentRouterPassword
     ? async () => {
@@ -2956,7 +3022,7 @@ async function refreshLoginAccountOnTab(platform, tabId, readUser = null, contro
         display_name: verifiedUser.display_name || dashboardUser.display_name,
         email: verifiedUser.email || dashboardUser.email };
     }
-    : readUser || (dashboard
+    : readUser || (dashboardBalance
       ? () => waitAgentRouterAccountOnTab(platform, tabId, control)
       : () => waitVisitSession(platform, tabId, false, false, true, control));
   visitStage(platform, control, "visit-balance", "登录已确认，正在核验刷新后的账号并读取余额");
@@ -2973,9 +3039,118 @@ async function refreshLoginAccountOnTab(platform, tabId, readUser = null, contro
   visitStage(platform, control, "visit-final-identity", "余额已保存，正在最终核验账号");
   const finalUser = await user();
   Object.assign(account, accountFromSelf(finalUser, account.monthlyTokens, account.tokensTruncated, account._warn));
-  accountHistorySamples.delete(account); // Final online reread is genuinely a new balance sample.
+  accountHistorySamples.delete(account); // Final same-page reread is a new balance sample.
   await publishAccountSnapshot(platform, account, control, month);
   return account;
+}
+
+// 调用原看板按钮，让站点自身携带鉴权并更新统计；只监听本次 GET，不替换余额 DOM。
+function tabRefreshNewApiDashboard(expectedOrigin, configuredUserId, operationToken = "", verifiedIdentity = null) {
+  const token = String(operationToken || "");
+  const configured = String(configuredUserId || "").trim();
+  const cancelled = () => !!token && window.__nacheckinCancelledCheckinToken === token;
+  const samePage = () => location.origin === expectedOrigin && /^\/console\/?$/.test(location.pathname);
+  const visible = (el) => {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    const style = getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+  };
+  const busy = (button) => button.disabled || button.getAttribute("aria-disabled") === "true" ||
+    button.getAttribute("aria-busy") === "true" ||
+    button.classList.contains("semi-button-loading") ||
+    !!button.querySelector('.semi-icon-loading, .semi-icon-spinning, .semi-spin-spinning, svg[data-icon="spin"], .animate-spin');
+  const fail = (message) => ({ ok: false, message });
+  if (cancelled()) return { ok: false, cancelled: true };
+  if (!samePage()) return fail("刷新页面不属于本站数据看板");
+  return new Promise((resolve) => {
+    const proto = XMLHttpRequest.prototype;
+    const originalOpen = proto.open, originalSend = proto.send;
+    const requests = new WeakMap(), listeners = new Map();
+    let settled = false, clicked = false, refreshed = false, button = null, poll;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer); clearTimeout(poll);
+      window.removeEventListener("nacheckin:checkin-stop", onStop);
+      window.removeEventListener("pagehide", onPageHide);
+      if (proto.open === hookedOpen) proto.open = originalOpen;
+      if (proto.send === hookedSend) proto.send = originalSend;
+      for (const [xhr, handler] of listeners) xhr.removeEventListener("loadend", handler);
+      resolve(result);
+    };
+    const onStop = (event) => {
+      if (token && String(event.detail || "") === token) finish({ ok: false, cancelled: true });
+    };
+    const onPageHide = () => finish(fail("看板刷新期间页面已离开，未继续取数"));
+    function hookedOpen(method, url, ...args) {
+      try {
+        const parsed = new URL(String(url), location.origin);
+        if (String(method).toUpperCase() === "GET" && parsed.origin === expectedOrigin &&
+            /^\/api\/data(?:\/self)?\/?$/.test(parsed.pathname)) requests.set(this, true);
+      } catch {}
+      return Reflect.apply(originalOpen, this, [method, url, ...args]);
+    }
+    function hookedSend(...args) {
+      if (clicked && !settled && requests.has(this)) {
+        const xhr = this;
+        const completed = () => {
+          xhr.removeEventListener("loadend", completed); listeners.delete(xhr);
+          if (settled) return;
+          let body;
+          try { body = JSON.parse(xhr.responseText); } catch {}
+          if (xhr.status < 200 || xhr.status >= 300 || !body || body.success !== true || !Array.isArray(body.data)) {
+            finish(fail("看板刷新接口请求失败（HTTP " + (Number(xhr.status) || 0) + "），页面已保留"));
+          } else refreshed = true;
+        };
+        listeners.set(xhr, completed);
+        xhr.addEventListener("loadend", completed);
+      }
+      return Reflect.apply(originalSend, this, args);
+    }
+    const check = () => {
+      if (settled) return;
+      try {
+        if (cancelled()) { finish({ ok: false, cancelled: true }); return; }
+        if (!samePage()) { finish(fail("看板刷新期间页面已跳转")); return; }
+        let user;
+        try { user = JSON.parse(localStorage.getItem("user") || "null"); } catch {}
+        user = user || verifiedIdentity;
+        const id = user && ["number", "string"].includes(typeof user.id) && /^\d+$/.test(String(user.id)) ? String(user.id) : "";
+        if (id && configured && id !== configured) {
+          finish({ ok: false, userMismatch: true, actualUserId: id }); return;
+        }
+        if (clicked) {
+          if (!id) { finish(fail("看板刷新期间登录状态已失效")); return; }
+          if (refreshed && visible(button) && !busy(button)) { finish({ ok: true, refreshed: true }); return; }
+        } else if (id && document.readyState === "complete") {
+          const names = [user.username, user.display_name].filter((name) => typeof name === "string" && name.trim());
+          const candidates = new Set();
+          for (const heading of document.querySelectorAll("h1, h2, h3")) {
+            if (!visible(heading) || names.length && !names.some((name) => String(heading.textContent || "").split(/[\s,，:：!！]+/).includes(name))) continue;
+            for (const item of heading.parentElement?.querySelectorAll("button") || []) {
+              if (visible(item) && item.querySelector('span[aria-label="refresh"].semi-icon-refresh, svg.lucide-refresh-cw, svg.lucide-refresh-ccw')) candidates.add(item);
+            }
+          }
+          if (candidates.size > 1) { finish(fail("无法唯一确认看板右上角刷新按钮，未点击")); return; }
+          button = [...candidates][0];
+          if (button && !busy(button)) {
+            try {
+              proto.open = hookedOpen; proto.send = hookedSend;
+              clicked = true;
+              button.click();
+            } catch { finish(fail("无法调用看板刷新按钮，未重试")); return; }
+          }
+        }
+      } catch { finish(fail("无法读取看板刷新控件，页面已保留")); return; }
+      if (!settled) poll = setTimeout(check, 100);
+    };
+    const timer = setTimeout(() => finish(fail(clicked
+      ? "看板刷新接口未在 15 秒内完成，页面已保留，未重复点击"
+      : "未找到可用的看板右上角刷新按钮，页面已保留")), 15000);
+    window.addEventListener("nacheckin:checkin-stop", onStop);
+    window.addEventListener("pagehide", onPageHide);
+    check();
+  });
 }
 
 // 只读刷新后的数据看板 DOM；localStorage 仅用于身份/显示单位，不从中取余额。
@@ -3048,7 +3223,7 @@ function tabReadAgentRouterDashboard(expectedOrigin, configuredUserId) {
     quota, used_quota: parseNumber(usedText, true), request_count: parseNumber(requestsText),
     quota_per_unit: Number(localStorage.getItem("quota_per_unit")),
     _accountSource: "dashboard", _availableDisplay: balanceText,
-    _dashboardWarning: "额度来自刷新后的看板显示，精度以页面为准（金额通常保留两位小数）",
+    _dashboardWarning: "额度来自当前看板显示，刷新按钮仅更新统计；未额外核验实时余额，精度以页面为准（金额通常保留两位小数）",
   } } };
 }
 
@@ -3064,7 +3239,10 @@ async function waitAgentRouterAccountOnTab(platform, tabId, control = null) {
         const out = await executeCheckinScript({ target: { tabId }, world: "MAIN", func: tabReadAgentRouterDashboard,
           args: [new URL(platform.baseUrl).origin, String(platform.userId || "").trim()] }, control);
         result = out && out[0] && out[0].result;
-      } catch {} // 刷新后的 SPA 可能仍在初始化，不能退回缓存。
+      } catch (error) {
+        assertCheckinActive(control);
+        if (isCheckinControlError(error)) throw error;
+      } // 刷新后的 SPA 可能仍在初始化，不能退回缓存。
       if (result && result.message) lastMessage = result.message;
       if (result && result.userMismatch) throw accountMismatchError(platform.userId, result.actualUserId);
       const body = result && result.ok && result.body && result.body.success !== false && result.body;
@@ -3243,12 +3421,556 @@ async function runVisitOnly(platform, options, control = null) {
   }
 }
 
+// iKuuu only observes this owned page. It never calls NewAPI or replays a write.
+async function runTrafficSite(platform, action, parent = null, month = currentMonth()) {
+  const ownedControl = !parent;
+  const control = parent || balanceSupplementControl();
+  if (ownedControl) {
+    detachedOauthControls.add(control);
+    control.abortListener = () => broadcastCheckinPageStop(control);
+    control.controller.signal.addEventListener("abort", control.abortListener, { once: true });
+  }
+  let tab, confirmed = null, outcome;
+  const retain = async () => { if (tab && tab.id != null) await chrome.tabs.update(tab.id, { active: true }).catch(() => {}); };
+  try {
+    assertCheckinActive(control);
+    validatePlatform(platform);
+    let trustedAccount = null;
+    if (platform.id != null) {
+      const stored = (await getPlatforms()).find((p) => String(p.id) === String(platform.id));
+      if (stored) {
+        if (!sameTaskConfig(stored, platform)) throw new Error("iKuuu 配置已变更，本轮未执行，请重新检测或刷新");
+        trustedAccount = stored.account;
+      }
+    }
+    platform = historyTaskSnapshot({ ...platform, account: trustedAccount, baseUrl: new URL(platform.baseUrl).origin, authMode: "cookie" });
+    const origin = platform.baseUrl;
+    const savedKey = (p) => String(p.account && p.account.kind === "traffic" &&
+      p.account.source === "page" && p.account.trafficAccountKey || "");
+    let expectedKey = savedKey(platform);
+    const assertConfig = async () => {
+      assertCheckinActive(control);
+      if (platform.id == null) return;
+      const current = (await getPlatforms()).find((p) => String(p.id) === String(platform.id));
+      if (!isCurrentHistoryTask(current, platform)) throw new Error("iKuuu 配置已变更或删除，页面已保留，请重新执行");
+      const key = savedKey(current);
+      if (key && expectedKey && key !== expectedKey) throw new Error("iKuuu 保存的流量账号身份已变化，页面已保留");
+      if (key) expectedKey = key;
+    };
+    const inject = async (operation, payload = null) => {
+      const stage = ({ guard: "页面检查", read: "流量读取", login: "登录", checkin: "签到" })[operation] || "页面操作";
+      assertCheckinActive(control);
+      const page = await chrome.tabs.get(tab.id);
+      const url = new URL(page.url);
+      if (url.protocol !== "https:" || url.origin !== origin || page.status !== "complete") {
+        throw new Error("iKuuu 页面不在目标 HTTPS 站点或仍在导航，页面已保留");
+      }
+      let out;
+      try {
+        out = await executeCheckinScriptRaw({ target: { tabId: tab.id }, world: "MAIN", func: tabIkuuuPage,
+          args: [origin, operation, payload, expectedKey, control.token] }, control);
+      } catch (error) {
+        if (error.trafficCheckinEvidence) confirmed = error.trafficCheckinEvidence;
+        throw error;
+      }
+      const entry = out && out[0];
+      if (entry && entry.error) {
+        const error = new Error("iKuuu " + stage + "阶段页面脚本执行异常，页面已保留");
+        error.code = "TRAFFIC_PAGE_SCRIPT_ERROR";
+        throw error;
+      }
+      const result = entry && entry.result;
+      if (result && result.cancelled) { assertCheckinActive(control); throw checkinCancelledError(); }
+      if (!result || !result.ok) {
+        const error = new Error(result && result.message || "iKuuu " + stage + "阶段页面脚本没有返回结果，页面已保留");
+        if (!result || result.code === "TRAFFIC_PAGE_SCRIPT_ERROR") error.code = "TRAFFIC_PAGE_SCRIPT_ERROR";
+        throw error;
+      }
+      return result;
+    };
+    visitStage(platform, control, "traffic-open", "正在打开 iKuuu 用户页面并检查浏览器登录状态");
+    tab = await chrome.tabs.create({ url: origin + "/user", active: false });
+    if (!tab || tab.id == null) throw new Error("无法创建 iKuuu 临时页面");
+    await waitVisitComplete(tab.id, null, control, 20000);
+    const firstPage = await chrome.tabs.get(tab.id);
+    const firstUrl = new URL(firstPage.url);
+    if (firstUrl.protocol !== "https:" || firstUrl.origin !== origin) throw new Error("iKuuu 页面跳转到其他站点，页面已保留");
+    await inject("guard");
+    if (!/^\/auth\/login\/?$/.test(firstUrl.pathname)) {
+      await waitVisitComplete(tab.id, () => chrome.tabs.reload(tab.id, { bypassCache: true }), control, 20000);
+    }
+    let page = await inject("read");
+    if (page.state === "logged-out") {
+      if (!String(platform.loginUsername || "").trim() || !platform.loginPassword) {
+        throw new Error("iKuuu 浏览器 Cookie 已掉登录，请在保留页面登录或配置可选邮箱密码");
+      }
+      await assertConfig();
+      visitStage(platform, control, "traffic-login", "Cookie 已掉登录，正在检查本站原生登录表单");
+      const submitted = await inject("login", { username: String(platform.loginUsername).trim(), password: platform.loginPassword });
+      if (submitted.state !== "authenticated") throw new Error("iKuuu 登录未获得明确认证结果，页面已保留");
+      markCheckinProgress(control, "traffic-login-response", true);
+      await waitVisitComplete(tab.id, null, control, 15000);
+      const deadline = Date.now() + 12000;
+      for (;;) {
+        assertCheckinActive(control);
+        try { page = await inject("read"); }
+        catch (error) {
+          assertCheckinActive(control);
+          const current = await chrome.tabs.get(tab.id).catch(() => null);
+          if (!current || current.status === "complete" || Date.now() >= deadline) throw error;
+          await wait(250, control);
+          continue;
+        }
+        if (page.state === "logged-in") break;
+        if (Date.now() >= deadline) throw new Error("iKuuu 登录响应后未确认用户页面，页面已保留");
+        await wait(250, control);
+      }
+    }
+    if (page.state !== "logged-in" || !page.account || !page.account.trafficAccountKey) {
+      throw new Error("iKuuu 没有可确认的页面用户名或剩余流量，页面已保留");
+    }
+    expectedKey = page.account.trafficAccountKey;
+    // First Cookie detection binds the current visible nickname, not the email.
+    // Subsequent reads must use this saved key, including slim UI messages.
+    await assertConfig();
+    markCheckinProgress(control, "traffic-identity:" + expectedKey, true);
+    let account = page.account;
+    if (action === "checkin") {
+      // Bind this online identity before a write, even if the post-click read fails.
+      await publishAccountSnapshot(platform, account, control, month);
+      await assertConfig();
+      visitStage(platform, control, "traffic-checkin", "正在核验签到状态及原按钮的业务响应");
+      // Recheck the saved visit-only switch immediately before the single click.
+      const latest = await resolveSavedVisitOnly(platform);
+      if (isVisitOnly(latest)) throw new Error("已启用仅访问，本轮未点击 iKuuu 签到按钮，请重新访问");
+      confirmed = await inject("checkin");
+      if (!confirmed.checkedIn) throw new Error("iKuuu 未取得明确签到业务证据，页面已保留");
+      markCheckinProgress(control, "traffic-checkin-confirmed", true);
+      if (confirmed.clicked) {
+        // Do not label the pre-click balance as a new balance if refresh fails.
+        account = null;
+        try {
+          visitStage(platform, control, "traffic-refresh", "签到已确认，正在同页刷新剩余流量");
+          await waitVisitComplete(tab.id, () => chrome.tabs.reload(tab.id, { bypassCache: true }), control, 20000);
+          page = await inject("read");
+          if (page.state !== "logged-in" || !page.account) throw new Error("刷新后没有有效在线流量");
+          account = page.account;
+          await assertConfig();
+        } catch (error) {
+          if (isCheckinControlError(error)) throw error;
+          outcome = { ok: true, siteType: "ikuuu", outcome: confirmed.outcome,
+            message: confirmed.message + "｜签到已确认，但流量刷新失败：" + error.message,
+            data: { stats: { checked_in_today: true } }, account: null,
+            accountWarning: "流量刷新失败：" + error.message };
+          await retain();
+          return outcome;
+        }
+      } else {
+        page = await inject("read");
+        if (page.state !== "logged-in" || !page.account) throw new Error("今日签到已确认，但当前流量读取失败");
+        account = page.account;
+      }
+    }
+    await assertConfig();
+    await publishAccountSnapshot(platform, account, control, month);
+    await assertConfig();
+    outcome = accountHistoryResponse({ ok: true, siteType: "ikuuu",
+      ...(action === "checkin" ? { outcome: confirmed.outcome, data: { stats: { checked_in_today: true } }, message: confirmed.message }
+        : { data: { stats: { checked_in_today: page.checkedIn === true } }, message: "iKuuu 在线身份及剩余流量已更新" }),
+      account,
+      ...(action === "visit" ? { visited: true, lastVisitDate: todayStr(), lastVisitedAt: new Date().toISOString(),
+        message: "iKuuu 访问完成，已更新剩余流量（未点击签到）" } : {}) });
+    if (AUTH_CONFIG.shouldLogoutAfterVisit(platform)) outcome.message += "｜iKuuu 不自动退出，浏览器登录态已保留";
+    assertCheckinActive(control);
+    try { await chrome.tabs.remove(tab.id); }
+    catch { outcome.message += "｜临时页关闭失败，请手动关闭"; await retain(); }
+    return outcome;
+  } catch (error) {
+    await retain();
+    if (confirmed && confirmed.checkedIn) {
+      const result = { ok: true, siteType: "ikuuu", outcome: confirmed.outcome, account: null,
+        data: { stats: { checked_in_today: true } }, message: confirmed.message + "｜流量刷新未完成：" + error.message,
+        accountWarning: "流量刷新未完成：" + error.message };
+      if (isCheckinControlError(error)) {
+        // A stop cannot undo an already observed business result; no new reads.
+        await persistCheckinResult(platform, result, null, null);
+        throw error;
+      }
+      return result;
+    }
+    if (isCheckinControlError(error)) throw error;
+    return { ok: false, siteType: "ikuuu", message: error.message || "iKuuu 操作失败，页面已保留", error: error.message };
+  } finally {
+    if (ownedControl) { detachedOauthControls.delete(control); finishCheckinControl(control); }
+    try { chrome.runtime.sendMessage({ type: "visitProgress", id: platform.id, phase: "done", message: "",
+      stopVersion: control.stopVersion }, () => { void chrome.runtime.lastError; }); } catch {}
+  }
+}
+
+async function tabIkuuuPage(expectedOrigin, action, payload = null, expectedKey = "", operationToken = "") {
+  const stage = ({ guard: "页面检查", read: "流量读取", login: "登录", checkin: "签到" })[action] || "页面操作";
+  try {
+  const token = String(operationToken || "");
+  const cancelled = () => !!token && window.__nacheckinCancelledCheckinToken === token;
+  const visible = (node) => {
+    if (!node || !node.isConnected || !node.getClientRects().length) return false;
+    const style = getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse" && style.opacity !== "0";
+  };
+  const text = (node) => node ? String(node.innerText || node.textContent || "").replace(/\s+/g, " ").trim() : "";
+  const cleanMessage = (value) => typeof value === "string" ? value.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 240) : "";
+  const samePage = () => location.protocol === "https:" && location.origin === expectedOrigin;
+  const fail = (message) => ({ ok: false, message });
+  const challenge = () => {
+    if (Array.from(document.querySelectorAll('[id="2fa-form"], [id="2fa-code"], #email-verification-form, .email-verify-form, .reverse-email-verify-form, input[autocomplete="one-time-code"]')).some(visible)) {
+      return "iKuuu 要求二次验证或邮箱验证，请在保留页面人工完成后重试";
+    }
+    if (typeof window.loginPhase === "string" && ["totp", "email_code", "reverse_email_verify"].includes(window.loginPhase)) {
+      return "iKuuu 要求二次验证或邮箱验证，请在保留页面人工完成后重试";
+    }
+    let captchaReady;
+    try { captchaReady = window.Captcha && typeof window.Captcha.isReady === "function" ? Boolean(window.Captcha.isReady()) : null; }
+    catch { return "iKuuu 验证码组件异常，页面已保留"; }
+    if (captchaReady === false || Array.from(document.querySelectorAll('.geetest_panel, .geetest_panel_box, .geetest-error-message, .g-recaptcha, .h-captcha, .cf-turnstile, iframe[src*="captcha"], iframe[src*="challenges.cloudflare.com"]')).some(visible) ||
+        captchaReady !== true && Array.from(document.querySelectorAll('.captcha-form-item, .embed-captcha, .geetest-onloading-placeholder')).some(visible)) {
+      return "iKuuu 需要人工完成验证码或安全验证，页面已保留";
+    }
+    const body = text(document.body);
+    if (/^(?:Just a moment|Attention Required|Verify you are human)|Checking your browser|验证您是真人|检查您的浏览器|安全验证中/i.test(body)) {
+      return "iKuuu 被安全验证拦截，请在保留页面人工处理";
+    }
+    return "";
+  };
+  const pageError = () => {
+    for (const node of document.querySelectorAll('.swal2-popup, .sweet-alert, .alert-danger, .login-error, [role="alert"]')) {
+      if (!visible(node)) continue;
+      const message = text(node);
+      if (/验证码|二步|二次验证|动态密码|验证邮箱|验证身份|verification.required|captcha|two.factor/i.test(message)) return message.slice(0, 240);
+      if (/失败|错误|出错|无效|不正确|拒绝|error|failed|invalid|denied/i.test(message)) return message.slice(0, 240);
+    }
+    return "";
+  };
+  const loginForm = () => {
+    const email = document.querySelector("#email"), password = document.querySelector("#password");
+    const button = document.querySelector('button[type="submit"].login');
+    const form = button && button.form;
+    return email && password && button && form && email.form === form && password.form === form
+      ? { email, password, button, form } : null;
+  };
+  const username = () => {
+    const names = Array.from(document.querySelectorAll(".navbar .nav-link-user")).filter(visible)
+      .map((node) => { const match = String(node.innerText || node.textContent || "").trim().match(/^Hi\s*[,，]\s*([\s\S]+)$/i); return match ? match[1].trim() : ""; }).filter(Boolean);
+    const links = Array.from(document.querySelectorAll(".navbar a[href]"));
+    const hasLink = (path) => links.some((node) => {
+      try { const url = new URL(node.getAttribute("href"), location.href); return url.origin === expectedOrigin && url.pathname.replace(/\/$/, "") === path; } catch { return false; }
+    });
+    if (!names.length || new Set(names).size !== 1 || !hasLink("/user/profile") || !hasLink("/user/logout")) return null;
+    return names[0];
+  };
+  const identity = () => {
+    const name = username();
+    if (!name) return fail("iKuuu 页面没有可确定的用户名，不能用数字用户ID或凭据猜测身份，页面已保留");
+    if (name.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+      return fail("iKuuu 页面昵称过长或包含控制字符，无法安全确认身份，页面已保留");
+    }
+    let key;
+    try { key = encodeURIComponent(name.trim().toLowerCase()); }
+    catch { return fail("iKuuu 页面昵称无法安全编码，页面已保留"); }
+    if (!key || key.length > 1536) return fail("iKuuu 页面昵称编码超出身份长度限制，页面已保留");
+    if (expectedKey && key !== expectedKey) return fail("iKuuu 当前页面账号与保存的流量账号不一致，页面已保留，未切换账号或签到");
+    return { ok: true, name, key };
+  };
+  const checkinState = () => {
+    const container = document.querySelector("#checkin-div");
+    if (!container || !visible(container)) return { checkedIn: false, button: null };
+    const already = /明日再来|今日已签到|今天已签到|已经签到|已签到|come\s+back\s+tomorrow|already\s+(?:checked|signed)|daily\s+bonus\s+(?:received|claimed)/i;
+    const nodes = Array.from(container.querySelectorAll("button, a")).filter(visible);
+    if (already.test(text(container))) return { checkedIn: true, button: null };
+    const buttons = nodes.filter((node) => /签到|check\s*in|daily\s+bonus/i.test(text(node)) &&
+      !node.disabled && !node.classList.contains("disabled") && node.getAttribute("aria-disabled") !== "true");
+    return { checkedIn: false, button: buttons.length === 1 ? buttons[0] : null };
+  };
+  const readAccount = (user) => {
+    const cardFor = (heading) => {
+      const nodes = Array.from(document.querySelectorAll("h4")).filter((node) => visible(node) && text(node) === heading);
+      return nodes.length === 1 ? nodes[0].closest(".card") : null;
+    };
+    const card = cardFor("剩余流量"), body = card && card.querySelector(".card-body");
+    const display = text(body);
+    const match = display.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|PB)$/i);
+    if (!body || !visible(body) || !match) return fail("iKuuu 剩余流量缺少有效数值或单位，页面已保留");
+    const bytes = Number(match[1]) * Math.pow(1024, ["B", "KB", "MB", "GB", "TB", "PB"].indexOf(match[2].toUpperCase()));
+    if (!Number.isFinite(bytes) || bytes < 0) return fail("iKuuu 剩余流量数值无效，页面已保留");
+    const member = cardFor("会员时长"), memberBody = member && member.querySelector(".card-body");
+    const daysMatch = visible(memberBody) && text(memberBody).match(/^(\d+)\s*天$/);
+    const days = daysMatch ? Number(daysMatch[1]) : null;
+    const expiryText = member && text(member.querySelector(".card-stats"));
+    const expiryMatch = expiryText && expiryText.match(/(\d{4}-\d{2}-\d{2})\s*过期/);
+    let expiry = expiryMatch ? expiryMatch[1] : null;
+    if (expiry) {
+      const date = new Date(expiry + "T00:00:00Z");
+      if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== expiry) expiry = null;
+    }
+    return { ok: true, account: { kind: "traffic", remainingTrafficBytes: bytes, remainingTrafficDisplay: display,
+      membershipDays: Number.isSafeInteger(days) && days >= 0 ? days : null, membershipExpiresAt: expiry,
+      displayName: user.name, trafficAccountKey: user.key, source: "page", updatedAt: new Date().toISOString(), historyWarning: "" } };
+  };
+  const probe = () => {
+    if (cancelled()) return { ok: false, cancelled: true };
+    if (!samePage()) return fail("iKuuu 页面已离开目标 HTTPS 站点，页面已保留");
+    const warning = challenge() || pageError();
+    if (warning) return fail(warning);
+    if (/^\/auth\/login\/?$/.test(location.pathname) && loginForm()) return { ok: true, state: "logged-out" };
+    if (!/^\/user(?:\/|$)/.test(location.pathname)) return fail("iKuuu 页面不是已确认的用户页或登录页，页面已保留");
+    const user = identity();
+    if (!user.ok) return user;
+    const account = readAccount(user);
+    if (!account.ok) return account;
+    return { ...account, state: "logged-in", checkedIn: checkinState().checkedIn };
+  };
+  if (action === "read") {
+    const deadline = Date.now() + 12000;
+    let stableKey = "", stableSince = 0;
+    for (;;) {
+      const result = probe();
+      const name = username();
+      const mismatch = name && expectedKey && encodeURIComponent(name.trim().toLowerCase()) !== expectedKey;
+      if (result.ok && result.account) {
+        const key = JSON.stringify([result.account.trafficAccountKey, result.account.remainingTrafficDisplay,
+          result.account.membershipDays, result.account.membershipExpiresAt]);
+        if (key !== stableKey) { stableKey = key; stableSince = Date.now(); }
+        if (Date.now() - stableSince >= 600) return result;
+      } else if (result.ok || result.cancelled || challenge() || pageError() || !samePage() || mismatch) return result;
+      else stableKey = "";
+      if (Date.now() >= deadline) return result.ok ? fail("iKuuu 流量读数尚未稳定，页面已保留") : result;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  if (!samePage()) return fail("iKuuu 操作页面不属于目标 HTTPS 站点");
+  if (cancelled()) return { ok: false, cancelled: true };
+  const initialWarning = challenge() || pageError();
+  if (initialWarning) return fail(initialWarning);
+  if (action === "guard") return { ok: true };
+  let button, requestPath, loginParts;
+  const safeLoginForm = (parts) => {
+    if (!samePage() || !/^\/auth\/login\/?$/.test(location.pathname) || !parts ||
+        parts.email.type !== "email" || parts.password.type !== "password" || !visible(parts.email) || !visible(parts.password) ||
+        !visible(parts.button) || parts.button.disabled) return false;
+    const safeAction = (value, placeholderAllowed) => {
+      const raw = String(value || "").trim();
+      if (placeholderAllowed && raw === "javascript:void(0);") return true;
+      try { const url = new URL(raw || location.href, location.href); return url.protocol === "https:" && url.origin === expectedOrigin && /^\/auth\/login\/?$/.test(url.pathname) && !url.username && !url.password && !url.search && !url.hash; }
+      catch { return false; }
+    };
+    if (String(parts.form.getAttribute("method") || "GET").toUpperCase() !== "POST" || !safeAction(parts.form.getAttribute("action"), true)) return false;
+    if (parts.button.hasAttribute("formmethod") && parts.button.getAttribute("formmethod").toUpperCase() !== "POST") return false;
+    if (parts.button.hasAttribute("formaction") && !safeAction(parts.button.getAttribute("formaction"), true)) return false;
+    return true;
+  };
+  if (action === "login") {
+    const parts = loginForm();
+    if (!safeLoginForm(parts) || !payload || typeof payload.password !== "string" || !payload.password || !payload.username) {
+      return fail("iKuuu 登录表单的 HTTPS 同源地址、POST 方法或字段未通过安全核验，页面已保留");
+    }
+    loginParts = parts;
+    button = parts.button;
+    requestPath = "/auth/login";
+  } else if (action === "checkin") {
+    const state = probe();
+    if (!state.ok || state.state !== "logged-in") return state.ok ? fail("iKuuu 会话已掉登录，未点击签到") : state;
+    const checkin = checkinState();
+    if (checkin.checkedIn) return { ok: true, checkedIn: true, clicked: false, outcome: "already", message: "iKuuu 今日已签到（新页面已确认）" };
+    if (!checkin.button) return fail("iKuuu 没有唯一可用的签到按钮，未执行签到，页面已保留");
+    button = checkin.button;
+    if (button.tagName === "A") {
+      const url = new URL(button.getAttribute("href") || "#", location.href);
+      if (url.origin !== expectedOrigin || url.pathname !== location.pathname || url.search !== location.search) return fail("iKuuu 签到链接会导航到其他页面，未点击");
+    }
+    requestPath = "/user/checkin";
+  } else return fail("不支持的 iKuuu 页面动作");
+  return await new Promise((resolve) => {
+    const proto = XMLHttpRequest.prototype;
+    const originalOpen = proto.open, originalSend = proto.send, originalAbort = proto.abort;
+    const meta = new WeakMap(), listeners = new Map();
+    let finished = false, clicked = false, sent = false, stopped = false, settled = false;
+    let targetXhr, pendingResult, timer, poll;
+    const blockSubmit = (event) => { event.preventDefault(); };
+    const finish = (result) => {
+      if (finished) return;
+      if (sent && !settled) {
+        // Keep the queue and hooks until the actual target request has ended.
+        if (!pendingResult) {
+          pendingResult = { ...result, message: (result.message || "iKuuu 写请求已停止") +
+            "｜浏览器中止请求不代表服务器撤回，结果未确认，请人工查验，页面已保留，未自动重试" };
+          Reflect.apply(originalAbort, targetXhr, []);
+          // abort() also leaves UNSENT when send() failed before starting.
+          if (!settled && (targetXhr.readyState === 0 || targetXhr.readyState === 4)) {
+            settled = true;
+            finish(pendingResult);
+          }
+        }
+        return;
+      }
+      if (!result.ok && (stopped || cancelled())) result = { ...result, cancelled: true };
+      finished = true;
+      clearTimeout(timer); clearInterval(poll);
+      if (proto.open === hookedOpen) proto.open = originalOpen;
+      if (proto.send === hookedSend) proto.send = originalSend;
+      for (const [xhr, listener] of listeners) {
+        xhr.removeEventListener("loadend", listener);
+        xhr.removeEventListener("readystatechange", listener, true);
+      }
+      document.removeEventListener("submit", blockSubmit, true);
+      button.removeEventListener("click", blockSubmit, true);
+      if (action === "login" && HTMLFormElement.prototype.submit === blockedNativeSubmit) HTMLFormElement.prototype.submit = originalNativeSubmit;
+      window.removeEventListener("nacheckin:checkin-stop", onStop);
+      resolve(result);
+    };
+    const onStop = (event) => {
+      if (token && String(event.detail || "") !== token) return;
+      stopped = true;
+      if (!sent || action === "login") finish({ ok: false, cancelled: true });
+    };
+    const originalNativeSubmit = HTMLFormElement.prototype.submit;
+    function blockedNativeSubmit() { /* Native submit would bypass the site's login handler. */ }
+    function hookedOpen(method, url, ...rest) {
+      let target;
+      try { target = new URL(String(url), location.href); } catch {}
+      meta.set(this, { method: String(method).toUpperCase(), url: target });
+      return Reflect.apply(originalOpen, this, [method, url, ...rest]);
+    }
+    function hookedSend(...args) {
+      const info = meta.get(this);
+      const targetWrite = info && info.url && info.method === "POST" && info.url.protocol === "https:" &&
+        info.url.origin === expectedOrigin && info.url.pathname === requestPath && !info.url.search && !info.url.hash &&
+        !info.url.username && !info.url.password;
+      if (!finished && clicked && action === "login" && !targetWrite) {
+        finish(fail("iKuuu 登录处理器尝试非目标同源 POST，请求已阻止，页面已保留"));
+        throw new Error("非目标登录请求已阻止");
+      }
+      if (!finished && clicked && targetWrite) {
+        if (sent) throw new Error("重复写请求已阻止");
+        if (cancelled() || stopped || !samePage() || challenge() ||
+            action === "login" && (!safeLoginForm(loginParts) || loginForm().button !== button ||
+              loginParts.password.value !== payload.password || loginParts.email.value !== String(payload.username))) {
+          finish(cancelled() || stopped ? { ok: false, cancelled: true } : fail(challenge() || "iKuuu 提交时页面或表单安全核验失败"));
+          throw new Error("iKuuu 写请求已停止");
+        }
+        const xhr = this;
+        const onEnd = (event) => {
+          if (finished || settled || xhr.readyState !== 4 && event.type !== "loadend") return;
+          settled = true;
+          if (pendingResult) { finish(pendingResult); return; }
+          if (action === "login" && (stopped || cancelled())) { finish({ ok: false, cancelled: true }); return; }
+          if (xhr.status === 0) {
+            finish(fail("iKuuu 写请求超时、中止或网络失败，服务器结果未确认，请人工查验，页面已保留，未自动重试")); return;
+          }
+          if (!samePage()) { finish(fail("iKuuu 响应期间页面离开目标站点，未确认结果")); return; }
+          let responseUrl, body;
+          try {
+            responseUrl = new URL(xhr.responseURL);
+            body = xhr.responseType === "json" ? xhr.response : JSON.parse(xhr.responseText);
+          } catch { finish(fail("iKuuu 写请求没有有效 JSON 业务响应，页面已保留")); return; }
+          if (responseUrl.origin !== expectedOrigin || responseUrl.pathname !== requestPath || xhr.status < 200 || xhr.status >= 300 || !body || typeof body !== "object" || Array.isArray(body)) {
+            finish(fail("iKuuu 写请求网络失败或响应来源异常（HTTP " + xhr.status + "），页面已保留")); return;
+          }
+          const message = cleanMessage(body.msg || body.message);
+          const warning = challenge();
+          if (["totp", "email_code", "reverse_email_verify"].includes(body.phase) || /captcha|verification_required|two.factor|验证码|验证邮箱|二步|二次验证|动态密码/i.test(String(body.result || "") + " " + message) || warning) {
+            finish(fail(warning || "iKuuu 要求验证码或二次验证，页面已保留，请人工完成后重试")); return;
+          }
+          if (action === "login") {
+            finish(body.phase === "authenticated" ? { ok: true, state: "authenticated" }
+              : fail("iKuuu 登录失败或结果不明确：" + (message || "未返回 authenticated 认证状态") + "，页面已保留"));
+            return;
+          }
+          const already = /明日再来|今日已签到|今天已签到|已经签到|已签到|重复签到|签到过|already\s+(?:checked\s*in|signed\s*in|today)|today\s+already/i.test(message);
+          const negative = /失败|错误|无效|不足|拒绝|未成功|不成功|error|failed|invalid|denied|not\s+success/i.test(message);
+          const flagSuccess = body.ret === 1 || body.ret === "1" || body.ret === true || body.success === true || body.success === 1 || body.success === "1";
+          const flagFailure = Object.prototype.hasOwnProperty.call(body, "ret") && ![1, "1", true].includes(body.ret) ||
+            Object.prototype.hasOwnProperty.call(body, "success") && ![1, "1", true].includes(body.success);
+          const retNumber = typeof body.ret === "number" || typeof body.ret === "string" && body.ret.trim() !== ""
+            ? Number(body.ret) : NaN;
+          const negativeRet = Number.isFinite(retNumber) && retNumber < 0;
+          const messageSuccess = /签到成功|成功签到|签到.*(?:获得|获取).*流量|(?:check.?in|daily\s+bonus).*(?:success|received|claimed)|^(?:success|successful)(?:[.!\s]|$)/i.test(message);
+          if (!negative && !negativeRet && (already || !flagFailure && (flagSuccess || messageSuccess))) {
+            finish({ ok: true, checkedIn: true, clicked: true, outcome: already ? "already" : "ok", message: already ? "iKuuu 今日已签到" : "iKuuu 签到成功" });
+          } else finish(fail("iKuuu 签到业务失败或缺少明确成功证据：" + (message || "响应未明确 ret/success/message 成功") + "，页面已保留"));
+        };
+        listeners.set(xhr, onEnd);
+        // Capture the actual response before jQuery's load handler navigates or
+        // resets CAPTCHA. The hook is temporary and never sends another request.
+        xhr.addEventListener("readystatechange", onEnd, true);
+        xhr.addEventListener("loadend", onEnd);
+        xhr.timeout = 25000;
+        targetXhr = xhr;
+        sent = true;
+        try { return Reflect.apply(originalSend, xhr, args); }
+        catch (error) {
+          finish(fail("iKuuu 原生 XHR 发送失败，结果未确认，请人工查验，页面已保留，未重试"));
+          throw error;
+        }
+      }
+      return Reflect.apply(originalSend, this, args);
+    }
+    try {
+      proto.open = hookedOpen; proto.send = hookedSend;
+      if (action === "login") {
+        document.addEventListener("submit", blockSubmit, true);
+        HTMLFormElement.prototype.submit = blockedNativeSubmit;
+      }
+      button.addEventListener("click", blockSubmit, true);
+      window.addEventListener("nacheckin:checkin-stop", onStop);
+      timer = setTimeout(() => finish(stopped || cancelled() ? { ok: false, cancelled: true }
+        : fail("iKuuu 未在 25 秒内取得此次按钮点击的明确 XHR 业务响应，页面已保留，未重试")), 25000);
+      poll = setInterval(() => {
+        if (cancelled()) { stopped = true; if (!sent || action === "login") finish({ ok: false, cancelled: true }); return; }
+        const warning = challenge() || pageError();
+        if (warning) finish(fail(warning));
+      }, 150);
+      if (action === "login") {
+        if (!safeLoginForm(loginParts) || challenge() || cancelled()) {
+          finish(cancelled() ? { ok: false, cancelled: true } : fail(challenge() || "iKuuu 填写前登录表单安全核验失败")); return;
+        }
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+        setter.call(loginParts.email, String(payload.username));
+        setter.call(loginParts.password, payload.password);
+        for (const field of [loginParts.email, loginParts.password]) {
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+          field.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        if (!loginParts.email.validity.valid) { finish(fail("iKuuu 原生登录表单要求有效邮箱，页面已保留")); return; }
+      }
+      const warning = challenge() || pageError();
+      if (warning || cancelled() || !samePage() || action === "login" &&
+          (!safeLoginForm(loginParts) || loginForm().button !== button || loginParts.password.value !== payload.password)) {
+        finish(cancelled() ? { ok: false, cancelled: true } : fail(warning || "iKuuu 提交前安全核验失败")); return;
+      }
+      if (action === "checkin") {
+        const user = identity();
+        if (!user.ok || checkinState().button !== button) { finish(user.ok ? fail("iKuuu 签到按钮状态已变化，未点击") : user); return; }
+      }
+      clicked = true;
+      button.click();
+    } catch { finish(fail("iKuuu 原生按钮点击或监听失败，页面已保留，未重试")); }
+  });
+  } catch (error) {
+    let errorType = "Error";
+    try {
+      if (error && ["Error", "SyntaxError", "TypeError", "ReferenceError", "RangeError", "URIError", "EvalError", "DOMException", "SecurityError", "InvalidStateError"].includes(error.name)) errorType = error.name;
+    } catch {}
+    return { ok: false, code: "TRAFFIC_PAGE_SCRIPT_ERROR",
+      message: "iKuuu " + stage + "阶段页面脚本异常（" + errorType + "），页面已保留" };
+  }
+}
+
 // 签到 / 仅访问
 async function runCheckin(platform, options) {
   const control = options && options.control || null;
   try {
     assertCheckinActive(control);
     platform = historyTaskSnapshot(await resolveSavedVisitOnly(platform));
+    if (isTrafficSite(platform)) return await runTrafficSite(platform, isVisitOnly(platform) ? "visit" : "checkin", control);
     if (isVisitOnly(platform)) return await runVisitOnly(platform, options, control);
     // Agent Router 通过退出并重新登录签到；其他自触发兼容站点仍使用 GET 请求。
     const isSelfTrigger = isSelfTriggerMode(platform);
@@ -3359,6 +4081,11 @@ async function fetchMonthlyTokens(platform, month, read, control = null) {
 
 async function fetchAccount(platform, month, reuseSelfData, read, control = null, balanceAccount = null) {
   platform = historyTaskSnapshot(platform);
+  if (isTrafficSite(platform)) {
+    const result = await runTrafficSite(platform, "read", control, month);
+    if (!result.ok || !result.account) throw new Error(result.message || "无法读取 iKuuu 流量");
+    return result.account;
+  }
   month = month || currentMonth();
   validatePlatform(platform);
   if (!read && await isAgentRouterReauthPending(platform)) {
@@ -3468,6 +4195,7 @@ function unverifiedOauthConfig(platform) {
 
 async function runStats(platform, month) {
   platform = historyTaskSnapshot(await resolveSavedVisitOnly(platform));
+  if (isTrafficSite(platform)) return await runTrafficSite(platform, "read", null, month);
   // 配置校验失败不能靠账户缓存降级为连接成功。
   try { validatePlatform(platform); }
   catch (e) { return { ok: false, message: e.message, error: e.message }; }
@@ -3565,6 +4293,7 @@ async function rawGetJson(p, reqPath, query) {
 
 // 只有「访问令牌」模式能由 Service Worker 直连；另两种模式复用站点登录态。
 function isTokenAuthMode(p) {
+  if (isTrafficSite(p)) return false;
   return !p || !p.authMode || p.authMode === "token";
 }
 
@@ -4126,6 +4855,7 @@ async function buildLogFallbackDetail(read, name, range) {
 }
 
 async function runModelInsight(platform, hours) {
+  if (isTrafficSite(platform)) return { ok: false, message: "iKuuu 流量站点不支持 NewAPI 模型指标" };
   try {
     validatePlatform(platform);
   } catch (e) {
@@ -4206,6 +4936,7 @@ async function runModelInsight(platform, hours) {
 
 // 单模型明细：分组维度的首字延迟与时间序列。
 async function runModelDetail(platform, model, hours) {
+  if (isTrafficSite(platform)) return { ok: false, message: "iKuuu 流量站点不支持 NewAPI 模型明细" };
   const name = String(model || "").trim();
   if (!name) return { ok: false, message: "缺少模型名称" };
   try {
@@ -4259,6 +4990,8 @@ function mergeStats(platform, data, message, ok) {
 // 分类签到结果：成功 / 今日已签到 / 失败
 function classify(result) {
   if (result.visited) return "visited";
+  if (result.outcome === "already") return "already";
+  if (result.siteType === "ikuuu" && !result.ok) return "fail";
   if (result.reauthRequired || result.pending) return "pending";
   if (result.ok) return "ok";
   if (isAlreadyCheckinMessage(result.message))
@@ -4284,6 +5017,7 @@ const normalizeKeepAlive = (ka) => {
 };
 const getKeepAlive = (p) => normalizeKeepAlive(p && p.keepAlive);
 const needsKeepAliveToday = (p) => {
+  if (isTrafficSite(p)) return false;
   const ka = getKeepAlive(p);
   return !!(ka.enabled && ka.lastDate !== todayStr());
 };
@@ -4429,8 +5163,10 @@ async function retryKeepAliveWithModels(format, url, key, tried, control = null)
   return { ok: false, tried: used, error: lastError };
 }
 async function runKeepAliveCall(p, control = null) {
+  if (isTrafficSite(p)) return { ok: false, message: "iKuuu 流量站点不启用 NewAPI 保活" };
   if (control) { control.stageLabel = "正在执行已启用的 API 保活（不是签到接口）"; markCheckinProgress(control, "keepalive-start"); }
   p = await resolveSavedVisitOnly(p);
+  if (isTrafficSite(p)) return { ok: false, message: "iKuuu 流量站点不启用 NewAPI 保活" };
   const ka = getKeepAlive(p);
   if (!ka.enabled) return null;
   const format = ka.format;
@@ -4463,6 +5199,7 @@ async function runKeepAliveCall(p, control = null) {
 }
 async function listKeepAliveModels(p) {
   p = await resolveSavedVisitOnly(p);
+  if (isTrafficSite(p)) return { ok: false, message: "iKuuu 流量站点不支持保活模型" };
   const ka = getKeepAlive(p);
   if (!ka.enabled) return { ok: false, message: "请先开启「自动调用 API」开关" };
   const format = ka.format;
@@ -4735,6 +5472,8 @@ async function persistCheckinResult(platform, result, alive = null, control = ac
     const p = list.find((entry) => entry.id === platform.id);
     const accountTask = result.account && accountHistorySamples.get(result.account);
     if (!isCurrentHistoryTask(p, platform) || (accountTask && !isCurrentHistoryTask(p, accountTask.platform))) return list;
+    if (isTrafficSite(p) && result.account && p.account && p.account.kind === "traffic" &&
+        p.account.trafficAccountKey && p.account.trafficAccountKey !== result.account.trafficAccountKey) return list;
     if (alive) p.keepAlive = normalizeKeepAlive(platform.keepAlive);
     delete p.loading;
     p.taskResultRevision = (Number(p.taskResultRevision) || 0) + 1;
@@ -4742,12 +5481,15 @@ async function persistCheckinResult(platform, result, alive = null, control = ac
     p.error = result.ok ? "" : result.message;
     p.reauthPending = !!result.reauthRequired;
     if (result.reauthRequired) p.reauthStartedAt = result.reauthStartedAt;
-    if (result.account) { p.account = Object.assign({}, p.account || {}, result.account); p.accountError = ""; }
+    if (result.account) { p.account = result.account.kind === "traffic" ? { ...result.account } : Object.assign({}, p.account || {}, result.account); p.accountError = ""; }
+    if (isTrafficSite(p) && result.accountWarning) p.accountError = result.accountWarning;
     if (result.visited) {
       p.lastVisitDate = result.lastVisitDate;
       p.lastVisitedAt = result.lastVisitedAt;
     } else if (!isVisitOnly(p)) p.lastCheckinAt = new Date().toISOString();
-    if (!result.visited && !isVisitOnly(p) && !result.reauthRequired && (result.ok || isAlreadyCheckinMessage(result.message))) {
+    if (!result.visited && !isVisitOnly(p) && !result.reauthRequired &&
+        (isTrafficSite(p) ? result.ok && result.data && result.data.stats && result.data.stats.checked_in_today === true
+          : result.ok || isAlreadyCheckinMessage(result.message))) {
       p.stats = { ...(p.stats || {}), ...(result.data && result.data.stats || {}), checked_in_today: true };
       p.statsDate = todayStr();
     }
@@ -4777,8 +5519,8 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null,
           p.keepAlive = normalizeKeepAlive(Object.assign({}, ka, { lastDate: today }));
         }
       }
-      const alreadyVisited = isVisitOnly(p) && p.lastVisitDate === today;
-      const alreadyToday = !isVisitOnly(p) && !!(p.stats && p.stats.checked_in_today && p.statsDate === today);
+      const alreadyVisited = !isTrafficSite(p) && isVisitOnly(p) && p.lastVisitDate === today;
+      const alreadyToday = !isTrafficSite(p) && !isVisitOnly(p) && !!(p.stats && p.stats.checked_in_today && p.statsDate === today);
       const r = explicitSelection && alreadyVisited
         ? { ok: true, visited: true, message: "今日已访问", data: null, lastVisitDate: p.lastVisitDate, lastVisitedAt: p.lastVisitedAt }
         : explicitSelection && alreadyToday
@@ -4854,6 +5596,7 @@ async function findUncheckedPlatforms(platforms, historyBudget = { attempted: ne
   for (let p of platforms) results.push(await withPlatformSession(p, async () => {
     assertCheckinActive(control);
     p = await resolveSavedVisitOnly(p);
+    if (isTrafficSite(p)) return p;
     if ((isVisitOnly(p) && p.lastVisitDate === todayStr()) ||
         (!isVisitOnly(p) && p.stats && p.stats.checked_in_today && p.statsDate === todayStr())) {
       await supplementMissingBalance(p, control, historyBudget);
@@ -5014,7 +5757,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (isVisitOnly(stored)) msg = { ...msg, platform: stored };
       }
       if (msg.type === "getCapabilities") {
-        sendResponse({ ok: true, authBuild: AUTH_CONFIG.build, authModes: [...AUTH_CONFIG.modes], version: chrome.runtime.getManifest().version });
+        sendResponse({ ok: true, authBuild: AUTH_CONFIG.build, authModes: [...AUTH_CONFIG.modes], siteTypes: [...AUTH_CONFIG.siteTypes], version: chrome.runtime.getManifest().version });
       } else if (msg.type === "savePlatforms") {
         if (!Array.isArray(msg.platforms)) throw new Error("平台配置格式必须为数组");
         await savePlatforms(msg.platforms, msg.resetState === true);

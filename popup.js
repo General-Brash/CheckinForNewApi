@@ -133,7 +133,67 @@ function sendRaw(msg) {
 }
 const AUTH_CONFIG = globalThis.NACheckinAuth;
 const AUTH_MODES = AUTH_CONFIG.modes;
+const siteType = (p) => AUTH_CONFIG.siteType(p);
+const isTrafficSite = (p) => AUTH_CONFIG.isTrafficSite(p);
+const usesLoginCredentials = (p) => AUTH_CONFIG.usesLoginCredentials(p);
 const isAgentRouterMode = (p) => AUTH_CONFIG.isAgentRouterMode(p.authMode);
+const TRAFFIC_BYTES_PER_GB = 1024 ** 3;
+let lastNewApiAuthMode = "token";
+function normalizeTrafficBaseUrl(value) {
+  const raw = String(value || "").trim();
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && !url.username && !url.password ? url.origin : raw;
+  } catch { return raw; }
+}
+function trafficNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function confirmedTrafficAccountKey(account) {
+  if (!account || account.source !== "page" || typeof account.trafficAccountKey !== "string") return null;
+  const key = account.trafficAccountKey;
+  try {
+    const username = decodeURIComponent(key);
+    return key.length <= 1536 && username.length > 0 && username.length <= 128 && !/[\u0000-\u001f\u007f]/.test(username) &&
+      encodeURIComponent(username.trim().toLowerCase()) === key ? key : null;
+  } catch { return null; }
+}
+function accountForSite(p, account) {
+  if (!account || typeof account !== "object") return null;
+  if (!isTrafficSite(p)) return account.kind === "traffic" ? null : account;
+  if (account.kind !== "traffic" || account.source !== "page") return null;
+  return {
+    kind: "traffic",
+    remainingTrafficBytes: trafficNumber(account.remainingTrafficBytes),
+    remainingTrafficDisplay: typeof account.remainingTrafficDisplay === "string" && account.remainingTrafficDisplay.trim() ? account.remainingTrafficDisplay : null,
+    membershipDays: Number.isInteger(account.membershipDays) && account.membershipDays >= 0 ? account.membershipDays : null,
+    membershipExpiresAt: typeof account.membershipExpiresAt === "string" && /^\d{4}-\d{2}-\d{2}$/.test(account.membershipExpiresAt) ? account.membershipExpiresAt : null,
+    displayName: typeof account.displayName === "string" && account.displayName.trim() ? account.displayName : null,
+    trafficAccountKey: confirmedTrafficAccountKey(account),
+    source: "page",
+    updatedAt: account.updatedAt,
+    historyWarning: typeof account.historyWarning === "string" ? account.historyWarning : "",
+  };
+}
+function normalizeSiteConfig(p) {
+  if (!isTrafficSite(p)) return p.account && p.account.kind === "traffic" ? { ...p, account: null } : p;
+  return {
+    ...p, siteType: "ikuuu", baseUrl: normalizeTrafficBaseUrl(p.baseUrl), authMode: "cookie",
+    userId: "", accessToken: "", loginUsername: String(p.loginUsername || "").trim(),
+    loginPassword: typeof p.loginPassword === "string" ? p.loginPassword : "",
+    logoutAfterVisit: false, keepAlive: { ...normalizeKeepAlive(p.keepAlive), enabled: false },
+    ...(Object.hasOwn(p, "account") ? { account: accountForSite(p, p.account) } : {}),
+  };
+}
+function trafficDisplay(account) {
+  if (!account || account.kind !== "traffic") return "—";
+  if (typeof account.remainingTrafficDisplay === "string" && account.remainingTrafficDisplay.trim()) return account.remainingTrafficDisplay;
+  const bytes = trafficNumber(account.remainingTrafficBytes);
+  return bytes === null ? "—" : (bytes / TRAFFIC_BYTES_PER_GB).toFixed(2) + " GB";
+}
+function membershipDisplay(account) {
+  return account && account.kind === "traffic" && Number.isInteger(account.membershipDays) && account.membershipDays >= 0 ? account.membershipDays + " 天" : "—";
+}
 const AUTH_REQUEST_TYPES = new Set(["test", "stats", "account", "checkin", "modelInsight", "modelDetail", "testKeepAlive", "keepAliveModels", "savePlatforms", "autoRun", "stopCheckin"]);
 // 修改源码后，现有扩展后台可能仍运行旧代码。先握手，不能将新模式交给旧 token 校验。
 // 不缓存握手结果：同一页面存活期间 Service Worker 也可能更新/恢复。
@@ -141,8 +201,11 @@ async function send(msg) {
   if (AUTH_REQUEST_TYPES.has(msg.type)) {
     const capabilities = await sendRaw({ type: "getCapabilities" });
     const mode = msg.platform && (msg.platform.authMode || "token");
+    const trafficRequest = msg.platform && isTrafficSite(msg.platform) ||
+      Array.isArray(msg.platforms) && msg.platforms.some(isTrafficSite);
     if (!capabilities || !capabilities.ok || capabilities.authBuild !== AUTH_CONFIG.build ||
-        !Array.isArray(capabilities.authModes) || (mode && !capabilities.authModes.includes(mode))) {
+        !Array.isArray(capabilities.authModes) || (mode && !capabilities.authModes.includes(mode)) ||
+        trafficRequest && (!Array.isArray(capabilities.siteTypes) || !capabilities.siteTypes.includes("ikuuu"))) {
       return { ok: false, code: "BACKGROUND_UPDATE_REQUIRED", message: "扩展界面与后台版本不一致，请在扩展管理页点击本扩展的「重新加载」，再关闭并重新打开侧边栏（不要只刷新站点网页）" };
     }
   }
@@ -150,12 +213,13 @@ async function send(msg) {
 }
 const isVisitOnly = (p) => NACheckinAuth.isVisitOnly(p);
 const slim = (p) => ({
-  id: p.id, baseUrl: p.baseUrl, userId: p.userId, authMode: p.authMode, visitOnly: isVisitOnly(p),
-  logoutAfterVisit: NACheckinAuth.shouldLogoutAfterVisit(p),
-  accessToken: !p.authMode || p.authMode === "token" ? p.accessToken : "",
-  ...(p.authMode === "password" ? { loginUsername: String(p.loginUsername || "").trim(), loginPassword: p.loginPassword } : {}),
+  id: p.id, siteType: siteType(p), baseUrl: isTrafficSite(p) ? normalizeTrafficBaseUrl(p.baseUrl) : p.baseUrl,
+  userId: isTrafficSite(p) ? "" : p.userId, authMode: isTrafficSite(p) ? "cookie" : p.authMode, visitOnly: isVisitOnly(p),
+  logoutAfterVisit: !isTrafficSite(p) && NACheckinAuth.shouldLogoutAfterVisit(p),
+  accessToken: !isTrafficSite(p) && (!p.authMode || p.authMode === "token") ? p.accessToken : "",
+  ...(usesLoginCredentials(p) ? { loginUsername: String(p.loginUsername || "").trim(), loginPassword: typeof p.loginPassword === "string" ? p.loginPassword : "" } : {}),
 });
-const slimFull = (p) => ({ id: p.id, ...slim(p), keepAlive: normalizeKeepAlive(p.keepAlive) });
+const slimFull = (p) => ({ id: p.id, ...slim(p), keepAlive: { ...normalizeKeepAlive(p.keepAlive), ...(isTrafficSite(p) ? { enabled: false } : {}) } });
 const getStats = (p, month) =>
   send({ type: "stats", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 const doCheckin = (p, opts = {}) =>
@@ -167,15 +231,28 @@ const getModelDetail = (p, model, hours) => send({ type: "modelDetail", platform
 
 // ---------- 校验 ----------
 function validatePlatform(p) {
+  if (p.siteType && !AUTH_CONFIG.siteTypes.includes(p.siteType)) throw new Error("不支持的站点类型");
   let url;
   try {
     url = new URL(p.baseUrl);
   } catch {
-    throw new Error("NewAPI 站点地址格式不正确");
+    throw new Error("站点地址格式不正确");
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
   if (p.authMode && !AUTH_MODES.includes(p.authMode)) throw new Error("不支持的鉴权方式");
+  if (isTrafficSite(p)) {
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("流量站点必须使用无内嵌凭据的 HTTPS 地址");
+    if (typeof p.loginPassword !== "string" && p.loginPassword != null) throw new Error("登录密码必须是字符串");
+    if (!!String(p.loginUsername || "").trim() !== !!p.loginPassword) throw new Error("恢复登录的账号和密码请都留空或都填写");
+    p.baseUrl = url.origin;
+    p.authMode = "cookie";
+    p.userId = "";
+    p.accessToken = "";
+    p.logoutAfterVisit = false;
+    p.keepAlive = { ...normalizeKeepAlive(p.keepAlive), enabled: false };
+    return p;
+  }
   const ka = normalizeKeepAlive(p.keepAlive);
   if (ka.enabled) {
     if (ka.url && !safeHttpUrl(ka.url))
@@ -220,10 +297,10 @@ function mergeStatsInto(id, data, message, ok, account) {
     if (data.min_quota != null) p.stats.min_quota = data.min_quota;
   } else {
     // 额度刷新独立于访问/签到结果；兼容旧版本把取数错误写入 p.error 的记录。
-    if (/^获取账户额度失败[：:]/.test(p.error || "")) p.error = "";
+    if (/^获取账户(?:额度|流量)失败[：:]/.test(p.error || "")) p.error = "";
     p.accountError = ok ? "" : message;
   }
-  if (account) p.account = account;
+  if (account) p.account = accountForSite(p, account);
 }
 
 function validStopVersion(value) {
@@ -323,18 +400,19 @@ function releaseCheckinOperation(id, operation) {
 
 // ---------- 渲染 ----------
 function status(p) {
+  const refreshLabel = isTrafficSite(p) ? "流量刷新失败" : "额度刷新失败";
   if (p.loading || currentVisitProgress(p.id)) return ["处理中", "badge-muted"];
   if (cancelledCheckins.has(p.id)) return ["已终止", "badge-muted"];
   if (isVisitOnly(p)) {
-    if (p.error) return [/^获取账户额度失败[：:]/.test(p.error) ? "额度刷新失败" : "访问失败", "badge-danger"];
-    if (p.accountError) return ["额度刷新失败", "badge-danger"];
+    if (p.error) return [/^获取账户(?:额度|流量)失败[：:]/.test(p.error) ? refreshLabel : "访问失败", "badge-danger"];
+    if (p.accountError) return [refreshLabel, "badge-danger"];
     return p.lastVisitDate === todayStr() ? ["今日已访问", "badge-success"] : ["仅访问", "badge-warning"];
   }
   // checked_in_today 来自缓存，必须由 statsDate 锚定当天，否则跨天后视为待签到
   if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return ["今日已签到", "badge-success"];
   if (p.reauthPending) return ["等待登录", "badge-warning"];
   if (p.error) return ["请求失败", "badge-danger"];
-  if (p.accountError) return ["额度刷新失败", "badge-danger"];
+  if (p.accountError) return [refreshLabel, "badge-danger"];
   return ["待签到", "badge-warning"];
 }
 
@@ -351,6 +429,7 @@ function accountGroupKey(p) {
   try {
     const url = new URL(p.baseUrl);
     if (!/^https?:$/.test(url.protocol)) throw new Error("invalid");
+    if (isTrafficSite(p)) return "ikuuu|" + url.origin;
     // 保留部署路径和端口；不同 API 实例不能只因域名相同而合并。
     return url.origin + url.pathname.replace(/\/+$/, "");
   } catch { return "invalid:" + p.id; }
@@ -368,9 +447,12 @@ function accountGroupSummary(accounts) {
   const unique = new Map();
   let duplicates = 0;
   for (const p of accounts) {
-    // 只对在线确认过的用户 ID 去重，未确认身份的配置不猜测归属。
-    const id = p.account && p.account.userId;
-    const key = id != null && /^\d+$/.test(String(id)) ? "user:" + id : "config:" + p.id;
+    // 只对在线确认过的身份去重，未确认身份的配置不猜测归属。
+    const acc = accountForSite(p, p.account);
+    const id = acc && acc.userId;
+    const key = isTrafficSite(p)
+      ? acc && acc.trafficAccountKey ? "traffic:" + acc.trafficAccountKey : "config:" + p.id
+      : id != null && /^\d+$/.test(String(id)) ? "user:" + id : "config:" + p.id;
     const previous = unique.get(key);
     if (previous) {
       duplicates++;
@@ -380,20 +462,29 @@ function accountGroupSummary(accounts) {
     unique.set(key, p);
   }
   let total = 0, known = 0, unknown = 0;
+  const traffic = accounts.length > 0 && isTrafficSite(accounts[0]);
   for (const p of unique.values()) {
-    const acc = p.account || {};
-    const amount = quotaNumber(acc.available), unit = quotaUnitFor(acc);
+    const acc = accountForSite(p, p.account) || {};
+    const amount = traffic ? trafficNumber(acc.remainingTrafficBytes) : quotaNumber(acc.available);
+    const unit = traffic ? TRAFFIC_BYTES_PER_GB : quotaUnitFor(acc);
     const value = amount !== null && unit !== null ? amount / unit : NaN;
     if (!Number.isFinite(value)) { unknown++; continue; }
     total += value; known++;
   }
-  return { total, known, unknown, duplicates };
+  return { total, known, unknown, duplicates, traffic };
 }
-function accountUpdatedLabel(account) {
+function accountUpdatedLabel(account, traffic = false) {
   const date = new Date(account && account.updatedAt || "");
-  return Number.isFinite(date.getTime()) ? "余额更新时间：" + date.toLocaleString() : "余额更新时间未知";
+  const name = traffic ? "流量" : "余额";
+  return Number.isFinite(date.getTime()) ? name + "更新时间：" + date.toLocaleString() : name + "更新时间未知";
 }
 function accountIdentity(p) {
+  if (isTrafficSite(p)) {
+    const acc = accountForSite(p, p.account) || {};
+    let username = "";
+    try { username = acc.trafficAccountKey ? decodeURIComponent(acc.trafficAccountKey) : ""; } catch (_) {}
+    return [acc.displayName, username ? "账号 " + username : "尚未确认账号"].filter(Boolean).join(" · ");
+  }
   const id = p.account && p.account.userId || p.userId;
   const identity = id ? "用户 ID " + id : "尚未确认用户 ID";
   const username = p.authMode === "password" ? String(p.loginUsername || "").trim() : "";
@@ -404,16 +495,18 @@ function accountBatchLocked(p) {
 }
 function renderAccountPreview(p) {
   const [label, cls] = status(p);
-  const account = p.account || {};
+  const traffic = isTrafficSite(p);
+  const account = accountForSite(p, p.account) || {};
   const busy = p.loading || startingCheckins.has(p.id) || activeCheckins.has(p.id) || !!currentVisitProgress(p.id);
   const visitOnly = isVisitOnly(p);
   const actionLabel = visitOnly ? (busy ? "访问中…" : "访问") : (busy ? "签到中…" : "签到");
   const actionName = visitOnly ? "访问" : "快捷签到";
-  return '<div class="account-preview-row"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small>' +
+  return '<div class="account-preview-row' + (traffic ? ' traffic-preview' : '') + '"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small>' +
     (p.accountHistoryError ? '<small><span class="warn">历史写入告警：' + esc(p.accountHistoryError) + '</span></small>' : '') + '</span>' +
-    '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account)) + '">' +
+    '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account, traffic)) + '">' +
     '<span class="account-preview-value"><button type="button" class="btn btn-primary account-preview-checkin" data-action="checkin" data-id="' + esc(p.id) + '" aria-label="' + esc(actionName + "：" + p.name) + '" title="' + esc(actionName + "：" + p.name) + '"' +
-    (busy || accountBatchLocked(p) ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
+    (busy || accountBatchLocked(p) ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(traffic ? trafficDisplay(account) : formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
+    (traffic ? '<small class="account-preview-membership"' + (account.membershipExpiresAt ? ' title="到期日：' + esc(account.membershipExpiresAt) + '"' : '') + '>会员 ' + esc(membershipDisplay(account)) + '</small>' : '') +
     '<small class="' + esc(cls) + '">' + esc(label) + '</small></span></div>';
 }
 function renderAccountGroup(group, index) {
@@ -422,15 +515,16 @@ function renderAccountGroup(group, index) {
   const expanded = expandedAccountGroups.has(group.key);
   const running = activeBatchRun && activeBatchRun.groupKey === group.key;
   const busy = !!activeBatchRun || group.accounts.some((p) => p.loading || startingCheckins.has(p.id) || activeCheckins.has(p.id) || !!currentVisitProgress(p.id));
-  const amount = summary.known && Number.isFinite(summary.total) ? "$" + summary.total.toFixed(4) : "—";
-  const warnings = (summary.unknown ? " · " + summary.unknown + " 个余额未知" : "") +
+  const amount = summary.known && Number.isFinite(summary.total) ? (summary.traffic ? summary.total.toFixed(2) + " GB" : "$" + summary.total.toFixed(4)) : summary.traffic ? "— GB" : "—";
+  const groupLabel = summary.traffic ? normalizeTrafficBaseUrl(group.accounts[0].baseUrl) + " · iKuuu" : group.key;
+  const warnings = (summary.unknown ? " · " + summary.unknown + (summary.traffic ? " 个流量未知" : " 个余额未知") : "") +
     (summary.duplicates ? " · " + summary.duplicates + " 个重复身份配置未重复累计" : "");
   return '<section class="account-group"><div class="account-group-header"><button type="button" class="account-group-toggle" data-action="toggle-group" data-group="' + esc(group.key) +
     '" aria-expanded="' + expanded + '" aria-controls="account-group-' + index + '">' +
-    '<span><strong>' + (expanded ? "▾ " : "▸ ") + esc(group.key) + '</strong><small>' + group.accounts.length + ' 个账号配置' + esc(warnings) + '</small></span></button>' +
-    '<div class="account-group-actions"><span class="account-group-total">' + amount + '<small>已知余额合计（最近快照）</small></span>' +
+    '<span><strong>' + (expanded ? "▾ " : "▸ ") + esc(groupLabel) + '</strong><small>' + group.accounts.length + ' 个账号配置' + esc(warnings) + '</small></span></button>' +
+    '<div class="account-group-actions"><span class="account-group-total">' + amount + '<small>' + (summary.traffic ? '已知剩余流量合计' : '已知余额合计') + '（最近快照）</small></span>' +
     '<button type="button" class="btn btn-primary account-group-checkin" data-action="checkin-group" data-group="' + esc(group.key) +
-    '" aria-label="' + esc("一键签到：" + group.key) + '" title="' + esc("依次处理此网址的全部账号：" + group.key) + '"' +
+    '" aria-label="' + esc("一键签到：" + groupLabel) + '" title="' + esc("依次处理此网址的全部账号：" + groupLabel) + '"' +
     (busy ? " disabled" : "") + '>' + (running ? "签到中…" : "一键签到") + '</button></div></div>' +
     (expanded ? "" : '<div class="account-group-preview">' + group.accounts.map(renderAccountPreview).join("") + '</div>') +
     '<div id="account-group-' + index + '" class="account-group-cards"' + (expanded ? "" : " hidden") + '>' +
@@ -451,9 +545,13 @@ function render() {
   $("monthCheckins").textContent = platforms.reduce((n, p) => n + ((!isVisitOnly(p) && p.stats && p.stats.checkin_count) || 0), 0);
   const groups = groupAccounts(platforms);
   const totals = groups.map((group) => accountGroupSummary(group.accounts));
-  const totalQuota = totals.reduce((sum, group) => sum + group.total, 0);
-  const hasQuota = totals.some((group) => group.known);
+  const totalQuota = totals.reduce((sum, group) => sum + (group.traffic ? 0 : group.total), 0);
+  const hasQuota = totals.some((group) => !group.traffic && group.known);
   $("totalQuota").innerHTML = (hasQuota && Number.isFinite(totalQuota) ? totalQuota.toFixed(4) : "—") + ' <small>$</small>';
+  const trafficTotals = totals.filter((group) => group.traffic);
+  const totalTraffic = trafficTotals.reduce((sum, group) => sum + group.total, 0);
+  $("totalTrafficStat").hidden = !platforms.some(isTrafficSite);
+  $("totalTraffic").innerHTML = (trafficTotals.some((group) => group.known) && Number.isFinite(totalTraffic) ? totalTraffic.toFixed(2) : "—") + ' <small>GB</small>';
 
   if (!platforms.length) {
     grid.innerHTML = '<div class="empty">还没有平台配置，点击下方「添加平台」开始使用。</div>';
@@ -464,30 +562,34 @@ function render() {
 function renderPlatformCard(p) {
   const [label, cls] = status(p);
   const busy = p.loading || !!currentVisitProgress(p.id);
-  const acc = p.account || {};
+  const traffic = isTrafficSite(p);
+  const acc = accountForSite(p, p.account) || {};
   const qv = (v) => formatQuota(v, quotaUnitFor(acc));
   const qt = (v, trunc) => fmtTokens(v, trunc);
-  const addr = safeHttpUrl(p.baseUrl);
+  const addr = safeHttpUrl(traffic ? normalizeTrafficBaseUrl(p.baseUrl) + "/user#" : p.baseUrl);
+  const stats = traffic
+    ? '<div class="mini-stat"><strong>' + esc(trafficDisplay(acc)) + '</strong><span>剩余流量</span></div>' +
+      '<div class="mini-stat"><strong>' + esc(membershipDisplay(acc)) + '</strong><span>会员天数</span>' + (acc.membershipExpiresAt ? '<small class="membership-expiry">到期 ' + esc(acc.membershipExpiresAt) + '</small>' : '') + '</div>'
+    : '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
+      '<div class="mini-stat"><strong>' + qv(acc.used) + '</strong><span>已用额度</span></div>' +
+      '<div class="mini-stat"><strong>' + qt(acc.monthlyTokens, acc.tokensTruncated) + '</strong><span>本月Token</span></div>';
   return (
-    '<article class="platform-card"><div class="card-top"><div>' +
+    '<article class="platform-card' + (traffic ? ' traffic-card' : '') + '"><div class="card-top"><div>' +
     "<h3 class=\"platform-name\">" + esc(p.name) + "</h3>" +
     (addr
       ? '<a class="address address-link" href="' + esc(addr) + '" target="_blank" rel="noopener noreferrer" data-action="open-site" title="在浏览器中打开 ' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</a>"
       : '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div>") +
     "</div>" +
-    '<span class="badge ' + cls + '">' + label + "</span>" + (normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
-    '<div class="card-stats">' +
-    '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
-    '<div class="mini-stat"><strong>' + qv(acc.used) + '</strong><span>已用额度</span></div>' +
-    '<div class="mini-stat"><strong>' + qt(acc.monthlyTokens, acc.tokensTruncated) + '</strong><span>本月Token</span></div>' +
+    '<span class="badge ' + cls + '">' + label + "</span>" + (!traffic && normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
+    '<div class="card-stats">' + stats +
     "</div>" +
-    '<p class="account-meta">' + esc(accountIdentity(p)) + ' · ' + esc(accountUpdatedLabel(acc)) + '</p>' +
+    '<p class="account-meta">' + esc(accountIdentity(p)) + ' · ' + esc(accountUpdatedLabel(acc, traffic)) + '</p>' +
     '<p class="message' + ((p.error || p.accountError) && !currentVisitProgress(p.id) && !cancelledCheckins.has(p.id) ? " err" : "") + '">' + esc(currentVisitProgress(p.id) || cancelledCheckins.get(p.id) || p.error || p.accountError || p.message || p.note || "尚未获取最新统计") + "</p>" +
     (p.accountHistoryError ? '<p class="message err">历史写入告警：' + esc(p.accountHistoryError) + '</p>' : '') +
     '<div class="card-actions">' +
     '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (busy || accountBatchLocked(p) ? " disabled" : "") + ">" + (isVisitOnly(p) ? (busy ? "访问中…" : "立即访问") : (busy ? "签到中…" : "立即签到")) + "</button>" +
     '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
-    (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
+    (!traffic && hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
     '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
     '<button class="btn btn-danger" data-action="delete" data-id="' + esc(p.id) + '">删除</button>' +
     "</div></article>"
@@ -548,7 +650,7 @@ async function checkin(id, options) {
     return r;
   }
   releaseCheckinOperation(id, operation);
-  if (r.keepAlive && typeof r.keepAlive.date === "string") {
+  if (!isTrafficSite(p) && r.keepAlive && typeof r.keepAlive.date === "string") {
     p.keepAlive = normalizeKeepAlive(Object.assign({}, normalizeKeepAlive(p.keepAlive), { lastDate: r.keepAlive.date }));
   }
   p.message = r.message;
@@ -556,11 +658,20 @@ async function checkin(id, options) {
   // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
   p.reauthPending = !!r.reauthRequired;
   if (r.reauthRequired) p.reauthStartedAt = r.reauthStartedAt;
-  if (r.account) { p.account = Object.assign({}, p.account || {}, r.account); p.accountError = ""; }
+  if (r.account) {
+    p.account = accountForSite(p, isTrafficSite(p) ? r.account : Object.assign({}, p.account || {}, r.account));
+    p.accountError = "";
+  }
+  if (isTrafficSite(p) && r.accountWarning) p.accountError = r.accountWarning;
+  if (typeof r.historyWarning === "string") p.accountHistoryError = r.historyWarning;
+  else if (r.account && typeof r.account.historyWarning === "string") p.accountHistoryError = r.account.historyWarning;
   if (r.visited) {
     p.lastVisitDate = r.lastVisitDate; p.lastVisitedAt = r.lastVisitedAt;
   }
-  if (!r.visited && !isVisitOnly(p) && !r.reauthRequired && (r.ok || isAlreadyCheckinMessage(r.message))) {
+  const confirmedCheckin = isTrafficSite(p)
+    ? r.ok && !!(r.data && r.data.stats && r.data.stats.checked_in_today === true)
+    : r.ok || isAlreadyCheckinMessage(r.message);
+  if (!r.visited && !isVisitOnly(p) && !r.reauthRequired && confirmedCheckin) {
     p.stats = p.stats || {};
     if (r.data && r.data.stats) Object.assign(p.stats, r.data.stats);
     p.stats.checked_in_today = true;
@@ -595,11 +706,13 @@ async function refreshStats(id, silent) {
   const r = await getAccount(p);
   const current = platforms.find(x => x.id === id);
   if (!current || !sameConnectionConfig(config, slim(current))) return;
-  const message = r.message || (r.ok ? "额度已更新" : "获取账户额度失败");
-  const historyWarning = typeof r.historyWarning === "string" ? r.historyWarning : (current.accountHistoryError || "");
+  const measure = isTrafficSite(current) ? "流量" : "额度";
+  const message = r.message || (r.ok ? measure + "已更新" : "获取账户" + measure + "失败");
+  const historyWarning = typeof r.historyWarning === "string" ? r.historyWarning :
+    r.account && typeof r.account.historyWarning === "string" ? r.account.historyWarning : (current.accountHistoryError || "");
   mergeStatsInto(id, null, message, r.ok, r.account || null);
   // ok 只表示额度读取成功；未返回历史状态时沿用后台快照，不推断写入成功。
-  if (typeof r.historyWarning === "string") current.accountHistoryError = historyWarning;
+  if (typeof r.historyWarning === "string" || r.account && typeof r.account.historyWarning === "string") current.accountHistoryError = historyWarning;
   await savePlatforms();
   render();
   const feedback = message + (historyWarning && !message.includes(historyWarning) ? "；历史写入告警：" + historyWarning : "");
@@ -771,7 +884,7 @@ function renderModelMeta() {
 
 async function loadModelInsight() {
   const p = platforms.find((x) => x.id === modelState.platformId);
-  if (!p) return;
+  if (!p || isTrafficSite(p)) return;
   const request = ++modelInsightRequest;
   ++modelDetailRequest;
   const hours = modelState.hours;
@@ -801,7 +914,7 @@ async function loadModelInsight() {
 async function openModelPanel(id) {
   if (!hasModelPanel()) return;
   const p = platforms.find((x) => x.id === id);
-  if (!p) return;
+  if (!p || isTrafficSite(p)) return;
   modelState.platformId = id;
   modelState.hours = Number($("modelHours").value) || 24;
   $("modelModalTitle").textContent = "模型可用性与性能 · " + p.name;
@@ -823,7 +936,7 @@ function setActiveModelRow(model) {
 
 async function showModelDetail(model) {
   const p = platforms.find((x) => x.id === modelState.platformId);
-  if (!p) return;
+  if (!p || isTrafficSite(p)) return;
   const box = $("modelDetail");
   const request = ++modelDetailRequest;
   const hours = modelState.hours;
@@ -893,7 +1006,7 @@ function renderSparkline(group) {
 // ---------- 添加/编辑 ----------
 function keepAliveFromForm() {
   return {
-    enabled: $("keepAliveEnabled") ? $("keepAliveEnabled").checked : false,
+    enabled: !isTrafficSite({ siteType: $("siteType").value }) && $("keepAliveEnabled") ? $("keepAliveEnabled").checked : false,
     url: $("keepAliveUrl") ? $("keepAliveUrl").value.trim() : "",
     key: $("keepAliveKey") ? $("keepAliveKey").value : "",
     format: $("keepAliveFormat") && KEEPALIVE_FORMATS.indexOf($("keepAliveFormat").value) >= 0 ? $("keepAliveFormat").value : "chat",
@@ -902,23 +1015,28 @@ function keepAliveFromForm() {
 }
 function formData() {
   const prev = platforms.find((x) => x.id === editingId) || null;
+  const type = $("siteType").value;
+  const traffic = isTrafficSite({ siteType: type });
+  const mode = traffic ? "cookie" : $("authMode").value;
+  const login = usesLoginCredentials({ siteType: type, authMode: mode });
   return {
+    siteType: type,
     name: $("name").value.trim(),
-    baseUrl: $("baseUrl").value.trim().replace(/\/+$/, ""),
-    userId: $("userId").value.trim(),
-    accessToken: $("authMode").value === "token" ? $("accessToken").value.trim() : "",
-    loginUsername: $("authMode").value === "password" ? $("loginUsername").value.trim() : "",
-    loginPassword: $("authMode").value === "password" ? $("loginPassword").value : "",
+    baseUrl: traffic ? normalizeTrafficBaseUrl($("baseUrl").value) : $("baseUrl").value.trim().replace(/\/+$/, ""),
+    userId: traffic ? "" : $("userId").value.trim(),
+    accessToken: mode === "token" ? $("accessToken").value.trim() : "",
+    loginUsername: login ? $("loginUsername").value.trim() : "",
+    loginPassword: login ? $("loginPassword").value : "",
     visitOnly: $("visitOnly").checked,
-    logoutAfterVisit: $("logoutAfterVisit").checked,
+    logoutAfterVisit: !traffic && $("logoutAfterVisit").checked,
     note: $("note").value.trim(),
-    authMode: $("authMode") ? $("authMode").value : "token",
+    authMode: mode,
     keepAlive: Object.assign({}, normalizeKeepAlive(prev && prev.keepAlive), keepAliveFromForm()),
   };
 }
 
 function setLoginPasswordVisible(visible) {
-  visible = visible && $("authMode").value === "password";
+  visible = visible && usesLoginCredentials({ siteType: $("siteType").value, authMode: $("authMode").value });
   $("loginPassword").type = visible ? "text" : "password";
   const toggle = $("loginPasswordToggle");
   toggle.setAttribute("aria-pressed", String(visible));
@@ -927,6 +1045,7 @@ function setLoginPasswordVisible(visible) {
 }
 function closeModal() {
   ++modalSession;
+  invalidateConnectionTest();
   setLoginPasswordVisible(false);
   $("loginPassword").value = "";
   $("modal").classList.remove("open");
@@ -937,13 +1056,14 @@ function openModal(p) {
   invalidateConnectionTest();
   setLoginPasswordVisible(false);
   editingId = p ? p.id : null;
+  $("siteType").value = siteType(p);
   $("modalTitle").textContent = p ? "编辑平台" : "添加平台";
   $("name").value = p ? p.name || "" : "";
   $("baseUrl").value = p ? p.baseUrl || "" : "";
   $("userId").value = p ? p.userId || "" : "";
   $("accessToken").value = p ? p.accessToken || "" : "";
   $("loginUsername").value = p ? p.loginUsername || "" : "";
-  $("loginPassword").value = p && p.authMode === "password" && typeof p.loginPassword === "string" ? p.loginPassword : "";
+  $("loginPassword").value = usesLoginCredentials(p) && p && typeof p.loginPassword === "string" ? p.loginPassword : "";
   $("visitOnly").checked = isVisitOnly(p);
   $("logoutAfterVisit").checked = NACheckinAuth.shouldLogoutAfterVisit(p);
   $("note").value = p ? p.note || "" : "";
@@ -956,12 +1076,14 @@ function openModal(p) {
   if ($("keepAliveFormat")) $("keepAliveFormat").dataset.prevFmt = keepKa.format;
   syncKeepAliveFields();
   // Agent Router 使用网站原生退出与 GitHub OAuth 登录回调签到。
-  if (p && p.authMode) {
+  if (p && p.authMode && !isTrafficSite(p)) {
     $("authMode").value = AUTH_MODES.includes(p.authMode) ? p.authMode : "token";
   } else {
     const u = $("baseUrl").value.trim();
     $("authMode").value = /agentrouter\.org|ps\.air-outer\.com/i.test(u) ? "agentrouter_token" : "token";
   }
+  lastNewApiAuthMode = $("authMode").value;
+  if (isTrafficSite(p)) $("authMode").value = "cookie";
   toggleAuthFields();
   $("connectionStatus").className = "connection-status";
   $("connectionStatus").textContent = "";
@@ -975,22 +1097,43 @@ function openModal(p) {
 // 鉴权方式切换：Cookie 模式时令牌/用户ID可留空，并提示
 function toggleAuthFields() {
   setLoginPasswordVisible(false);
+  const traffic = isTrafficSite({ siteType: $("siteType").value });
+  if (traffic) $("authMode").value = "cookie";
   const mode = $("authMode").value;
   const password = mode === "password";
   const agent = isAgentRouterMode({ authMode: mode });
   $("visitOnlyField").style.display = "";
   const visit = $("visitOnly").checked;
-  $("logoutAfterVisitField").style.display = visit ? "" : "none";
-  $("keepAliveEnabled").disabled = false;
+  $("logoutAfterVisitField").style.display = !traffic && visit ? "" : "none";
+  $("logoutAfterVisit").disabled = traffic;
+  $("authModeField").style.display = traffic ? "none" : "";
+  $("authMode").disabled = traffic;
+  $("userIdField").style.display = traffic ? "none" : "";
+  $("userId").disabled = traffic;
+  $("accessToken").disabled = traffic;
+  $("keepAliveBox").style.display = traffic ? "none" : "";
+  $("keepAliveEnabled").disabled = traffic;
+  $("keepAliveFields").querySelectorAll("input, select, button").forEach((el) => { el.disabled = traffic; });
   syncKeepAliveFields();
-  $("testBtn").textContent = "检测连接";
-  $("accessToken").required = mode === "token";
-  $("accessTokenField").style.display = mode === "token" ? "" : "none";
-  $("loginUsernameField").style.display = password ? "" : "none";
-  $("loginPasswordField").style.display = password ? "" : "none";
-  $("loginUsername").required = password;
-  $("loginPassword").required = password;
-  $("userId").required = agent;
+  $("testBtn").textContent = traffic ? "检测流量" : "检测连接";
+  $("baseUrl").placeholder = traffic ? "https://ikuuu.top/user#" : "https://ai.example.com";
+  $("accessToken").required = !traffic && mode === "token";
+  $("accessTokenField").style.display = !traffic && mode === "token" ? "" : "none";
+  $("loginUsernameField").style.display = password || traffic ? "" : "none";
+  $("loginPasswordField").style.display = password || traffic ? "" : "none";
+  $("loginUsername").required = !traffic && password;
+  $("loginPassword").required = !traffic && password;
+  $("loginUsername").placeholder = traffic ? "可选，掉登录时恢复账号" : "登录邮箱或用户名";
+  $("loginPassword").placeholder = traffic ? "可选，与账号一起填写" : "登录密码";
+  $("userId").required = !traffic && agent;
+  const visitHint = $("visitOnlyHint");
+  if (!Object.hasOwn(visitHint.dataset, "newapi")) visitHint.dataset.newapi = visitHint.textContent;
+  $("visitOnlyLabel").textContent = traffic ? "仅访问（不点击签到）" : "仅访问（不调用签到接口）";
+  visitHint.textContent = traffic ? "读取剩余流量和会员天数，不点击签到；验证页面会保留。" : visitHint.dataset.newapi;
+  if (traffic) {
+    $("authHint").textContent = "优先使用浏览器登录 Cookie；账号密码可都留空，仅用于掉登录恢复。密码本地保存及导出均为明文。验证码或二次验证会报错并保留页面。";
+    return;
+  }
   const provider = mode === "agentrouter_linuxdo" ? "Linux DO" : "GitHub";
   $("authHint").textContent = visit
     ? "仅访问：正常登录后刷新首页一次，读取最新额度并更新卡片后关闭临时页；只跳过签到接口，额度、模型及已配置的保活保持正常。" + (password ? "邮箱密码会自动补登录；验证码需手动完成。" : agent ? provider + " 会启动本站 OAuth 登录，必要时请手动授权。" : "Cookie/令牌不能代替网页登录；会话失效时需在打开的页面手动登录。") + "访问结束后默认不退出账号，仅关闭本轮临时页；开启“访问结束后退出账号”才在收尾时退出（同站其他页面也会受影响）。切换账号或重新授权前的必要退出不受此开关影响；保存不自动测试账号，执行任务时核验身份和额度。"
@@ -1005,7 +1148,7 @@ function toggleAuthFields() {
 
 function syncKeepAliveFields() {
   if (!$("keepAliveEnabled")) return;
-  const on = $("keepAliveEnabled").checked;
+  const on = !isTrafficSite({ siteType: $("siteType").value }) && $("keepAliveEnabled").checked;
   if ($("keepAliveFields")) $("keepAliveFields").style.display = on ? "" : "none";
   if (on) {
     const base = $("baseUrl").value.trim().replace(/\/+$/, "");
@@ -1041,6 +1184,10 @@ function connectionStatus(text, type) {
 // 表单保存只比较账号身份/凭据；动作和显示选项不使在线账户快照失效。
 function sameAccountConfig(a, b) {
   if (!a || !b) return false;
+  if (siteType(a) !== siteType(b)) return false;
+  if (isTrafficSite(a)) return normalizeTrafficBaseUrl(a.baseUrl) === normalizeTrafficBaseUrl(b.baseUrl) &&
+    String(a.loginUsername || "").trim() === String(b.loginUsername || "").trim() &&
+    (typeof a.loginPassword === "string" ? a.loginPassword : "") === (typeof b.loginPassword === "string" ? b.loginPassword : "");
   const site = (p) => {
     const raw = String(p.baseUrl || "").trim().replace(/\/+$/, "");
     const history = globalThis.AccountHistory;
@@ -1058,6 +1205,7 @@ function sameAccountConfig(a, b) {
   return true;
 }
 function sameConnectionConfig(a, b) {
+  if (siteType(a) !== siteType(b)) return false;
   return ["baseUrl", "authMode", "userId", "accessToken", "loginUsername", "loginPassword", "visitOnly"].every((key) => a[key] === b[key]);
 }
 function invalidateConnectionTest() {
@@ -1077,20 +1225,20 @@ async function testConnection() {
   connectionConfig = data;
   const current = () => requestId === connectionRequestId && sameConnectionConfig(data, formData());
   $("testBtn").disabled = true;
-  connectionStatus(data.authMode === "password" ? "正在检测登录会话，必要时将打开本站登录表单…" : "正在检测站点连接，请稍候…");
+  connectionStatus(isTrafficSite(data) ? "正在读取流量，不点击签到…" : data.authMode === "password" ? "正在检测登录会话，必要时将打开本站登录表单…" : "正在检测站点连接，请稍候…");
   connectionPromise = (async () => {
     try {
       const r = await send({ type: "test", platform: slim(data), month: $("monthInput").value || currentMonth() });
       if (!current()) throw new Error("鉴权配置已变更，请按当前配置重新检测连接");
       if (r.ok) {
-        const needsUserId = data.userId ? "当前站点已使用用户ID鉴权。" : "当前站点无需用户ID即可连接。";
+        const needsUserId = isTrafficSite(data) ? "" : data.userId ? "当前站点已使用用户ID鉴权。" : "当前站点无需用户ID即可连接。";
         if (r.needsLogin) connectionStatus(r.message, "loading");
-        else connectionStatus("连接成功：" + (r.message || "账户接口可用") + " " + needsUserId, "success");
+        else connectionStatus((isTrafficSite(data) ? "流量读取成功：" : "连接成功：") + (r.message || (isTrafficSite(data) ? "流量页面可用" : "账户接口可用")) + (needsUserId ? " " + needsUserId : ""), "success");
         return r;
       }
       throw new Error(r.message || "未收到有效检测结果");
     } catch (e) {
-      if (current()) connectionStatus("连接失败：" + (e.message || "未知错误"), "error");
+      if (current()) connectionStatus((isTrafficSite(data) ? "流量读取失败：" : "连接失败：") + (e.message || "未知错误"), "error");
       throw e;
     } finally {
       if (requestId === connectionRequestId) {
@@ -1115,6 +1263,10 @@ function keepAliveStatusText(text, type) {
   if (el.scrollIntoView) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 async function testKeepAlive() {
+  if (isTrafficSite({ siteType: $("siteType").value })) {
+    toast("流量站点不支持自动调用 API", true);
+    return null;
+  }
   if (keepAliveTestPromise) return keepAliveTestPromise;
   const btn = $("keepAliveTestBtn");
   const fail = (msg) => {
@@ -1163,6 +1315,10 @@ async function testKeepAlive() {
   }
 }
 async function pickKeepAliveModels() {
+  if (isTrafficSite({ siteType: $("siteType").value })) {
+    toast("流量站点没有 NewAPI 模型", true);
+    return null;
+  }
   if (keepAlivePickPromise) return keepAlivePickPromise;
   const box = $("keepAliveModelList");
   const setLoading = (txt) => {
@@ -1294,9 +1450,9 @@ async function renderLastAuto() {
 function exportConfig() {
   const clean = platforms.map(({ loading, error, loginPassword, reauthPending, reauthStartedAt, reauthCompletedAt, ...rest }) => ({
     ...rest,
-    ...(rest.authMode === "password" ? { loginPassword: typeof loginPassword === "string" ? loginPassword : "" } : {}),
+    ...(usesLoginCredentials(rest) ? { loginPassword: typeof loginPassword === "string" ? loginPassword : "" } : {}),
   }));
-  const hasPasswords = clean.some((p) => p.authMode === "password" && p.loginPassword !== "");
+  const hasPasswords = clean.some((p) => usesLoginCredentials(p) && p.loginPassword !== "");
   if (hasPasswords && !window.confirm("导出的 JSON 文件包含明文登录密码，也可能包含访问令牌和 API Key。请妥善保管，不要公开或发送给他人。\n\n确认导出？")) return;
   const blob = new Blob([JSON.stringify(clean, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
@@ -1311,31 +1467,46 @@ async function importConfig(file) {
     const data = JSON.parse(await file.text());
     if (!Array.isArray(data)) throw new Error("配置格式必须是数组");
     const ids = new Set();
-    platforms = data.map((p) => {
+    const imported = data.map((p) => {
       if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("平台配置项必须是对象");
+      if (p.siteType && !AUTH_CONFIG.siteTypes.includes(p.siteType)) throw new Error("不支持的站点类型");
+      const traffic = isTrafficSite(p);
+      if (traffic && p.loginPassword != null && typeof p.loginPassword !== "string") throw new Error("登录密码必须是字符串");
       let id = typeof p.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(p.id) ? p.id : crypto.randomUUID();
       if (ids.has(id)) id = crypto.randomUUID();
       ids.add(id);
-      return {
+      const config = {
         id,
-        authMode: AUTH_MODES.includes(p.authMode) ? p.authMode : "token",
+        siteType: siteType(p),
+        authMode: traffic ? "cookie" : AUTH_MODES.includes(p.authMode) ? p.authMode : "token",
         name: p.name || "",
-        baseUrl: p.baseUrl || "",
-        userId: String(p.userId || ""),
-        accessToken: p.accessToken || "",
-        loginUsername: p.authMode === "password" ? String(p.loginUsername || "").trim() : "",
+        baseUrl: traffic ? normalizeTrafficBaseUrl(p.baseUrl) : p.baseUrl || "",
+        userId: traffic ? "" : String(p.userId || ""),
+        accessToken: traffic ? "" : p.accessToken || "",
+        loginUsername: usesLoginCredentials(p) ? String(p.loginUsername || "").trim() : "",
         visitOnly: p.visitOnly === true,
-        logoutAfterVisit: NACheckinAuth.shouldLogoutAfterVisit(p),
-        loginPassword: p.authMode === "password" && typeof p.loginPassword === "string" ? p.loginPassword : "",
+        logoutAfterVisit: !traffic && NACheckinAuth.shouldLogoutAfterVisit(p),
+        loginPassword: usesLoginCredentials(p) && typeof p.loginPassword === "string" ? p.loginPassword : "",
         note: p.note || "",
-        keepAlive: normalizeKeepAlive(p.keepAlive),
-        stats: p.stats || {},
+        keepAlive: { ...normalizeKeepAlive(p.keepAlive), ...(traffic ? { enabled: false } : {}) },
+        stats: traffic ? {} : p.stats || {},
         message: p.message || "",
       };
+      if (traffic) validatePlatform(config);
+      return config;
     });
-    await savePlatforms(true);
+    const previousPlatforms = platforms;
+    platforms = imported;
+    try {
+      await savePlatforms(true);
+    } catch (e) {
+      if (platforms === imported) platforms = previousPlatforms;
+      throw e;
+    }
     render();
-    toast("已导入 " + platforms.length + " 个平台" + (platforms.some((p) => p.authMode === "password" && !p.loginPassword) ? "；缺少密码的邮箱密码平台需编辑补填密码" : ""));
+    toast("已导入 " + platforms.length + " 个平台" +
+      (platforms.some((p) => p.authMode === "password" && !isTrafficSite(p) && !p.loginPassword) ? "；缺少密码的邮箱密码平台需编辑补填密码" : "") +
+      (platforms.some((p) => usesLoginCredentials(p) && p.loginPassword) ? "；登录密码在本地明文保存" : ""));
   } catch (e) {
     toast("导入失败：" + e.message, true);
   }
@@ -1345,7 +1516,7 @@ async function importConfig(file) {
 function loadStorage() {
   return new Promise((resolve) => {
     chrome.storage.local.get([KEY_PLATFORMS, KEY_SETTINGS, KEY_CHECKIN_STOP_VERSION, KEY_EXPANDED_GROUPS], (res) => {
-      platforms = Array.isArray(res[KEY_PLATFORMS]) ? res[KEY_PLATFORMS].map(p => ({ ...p, loading: false })) : [];
+      platforms = Array.isArray(res[KEY_PLATFORMS]) ? res[KEY_PLATFORMS].map(p => ({ ...normalizeSiteConfig(p), loading: false })) : [];
       expandedAccountGroups = new Set(Array.isArray(res[KEY_EXPANDED_GROUPS]) ? res[KEY_EXPANDED_GROUPS].filter((key) => typeof key === "string") : []);
       const storedStopVersion = validStopVersion(res[KEY_CHECKIN_STOP_VERSION]) ? res[KEY_CHECKIN_STOP_VERSION] : 0;
       checkinStopVersion = Math.max(checkinStopVersion, storedStopVersion);
@@ -1358,11 +1529,11 @@ async function savePlatforms(resetState = false) {
   for (const next of platforms) {
     const previous = stored.find((p) => p.id === next.id);
     if (next.reauthPending && previous && previous.reauthCompletedAt && Number(previous.reauthCompletedAt) >= Number(next.reauthStartedAt || 0) &&
-        next.authMode === previous.authMode && next.userId === previous.userId && next.baseUrl === previous.baseUrl) {
+        sameAccountConfig(next, previous)) {
       for (const key of ["reauthPending", "reauthCompletedAt", "message", "error", "accountError", "stats", "statsDate", "account", "lastCheckinAt"]) next[key] = previous[key];
     }
   }
-  const r = await send({ type: "savePlatforms", resetState, platforms: platforms.map(({ loading, ...p }) => p) });
+  const r = await send({ type: "savePlatforms", resetState, platforms: platforms.map(({ loading, ...p }) => normalizeSiteConfig(p)) });
   if (!r || !r.ok) throw new Error(r && r.message || "保存平台配置失败");
 }
 
@@ -1430,7 +1601,13 @@ async function init() {
     else if (action === "delete") removePlatform(id);
   });
 
-  $("authMode").onchange = () => { toggleAuthFields(); invalidateConnectionTest(); };
+  $("siteType").onchange = () => {
+    if (isTrafficSite({ siteType: $("siteType").value })) lastNewApiAuthMode = $("authMode").value;
+    else $("authMode").value = lastNewApiAuthMode;
+    toggleAuthFields();
+    invalidateConnectionTest();
+  };
+  $("authMode").onchange = () => { lastNewApiAuthMode = $("authMode").value; toggleAuthFields(); invalidateConnectionTest(); };
   $("visitOnly").onchange = () => { toggleAuthFields(); invalidateConnectionTest(); };
   for (const id of ["baseUrl", "userId", "accessToken", "loginUsername", "loginPassword"]) {
     $(id).addEventListener("input", invalidateConnectionTest);
@@ -1461,8 +1638,16 @@ async function init() {
       data.stats = sameAccount ? previousConfig.stats || {} : {};
       if (!sameAccount) {
         data.account = null;
+        data.statsDate = "";
+        data.accountError = "";
         data.accountHistoryError = "";
         data.accountHistoryUpdatedAt = "";
+        data.message = "";
+        data.error = "";
+        data.reauthPending = false;
+        data.reauthStartedAt = "";
+        data.reauthCompletedAt = "";
+        data.lastCheckinAt = "";
       }
       if (editingId) {
         const previous = platforms.find((p) => p.id === editingId) || {};
@@ -1605,6 +1790,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   const next = changes[KEY_PLATFORMS].newValue;
   if (!Array.isArray(next)) return;
   platforms = next.map((entry) => {
+    entry = normalizeSiteConfig(entry);
     const previous = platforms.find((p) => p.id === entry.id);
     if (previous && entry.taskResultRevision !== previous.taskResultRevision) clearVisitProgress(entry.id);
     // Storage delivers a full snapshot: missing fields must disappear in every open window.

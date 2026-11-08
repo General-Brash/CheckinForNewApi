@@ -22,6 +22,8 @@
   const MAX_COUNTER_GAP_MS = 7 * DAY_MS;
   const STALE_SNAPSHOT_MS = 36 * 60 * 60 * 1000;
   const DUPLICATE_SAMPLE_WINDOW_MS = 60 * 1000;
+  const BYTES_PER_GB = 1024 ** 3;
+  const TRAFFIC_METRIC = "remainingTrafficBytes";
   const MONTH_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
   const SVG_NS = "http://www.w3.org/2000/svg";
   const SITE_SCOPE_PREFIX = "site:";
@@ -37,9 +39,30 @@
     return value === null ? null : finite(value) ? value : null;
   }
 
+  function sampleKind(sample) {
+    return sample && sample.kind === "traffic" ? "traffic" : "money";
+  }
+
+  function configKind(config) {
+    return config.siteType === "ikuuu" || (config.account && config.account.kind === "traffic") ? "traffic" : "money";
+  }
+
+  function isSnapshotMetric(metric) {
+    return metric === "balance" || metric === TRAFFIC_METRIC;
+  }
+
   function normalizeSample(sample) {
     if (!sample || !finite(sample.at) || sample.at < 0) return null;
     const month = typeof sample.month === "string" && MONTH_PATTERN.test(sample.month) ? sample.month : null;
+    if (sample.kind === "traffic") {
+      return {
+        at: sample.at,
+        kind: "traffic",
+        remainingTrafficBytes: finite(sample.remainingTrafficBytes) && sample.remainingTrafficBytes >= 0 ? sample.remainingTrafficBytes : null,
+        month,
+      };
+    }
+    if (sample.kind != null && sample.kind !== "money") return null;
     return {
       at: sample.at,
       balance: numberOrNull(sample.balance),
@@ -78,10 +101,13 @@
   }
 
   function sampleQuality(sample) {
+    if (sampleKind(sample) === "traffic") return Number(sample.remainingTrafficBytes !== null);
     return Number(sample.balance !== null) + Number(sample.used !== null) + Number(sample.monthlyTokens !== null && sample.month !== null);
   }
 
   function sameSampleValues(left, right) {
+    if (sampleKind(left) !== sampleKind(right)) return false;
+    if (sampleKind(left) === "traffic") return left.remainingTrafficBytes === right.remainingTrafficBytes && left.month === right.month;
     return left.balance === right.balance
       && left.used === right.used
       && left.monthlyTokens === right.monthlyTokens
@@ -92,17 +118,22 @@
   function dedupeSamples(samples, preserveObservations = false) {
     const byTime = new Map();
     for (const sample of samples) {
-      const previous = byTime.get(sample.at);
+      const timeKey = sampleKind(sample) + ":" + sample.at;
+      const previous = byTime.get(timeKey);
       if (!previous) {
-        byTime.set(sample.at, sample);
+        byTime.set(timeKey, sample);
         continue;
       }
       const preferred = sampleQuality(sample) >= sampleQuality(previous) ? sample : previous;
       const other = preferred === sample ? previous : sample;
+      if (sampleKind(sample) === "traffic") {
+        byTime.set(timeKey, { ...preferred, remainingTrafficBytes: preferred.remainingTrafficBytes ?? other.remainingTrafficBytes });
+        continue;
+      }
       const tokenSource = preferred.monthlyTokens === null && (preferred.month === null || preferred.month === other.month)
         ? other : preferred;
       // Complementary reads at the same time must not discard a known balance.
-      byTime.set(sample.at, {
+      byTime.set(timeKey, {
         ...preferred,
         balance: preferred.balance ?? other.balance,
         used: preferred.used ?? other.used,
@@ -136,17 +167,19 @@
       const stored = history.accounts[platformId];
       const currentIdentity = identityFor(config);
       if (!currentIdentity) continue;
+      const kind = configKind(config);
       let group = groups.get(currentIdentity);
       if (!group) {
-        group = { identity: currentIdentity, label: String(config.name || config.baseUrl || "账号"), samples: [], configs: 0 };
+        group = { identity: currentIdentity, kind, label: String(config.name || config.baseUrl || "账号"), samples: [], configs: 0 };
         groups.set(currentIdentity, group);
       }
       group.configs++;
       // Missing or identity-mismatched history remains an explicit missing snapshot; never reuse cached account data.
-      if (stored && stored.identity === currentIdentity) group.samples.push(...stored.samples);
+      if (stored && stored.identity === currentIdentity) group.samples.push(...stored.samples.filter((sample) => sampleKind(sample) === kind));
     }
     return [...groups.values()].map((group) => ({
       identity: group.identity,
+      kind: group.kind,
       label: group.label,
       siteKey: siteKeyFor(group.identity),
       duplicateConfigs: Math.max(0, group.configs - 1),
@@ -213,11 +246,11 @@
     return found;
   }
 
-  function latestBalanceAtOrBefore(samples, at) {
+  function latestSnapshotAtOrBefore(samples, at, metric = "balance") {
     let found = null;
     for (const sample of samples) {
       if (sample.at > at) break;
-      if (finite(sample.balance)) found = sample;
+      if (finite(sample[metric])) found = sample;
     }
     return found;
   }
@@ -240,10 +273,12 @@
     let monthBoundaries = 0;
     let truncatedComparisons = 0;
 
-    for (const series of seriesList) {
+    const moneySeries = seriesList.filter((series) => series.kind !== "traffic");
+    for (const series of moneySeries) {
       let previous = null;
       let breakPending = false;
       for (const current of series.samples) {
+        if (sampleKind(current) === "traffic") continue;
         if (current.at > end) break;
         if (!previous) {
           previous = current;
@@ -279,7 +314,7 @@
             breaks++;
             breakPending = true;
           } else {
-            addMetricDelta(points, current.at, metric, current.monthlyTokens - previous.monthlyTokens, seriesList.length, breakPending);
+            addMetricDelta(points, current.at, metric, current.monthlyTokens - previous.monthlyTokens, moneySeries.length, breakPending);
             breakPending = false;
           }
         } else if (current.used === null || previous.used === null) {
@@ -289,7 +324,7 @@
           breaks++;
           breakPending = true;
         } else {
-          addMetricDelta(points, current.at, metric, current.used - previous.used, seriesList.length, breakPending);
+          addMetricDelta(points, current.at, metric, current.used - previous.used, moneySeries.length, breakPending);
           breakPending = false;
         }
         previous = current;
@@ -313,24 +348,26 @@
 
   function dailyAccountPoints(account, dates, now, metric) {
     const observations = account.observations || account.samples;
-    const changes = metric === "balance" ? [] : counterChanges([account], dates[0], now, metric).points;
+    const snapshotMetric = isSnapshotMetric(metric);
+    const snapshotLabel = metric === TRAFFIC_METRIC ? "剩余流量" : "余额";
+    const changes = snapshotMetric ? [] : counterChanges([account], dates[0], now, metric).points;
     return dates.map((at) => {
       const nextDay = new Date(at);
       nextDay.setDate(nextDay.getDate() + 1);
       const end = Math.min(now, nextDay.getTime() - 1);
       const observation = latestAtOrBefore(observations, end);
-      const sample = metric === "balance" ? latestBalanceAtOrBefore(observations, end) : observation;
+      const sample = snapshotMetric ? latestSnapshotAtOrBefore(observations, end, metric) : observation;
       const observed = !!observation && observation.at >= at;
       const change = latestAtOrBefore(changes, end);
       const dayChanges = changes.filter((point) => point.at >= at && point.at <= end);
       const effectiveSample = latestAtOrBefore(account.samples, end);
       const comparable = !!change && !!effectiveSample && change.at === effectiveSample.at && dayChanges.length > 0;
-      const available = !!sample && (metric === "balance" ? finite(sample.balance)
+      const available = !!sample && (snapshotMetric ? finite(sample[metric])
         : metric === "used" ? finite(sample.used)
         : finite(sample.monthlyTokens) && !!sample.month && !sample.truncated);
-      const value = metric === "balance" ? (sample ? sample.balance : null) : (change ? change.cumulative : null);
-      const carried = metric === "balance" && available && (sample.at < at || !finite(observation.balance));
-      const missing = metric === "balance" ? !available : !observed || !available || !comparable;
+      const value = snapshotMetric ? (sample ? sample[metric] : null) : (change ? change.cumulative : null);
+      const carried = snapshotMetric && available && (sample.at < at || !finite(observation && observation[metric]));
+      const missing = snapshotMetric ? !available : !observed || !available || !comparable;
       return {
         at,
         value,
@@ -345,10 +382,10 @@
         sampleAt: sample ? sample.at : null,
         stale: Number(!!sample && end - sample.at > STALE_SNAPSHOT_MS),
         breakBefore: dayChanges.some((point) => point.breakBefore),
-        status: metric === "balance" && carried
-          ? sample.at < at ? "当日未更新，沿用最近已确认余额" : "最新记录未含余额，保留当日已确认余额"
+        status: snapshotMetric && carried
+          ? sample.at < at ? `当日未更新，沿用最近已确认${snapshotLabel}` : `最新记录未含${snapshotLabel}，保留当日已确认${snapshotLabel}`
           : !observed ? "当日未采集" : !available ? "当日字段缺失或不可比较"
-          : metric !== "balance" && !comparable ? "当日无可比较变化" : "当日已采集",
+          : !snapshotMetric && !comparable ? "当日无可比较变化" : "当日已采集",
       };
     });
   }
@@ -377,8 +414,7 @@
     });
   }
 
-  function buildDailyCharts(series, dates, now, bySite) {
-    const metrics = ["balance", "used", "tokens"];
+  function buildDailyCharts(series, dates, now, bySite, metrics = ["balance", "used", "tokens"]) {
     const accounts = series.map((account) => {
       const entry = { key: account.identity, siteKey: account.siteKey, label: account.label, kind: "account", accountCount: 1 };
       for (const metric of metrics) entry[metric] = dailyAccountPoints(account, dates, now, metric);
@@ -399,8 +435,35 @@
     }
     return Object.fromEntries(metrics.map((metric) => [metric, entries.map((entry, index) => ({
         key: entry.key, siteKey: entry.siteKey, label: entry.label, kind: entry.kind, accountCount: entry.accountCount,
-        color: SERIES_COLORS[index % SERIES_COLORS.length], points: entry[metric],
+        metric, color: SERIES_COLORS[index % SERIES_COLORS.length], points: entry[metric],
     }))]));
+  }
+
+  function snapshotSummary(series, start, now, metric) {
+    const events = [...new Set(series.flatMap((account) => account.observations
+      .filter((sample) => sample.at >= start && sample.at <= now).map((sample) => sample.at)))].sort((a, b) => a - b);
+    const summaryAt = (at) => {
+      let total = 0, known = 0, stale = 0, sampleAt = null;
+      const snapshots = series.map((account) => {
+        const sample = latestSnapshotAtOrBefore(account.observations, at, metric);
+        if (sample) {
+          total += sample[metric];
+          known++;
+          if (at - sample.at > STALE_SNAPSHOT_MS) stale++;
+          sampleAt = sampleAt === null ? sample.at : Math.max(sampleAt, sample.at);
+        }
+        return { account, sample };
+      });
+      return {
+        latest: { value: known ? total : null, known, missing: Math.max(0, series.length - known), stale, totalSeries: series.length, sampleAt },
+        snapshots,
+      };
+    };
+    const current = summaryAt(now);
+    return {
+      ...current,
+      points: events.map((at) => ({ at, ...summaryAt(at).latest })).filter((point) => point.value !== null),
+    };
   }
 
   /** Pure view-model builder, also used by the offline regression tests. */
@@ -419,34 +482,14 @@
     const historyDiagnostics = collectHistoryDiagnostics(history, configs, identity, now)
       .filter((account) => !selectedSite || siteKeyFor(account.identity) === selectedSite);
     const bySite = identity === "all" && !selectedSite;
-    const events = [...new Set(series.flatMap((account) => account.observations
-      .filter((sample) => sample.at >= start && sample.at <= now).map((sample) => sample.at)))].sort((a, b) => a - b);
-
-    const balancePoints = events.map((at) => {
-      let total = 0, known = 0, stale = 0;
-      for (const account of series) {
-        const sample = latestBalanceAtOrBefore(account.observations, at);
-        if (!sample || sample.balance === null) continue;
-        total += sample.balance;
-        known++;
-        if (at - sample.at > STALE_SNAPSHOT_MS) stale++;
-      }
-      return { at, value: known ? total : null, known, missing: Math.max(0, series.length - known), stale, totalSeries: series.length };
-    }).filter((point) => point.value !== null);
-
-    let balanceTotal = 0, balanceKnown = 0, balanceStale = 0;
-    const latestSnapshots = series.map((account) => {
-      const sample = latestBalanceAtOrBefore(account.observations, now);
-      if (sample && sample.balance !== null) {
-        balanceTotal += sample.balance;
-        balanceKnown++;
-        if (now - sample.at > STALE_SNAPSHOT_MS) balanceStale++;
-      }
-      return { account, sample };
-    });
-
-    const used = counterChanges(series, start, now, "used");
-    const tokens = counterChanges(series, start, now, "tokens");
+    const moneySeries = series.filter((account) => account.kind === "money");
+    const trafficSeries = series.filter((account) => account.kind === "traffic");
+    const balance = snapshotSummary(moneySeries, start, now, "balance");
+    const traffic = snapshotSummary(trafficSeries, start, now, TRAFFIC_METRIC);
+    const showMoney = moneySeries.length > 0 || (bySite && trafficSeries.length === 0);
+    const showTraffic = trafficSeries.length > 0;
+    const used = counterChanges(moneySeries, start, now, "used");
+    const tokens = counterChanges(moneySeries, start, now, "tokens");
     const inRangeSamples = series.flatMap((account) => account.observations
       .filter((sample) => sample.at >= start && sample.at <= now)
       .map((sample) => ({ account, sample })))
@@ -464,21 +507,29 @@
       sites,
       dates,
       bySite,
-      charts: buildDailyCharts(series, dates, now, bySite),
+      moneySeries,
+      trafficSeries,
+      showMoney,
+      showTraffic,
+      charts: {
+        ...buildDailyCharts(moneySeries, dates, now, bySite),
+        ...buildDailyCharts(trafficSeries, dates, now, bySite, [TRAFFIC_METRIC]),
+      },
       historyDiagnostics,
       hasSamples: series.some((account) => account.observations.length > 0),
       inRangeSamples,
-      balancePoints,
-      latestBalance: {
-        value: balanceKnown ? balanceTotal : null, known: balanceKnown,
-        missing: Math.max(0, series.length - balanceKnown), stale: balanceStale, totalSeries: series.length,
-        sampleAt: latestSnapshots.reduce((latest, { sample }) => sample ? Math.max(latest, sample.at) : latest, 0) || null,
-      },
-      latestSnapshots,
+      balancePoints: balance.points,
+      latestBalance: balance.latest,
+      latestSnapshots: balance.snapshots,
+      trafficPoints: traffic.points,
+      latestTraffic: traffic.latest,
+      latestTrafficSnapshots: traffic.snapshots,
       newestSampleAt: series.reduce((latest, account) => account.observations.length ? Math.max(latest, account.observations[account.observations.length - 1].at) : latest, 0) || null,
       used,
       tokens,
       hasInRangeSamples: inRangeSamples.length > 0,
+      hasMoneyInRangeSamples: inRangeSamples.some(({ sample }) => sampleKind(sample) === "money"),
+      hasTrafficInRangeSamples: inRangeSamples.some(({ sample }) => sampleKind(sample) === "traffic"),
     };
   }
 
@@ -490,6 +541,10 @@
 
   function formatNumber(value) {
     return value === null || value === undefined || !finite(value) ? "—" : new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+  }
+
+  function formatTraffic(value) {
+    return !finite(value) ? "—" : new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value / BYTES_PER_GB) + " GB";
   }
 
   function formatDate(at) {
@@ -553,7 +608,11 @@
   }
 
   function chartWidthSignature(view) {
-    return [view.balanceChart, view.usedChart, view.tokenChart].map(measuredChartWidth).join(":");
+    return chartContainersFor(view).map(measuredChartWidth).join(":");
+  }
+
+  function chartContainersFor(view) {
+    return [view.balanceChart, view.usedChart, view.tokenChart, view.trafficChart];
   }
 
   function formatChartCurrency(value, width) {
@@ -578,22 +637,28 @@
     }).format(value);
   }
 
+  function formatChartTraffic(value) {
+    return !finite(value) ? "—" : new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value / BYTES_PER_GB) + " GB";
+  }
+
   function chartPointDetails(series, point, daily) {
     const parts = [];
+    const traffic = series.metric === TRAFFIC_METRIC;
+    const snapshotLabel = traffic ? "剩余流量" : "余额";
     if (point.status) parts.push(point.status);
     if (series.kind === "site") {
-      parts.push(`${point.known}/${point.totalSeries} 个账号有已知金额`);
+      parts.push(`${point.known}/${point.totalSeries} 个账号有已知${traffic ? "剩余流量" : "金额"}`);
     }
     if (point.missing && series.kind === "site") {
       if (point.missingLabels && point.missingLabels.length) parts.push(`缺测或不可比较：${point.missingLabels.join("、")}`);
     }
     if (point.carried) {
-      parts.push(`${point.carried} 个账号沿用此前已确认余额，不代表当日实时额度`);
+      parts.push(`${point.carried} 个账号沿用此前已确认${snapshotLabel}，不代表当日实时${traffic ? "流量" : "额度"}`);
     }
     if (point.missing && finite(point.value)) parts.push("包含之前的已知读数，仅作位置参考，并非当日完整读数");
     if (finite(point.sampleAt)) parts.push(`最近采集 ${formatDateTime(point.sampleAt)}`);
     if (finite(point.oldestSampleAt) && point.oldestSampleAt !== point.sampleAt) {
-      parts.push(`最早余额快照 ${formatDateTime(point.oldestSampleAt)}`);
+      parts.push(`最早${snapshotLabel}快照 ${formatDateTime(point.oldestSampleAt)}`);
     }
     if (point.breakBefore) parts.push("与前段不可比较");
     if (point.stale) parts.push(`${point.stale} 个快照较旧`);
@@ -614,7 +679,8 @@
       const item = element(doc, typeof onSelect === "function" ? "button" : "span", "history-legend-item");
       if (typeof onSelect === "function") {
         item.type = "button";
-        const action = series.kind === "site" ? `查看 ${series.label} 的账号额度变化` : `查看 ${series.label} 的额度变化`;
+        const metricLabel = series.metric === TRAFFIC_METRIC ? "剩余流量" : "额度";
+        const action = series.kind === "site" ? `查看 ${series.label} 的账号${metricLabel}变化` : `查看 ${series.label} 的${metricLabel}变化`;
         item.setAttribute("aria-label", action);
         item.setAttribute("title", action);
         item.addEventListener("click", () => onSelect(series));
@@ -626,7 +692,7 @@
       item.append(swatch, element(doc, "span", "history-legend-label", series.label));
       const latest = series.points[series.points.length - 1];
       const detail = series.kind === "site" ? `${series.accountCount} 个账号`
-        : latest && latest.carried ? "沿用已确认余额" : latest && latest.uncollected ? "当日未采集" : "";
+        : latest && latest.carried ? `沿用已确认${series.metric === TRAFFIC_METRIC ? "剩余流量" : "余额"}` : latest && latest.uncollected ? "当日未采集" : "";
       if (detail) item.appendChild(element(doc, "small", "history-legend-detail", detail));
       legend.appendChild(item);
     }
@@ -655,7 +721,7 @@
     let min = valid.length ? Math.min(...valid.map((point) => point.value)) : 0;
     let max = valid.length ? Math.max(...valid.map((point) => point.value)) : 1;
     if (min === max) {
-      const pad = Math.max(Math.abs(max) * 0.08, 1);
+      const pad = Math.max(Math.abs(max) * 0.08, options.minimumPadding || 1);
       min -= pad;
       max += pad;
     } else {
@@ -663,6 +729,7 @@
       min -= pad;
       max += pad;
     }
+    if (options.nonNegative) min = Math.max(0, min);
     const ticks = Array.from({ length: valid.length ? 4 : 0 }, (_, index) => ({
       ratio: index / 3,
       value: max - (max - min) * (index / 3),
@@ -894,6 +961,7 @@
   }
 
   function sampleStatus(sample) {
+    if (sampleKind(sample) === "traffic") return sample.remainingTrafficBytes === null ? "剩余流量缺失" : "字段齐全";
     const issues = [];
     if (sample.balance === null) issues.push("余额缺失");
     if (sample.used === null) issues.push("已用缺失");
@@ -905,7 +973,7 @@
 
   function historyEmptyState(model) {
     if (model.hasSamples) {
-      return { title: "所选区间无样本", message: "可切换时间范围，或刷新账号额度。" };
+      return { title: "所选区间无样本", message: `可切换时间范围，或刷新账号${model.showTraffic && !model.moneySeries.length ? "流量" : "数据"}。` };
     }
     const diagnostics = model.historyDiagnostics || [];
     if (diagnostics.some((account) => account.errors.length)) {
@@ -917,21 +985,27 @@
     return { title: "尚无真实历史样本", message: HISTORY_REFRESH_GUIDANCE };
   }
 
-  function renderRows(tbody, model) {
+  function renderRows(tbody, model, kind = "money") {
     const doc = tbody.ownerDocument;
     tbody.replaceChildren();
-    if (!model.inRangeSamples.length) {
+    const samples = model.inRangeSamples.filter(({ sample }) => sampleKind(sample) === kind);
+    if (!samples.length) {
       const row = element(doc, "tr");
       const empty = historyEmptyState(model);
       const cell = element(doc, "td", "history-table-empty", `${empty.title}：${empty.message}`);
-      cell.colSpan = 6;
+      cell.colSpan = kind === "traffic" ? 4 : 6;
       row.appendChild(cell);
       tbody.appendChild(row);
       return;
     }
-    for (const { account, sample } of model.inRangeSamples) {
+    for (const { account, sample } of samples) {
       const row = element(doc, "tr");
-      const values = [
+      const values = kind === "traffic" ? [
+        formatDateTime(sample.at),
+        `${account.label} · ${account.siteKey}`,
+        formatTraffic(sample.remainingTrafficBytes),
+        sampleStatus(sample),
+      ] : [
         formatDateTime(sample.at),
         `${account.label} · ${account.siteKey}`,
         formatCurrency(sample.balance),
@@ -942,6 +1016,20 @@
       for (const value of values) row.appendChild(element(doc, "td", "", value));
       tbody.appendChild(row);
     }
+  }
+
+  function renderTables(view, model) {
+    renderRows(view.tableBody, model);
+    renderRows(view.trafficTableBody, model, "traffic");
+  }
+
+  function setTypeVisibility(view, model) {
+    for (const key of ["history-balance-chart", "history-used-chart", "history-token-chart"]) view.chartSections[key].hidden = !model.showMoney;
+    view.chartSections["history-traffic-chart"].hidden = !model.showTraffic;
+    view.changeSummary.hidden = !model.showMoney || !model.hasMoneyInRangeSamples;
+    view.moneyTableSection.hidden = !model.moneySeries.length && model.showTraffic;
+    view.trafficTableSection.hidden = !model.showTraffic;
+    view.moneyTableTitle.textContent = model.showTraffic ? "金额采样明细" : "采样明细";
   }
 
   function completenessText(model) {
@@ -967,24 +1055,27 @@
       refresh(view);
     };
     const chartSeries = (metric) => model.charts[metric];
+    setTypeVisibility(view, model);
     view.balanceTitle.textContent = model.bySite ? "网址额度总和走势" : "账号额度走势";
-    renderChart(view.balanceChart, [], view.balanceTitle.textContent, formatCurrency,
-      model.hasInRangeSamples ? "当前范围暂无有效余额样本。" : historyEmptyState(model).message,
-      { axisFormatter: formatChartCurrency, series: chartSeries("balance"), onSelect });
-    renderChart(view.usedChart, [], "已用金额可比较片段累计（非完整区间消耗）", formatCurrency,
-      model.hasInRangeSamples ? "当前范围暂无可比较的已用金额变化。" : historyEmptyState(model).message,
-      {
-        axisFormatter: formatChartCurrency,
-        series: chartSeries("used"),
-        onSelect,
-      });
-    renderChart(view.tokenChart, [], "Token 可比较片段累计（非完整区间消耗）", formatNumber,
-      model.hasInRangeSamples ? "当前范围暂无可比较的 Token 变化。" : historyEmptyState(model).message,
-      {
-        axisFormatter: formatChartNumber,
-        series: chartSeries("tokens"),
-        onSelect,
-      });
+    if (model.showMoney) {
+      renderChart(view.balanceChart, [], view.balanceTitle.textContent, formatCurrency,
+        model.hasMoneyInRangeSamples ? "当前范围暂无有效余额样本。" : historyEmptyState(model).message,
+        { axisFormatter: formatChartCurrency, series: chartSeries("balance"), onSelect });
+      renderChart(view.usedChart, [], "已用金额可比较片段累计（非完整区间消耗）", formatCurrency,
+        model.hasMoneyInRangeSamples ? "当前范围暂无可比较的已用金额变化。" : historyEmptyState(model).message,
+        { axisFormatter: formatChartCurrency, series: chartSeries("used"), onSelect });
+      renderChart(view.tokenChart, [], "Token 可比较片段累计（非完整区间消耗）", formatNumber,
+        model.hasMoneyInRangeSamples ? "当前范围暂无可比较的 Token 变化。" : historyEmptyState(model).message,
+        { axisFormatter: formatChartNumber, series: chartSeries("tokens"), onSelect });
+    } else {
+      for (const chart of [view.balanceChart, view.usedChart, view.tokenChart]) chart.replaceChildren();
+    }
+    view.trafficTitle.textContent = model.bySite ? "网址剩余流量总和走势" : "账号剩余流量走势";
+    if (model.showTraffic) {
+      renderChart(view.trafficChart, [], view.trafficTitle.textContent, formatTraffic,
+        model.hasTrafficInRangeSamples ? "当前范围暂无有效剩余流量样本。" : historyEmptyState(model).message,
+        { axisFormatter: formatChartTraffic, series: chartSeries(TRAFFIC_METRIC), onSelect, nonNegative: true, minimumPadding: BYTES_PER_GB / 100 });
+    } else view.trafficChart.replaceChildren();
   }
 
   function renderScope(view, model) {
@@ -1010,10 +1101,16 @@
     const tokenValue = model.tokens.total === null ? "—" : `+${formatNumber(model.tokens.total)}`;
     const usedDetail = `${model.used.points.length} 条可比较记录`;
     const tokenDetail = `${model.tokens.points.length} 条可比较记录`;
-    view.summary.replaceChildren(
+    const summaryCards = model.moneySeries.length || !model.showTraffic ? [
       summaryCard(doc, "最新余额（按身份去重）", formatCurrency(model.latestBalance.value), balanceDetail),
-    );
-    view.changeSummary.replaceChildren(...(model.hasInRangeSamples ? [
+    ] : [];
+    if (model.showTraffic) {
+      const trafficAt = model.latestTraffic.sampleAt;
+      const trafficDetail = `${model.latestTraffic.known}/${model.latestTraffic.totalSeries} 个账号有已知剩余流量${trafficAt !== null ? ` · ${formatDateTime(trafficAt)}（${timeAgo(trafficAt)}）` : ""}${model.latestTraffic.stale ? ` · ${model.latestTraffic.stale} 个较旧` : ""}`;
+      summaryCards.push(summaryCard(doc, "最新剩余流量（按身份去重）", formatTraffic(model.latestTraffic.value), trafficDetail));
+    }
+    view.summary.replaceChildren(...summaryCards);
+    view.changeSummary.replaceChildren(...(model.hasMoneyInRangeSamples ? [
       summaryCard(doc, `${model.days} 天已用变化（可比较片段）`, usedValue, usedDetail),
       summaryCard(doc, `${model.days} 天 Token 变化（可比较片段）`, tokenValue, tokenDetail),
     ] : []));
@@ -1027,7 +1124,7 @@
     view.chartModel = model;
     view.chartWidthSignature = chartWidthSignature(view);
     renderCharts(view, model);
-    renderRows(view.tableBody, model);
+    renderTables(view, model);
   }
 
   function readStoredSnapshot() {
@@ -1129,7 +1226,7 @@
     const range = element(doc, "p", "history-range", "正在读取本地历史…");
     panel.appendChild(range);
     const summary = element(doc, "section", "history-summary");
-    summary.setAttribute("aria-label", "最新余额摘要");
+    summary.setAttribute("aria-label", "最新金额与流量摘要");
     panel.appendChild(summary);
     const coverage = element(doc, "p", "history-coverage");
     coverage.hidden = true;
@@ -1142,11 +1239,15 @@
       ["网址额度总和走势", "history-balance-chart"],
       ["使用金额累计变化", "history-used-chart"],
       ["Token 累计变化", "history-token-chart"],
+      ["网址剩余流量总和走势", "history-traffic-chart"],
     ];
     const chartContainers = {};
     const chartTitles = {};
+    const chartSections = {};
     for (const [title, key] of chartEntries) {
-      const section = element(doc, "section", "history-chart-section");
+      const section = element(doc, "section", `history-chart-section${key === "history-balance-chart" || key === "history-traffic-chart" ? " history-chart-wide" : ""}`);
+      if (key === "history-traffic-chart") section.hidden = true;
+      chartSections[key] = section;
       const heading = element(doc, "h3", "", title);
       section.appendChild(heading);
       chartTitles[key] = heading;
@@ -1159,26 +1260,36 @@
     }
     panel.appendChild(charts);
 
-    const tableSection = element(doc, "section", "history-table-section");
-    tableSection.appendChild(element(doc, "h3", "", "采样明细"));
-    const tableScroll = element(doc, "div", "history-table-scroll");
-    const table = element(doc, "table", "history-table");
-    const thead = element(doc, "thead", "");
-    const headerRow = element(doc, "tr", "");
-    for (const label of ["采样时间", "账号", "余额（美元）", "累计已用（美元）", "月 Token（YYYY-MM）", "数据状态"]) {
-      headerRow.appendChild(element(doc, "th", "", label));
+    const tables = {};
+    for (const [kind, title, labels] of [
+      ["money", "采样明细", ["采样时间", "账号", "余额（美元）", "累计已用（美元）", "月 Token（YYYY-MM）", "数据状态"]],
+      ["traffic", "流量采样明细", ["采样时间", "账号", "剩余流量（GB）", "数据状态"]],
+    ]) {
+      const section = element(doc, "section", "history-table-section");
+      if (kind === "traffic") section.hidden = true;
+      const heading = element(doc, "h3", "", title);
+      section.appendChild(heading);
+      const scroll = element(doc, "div", "history-table-scroll");
+      const table = element(doc, "table", `history-table${kind === "traffic" ? " history-traffic-table" : ""}`);
+      const thead = element(doc, "thead", "");
+      const headerRow = element(doc, "tr", "");
+      for (const label of labels) headerRow.appendChild(element(doc, "th", "", label));
+      thead.appendChild(headerRow);
+      const tbody = element(doc, "tbody", "");
+      table.append(thead, tbody);
+      scroll.appendChild(table);
+      section.appendChild(scroll);
+      panel.appendChild(section);
+      tables[kind] = { section, heading, tbody };
     }
-    thead.appendChild(headerRow);
-    const tbody = element(doc, "tbody", "");
-    table.append(thead, tbody);
-    tableScroll.appendChild(table);
-    tableSection.appendChild(tableScroll);
-    panel.appendChild(tableSection);
 
     overlay.appendChild(panel);
     doc.body.appendChild(overlay);
-    return { overlay, panel, close, accountSelect, periodSelect, back, scopeLabel, scopeDetail, range, summary, changeSummary, coverage, tableBody: tbody,
+    return { overlay, panel, close, accountSelect, periodSelect, back, scopeLabel, scopeDetail, range, summary, changeSummary, coverage,
+      tableBody: tables.money.tbody, moneyTableSection: tables.money.section, moneyTableTitle: tables.money.heading,
+      trafficTableBody: tables.traffic.tbody, trafficTableSection: tables.traffic.section, chartSections,
       balanceTitle: chartTitles["history-balance-chart"],
+      trafficTitle: chartTitles["history-traffic-chart"], trafficChart: chartContainers["history-traffic-chart"],
       balanceChart: chartContainers["history-balance-chart"], usedChart: chartContainers["history-used-chart"], tokenChart: chartContainers["history-token-chart"], trigger };
   }
 
@@ -1195,7 +1306,7 @@
         view.chartWidthSignature = signature;
         renderCharts(view, view.chartModel);
       });
-      for (const chart of [view.balanceChart, view.usedChart, view.tokenChart]) view.resizeObserver.observe(chart);
+      for (const chart of chartContainersFor(view)) view.resizeObserver.observe(chart);
     } catch (_) {
       if (view.resizeObserver && typeof view.resizeObserver.disconnect === "function") view.resizeObserver.disconnect();
       view.resizeObserver = null;
@@ -1218,16 +1329,22 @@
 
   function showError(view, error) {
     if (!view || activeView !== view) return;
+    const selected = view.accountSelect.value;
+    setTypeVisibility(view, buildViewModel(null, view.configs, {
+      identity: selected.startsWith(SITE_SCOPE_PREFIX) ? "all" : selected,
+      site: selected.startsWith(SITE_SCOPE_PREFIX) ? selected.slice(SITE_SCOPE_PREFIX.length) : null,
+    }));
     view.chartModel = null;
     view.range.textContent = "本地历史读取失败";
     view.coverage.textContent = error && error.message ? error.message : "无法读取本地历史存储。";
     view.coverage.hidden = false;
-    for (const chart of [view.balanceChart, view.usedChart, view.tokenChart]) {
+    for (const chart of chartContainersFor(view)) {
       chart.replaceChildren(emptyMessage(view.doc, "读取失败", "请确认扩展本地存储可用后重新打开面板。"));
     }
     view.summary.replaceChildren();
     view.changeSummary.replaceChildren();
     view.tableBody.replaceChildren();
+    view.trafficTableBody.replaceChildren();
   }
 
   function refresh(view) {
@@ -1255,7 +1372,7 @@
         view.summary.replaceChildren();
         view.changeSummary.replaceChildren();
         renderCharts(view, model);
-        renderRows(view.tableBody, model);
+        renderTables(view, model);
         return;
       }
       renderModel(view, model);
@@ -1285,7 +1402,7 @@
       }
       if (event.key !== "Tab") return;
       const focusable = [...view.panel.querySelectorAll('button:not([disabled]), select, [href], [tabindex]:not([tabindex="-1"])')]
-        .filter((node) => !node.hidden && node.getAttribute("aria-hidden") !== "true");
+        .filter((node) => !node.hidden && !node.closest("[hidden]") && node.getAttribute("aria-hidden") !== "true");
       if (!focusable.length) { event.preventDefault(); view.panel.focus(); return; }
       const first = focusable[0], last = focusable[focusable.length - 1];
       if (event.shiftKey && (doc.activeElement === first || doc.activeElement === view.panel)) {
@@ -1330,6 +1447,7 @@
     buildViewModel,
     formatCurrency,
     formatNumber,
+    formatTraffic,
     formatDate,
     formatDateTime,
     renderChart,

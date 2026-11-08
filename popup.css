@@ -321,3 +321,18 @@ select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-i
 .history-open-button{flex:none;margin:0;padding:8px 13px}
 .site-footer-actions>span{min-width:0}
 @media(max-width:420px){.account-preview-row{align-items:flex-start}.account-preview-details{max-width:68%}.account-preview-value{gap:5px}.account-preview-checkin{padding:4px 6px}}
+
+.traffic-total{grid-column:1/-1}
+.traffic-total[hidden]{display:none}
+.traffic-total .stat-value{font-size:22px;letter-spacing:0;overflow-wrap:anywhere}
+.traffic-card .card-top>div{flex:1;min-width:0}
+.traffic-card .platform-name{overflow-wrap:anywhere;letter-spacing:0}
+.traffic-card .address{max-width:100%}
+.traffic-card .badge{flex:none}
+.traffic-card .card-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+.traffic-card .mini-stat{min-width:0}
+.traffic-card .mini-stat strong{font-size:16px;letter-spacing:0;overflow-wrap:anywhere}
+.membership-expiry{display:block;color:var(--muted);font-size:11px;font-weight:400;overflow-wrap:anywhere}
+.traffic-preview .account-preview-amount{white-space:normal;overflow-wrap:anywhere;text-align:right;min-width:0}
+.traffic-preview .account-preview-membership{margin-top:0;overflow-wrap:anywhere}
+@media(max-width:420px){.traffic-preview{flex-wrap:wrap}.traffic-preview .account-preview-details{max-width:100%;margin-left:auto}.traffic-card .mini-stat{padding:0 6px}.traffic-card .mini-stat strong{font-size:14px}}

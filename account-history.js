@@ -41,7 +41,7 @@
       // URL canonicalizes scheme/host/port; pathname keeps deployments distinct.
       // Query and fragment are intentionally omitted because they may contain secrets.
       const pathname = url.pathname.replace(/\/+$/, '');
-      return { rejectedCredentials: false, value: url.origin + pathname };
+      return { rejectedCredentials: false, value: url.origin + pathname, origin: url.origin };
     } catch {
       return null;
     }
@@ -57,11 +57,35 @@
       PLATFORM_ID_RE.test(String(value)) && !['__proto__', 'prototype', 'constructor'].includes(String(value));
   }
 
-  // New-API 的实时 user.id 是数字 ID。token、密码、Cookie 和其片段从不参与身份生成。
+  function validTrafficAccountKey(value) {
+    if (typeof value !== 'string' || !value || value.length > 1536) return false;
+    try {
+      const nickname = decodeURIComponent(value);
+      return nickname.length > 0 && nickname.length <= 128 && !/[\u0000-\u001f\u007f]/.test(nickname) &&
+        encodeURIComponent(nickname.trim().toLowerCase()) === value;
+    } catch {
+      return false;
+    }
+  }
+
+  function isTrafficIdentity(identity) {
+    return typeof identity === 'string' && /^traffic-(?:user|config):/.test(identity.slice(identity.lastIndexOf('|') + 1));
+  }
+
+  // Only confirmed page nicknames or New-API numeric IDs participate; never login credentials.
   function identityFor(platform) {
     if (!platform || typeof platform !== 'object') return null;
     const parsedBase = parsedBaseUrl(platform.baseUrl);
     if (parsedBase && parsedBase.rejectedCredentials) return null;
+    const account = platform.account && typeof platform.account === 'object' ? platform.account : null;
+    if (platform.siteType === 'ikuuu' || (account && account.kind === 'traffic')) {
+      if (!parsedBase) return null;
+      const key = account && account.kind === 'traffic' && account.source === 'page' &&
+        validTrafficAccountKey(account.trafficAccountKey) ? account.trafficAccountKey : null;
+      const identity = key ? parsedBase.origin + '|traffic-user:' + key
+        : validPlatformId(platform.id) ? parsedBase.origin + '|traffic-config:' + String(platform.id) : null;
+      return isSafeIdentity(identity) ? identity : null;
+    }
     const base = parsedBase ? parsedBase.value : null;
     const configuredUserId = platform.userId == null ? '' : String(platform.userId).trim();
     const snapshotUserId = platform.account && typeof platform.account === 'object' && platform.account.userId != null
@@ -77,12 +101,18 @@
   }
 
   function isSafeIdentity(identity) {
-    if (typeof identity !== 'string' || identity.length > 512) return false;
+    if (typeof identity !== 'string' || identity.length > 2048) return false;
     const separator = identity.lastIndexOf('|');
     if (separator < 0) return /^config:[A-Za-z0-9_-]{1,64}$/.test(identity);
 
     const origin = identity.slice(0, separator);
     const localId = identity.slice(separator + 1);
+    if (localId.startsWith('traffic-')) {
+      const parsed = parsedBaseUrl(origin);
+      if (!parsed || parsed.rejectedCredentials || parsed.origin !== origin) return false;
+      if (localId.startsWith('traffic-user:')) return validTrafficAccountKey(localId.slice('traffic-user:'.length));
+      return localId.startsWith('traffic-config:') && validPlatformId(localId.slice('traffic-config:'.length));
+    }
     if (normalizedBaseUrl(origin) !== origin) return false;
     return /^user:\d{1,64}$/.test(localId) || /^config:[A-Za-z0-9_-]{1,64}$/.test(localId);
   }
@@ -97,6 +127,15 @@
   function normalizeSample(sample, now, cutoff) {
     if (!sample || typeof sample !== 'object' || !validTime(sample.at) || sample.at > now || sample.at < cutoff) return null;
     if (typeof sample.month !== 'string' || !MONTH_RE.test(sample.month)) return null;
+    if (sample.kind === 'traffic') {
+      return {
+        at: sample.at,
+        kind: 'traffic',
+        remainingTrafficBytes: finiteOrNull(sample.remainingTrafficBytes, { nonNegative: true }),
+        month: sample.month,
+      };
+    }
+    if (sample.kind != null && sample.kind !== 'money') return null;
     return {
       at: sample.at,
       balance: finiteOrNull(sample.balance),
@@ -131,7 +170,7 @@
       const samplesByTime = new Map();
       for (const candidate of entry.samples) {
         const sample = normalizeSample(candidate, currentTime, cutoff);
-        if (sample) samplesByTime.set(sample.at, sample);
+        if (sample && (sample.kind === 'traffic') === isTrafficIdentity(entry.identity)) samplesByTime.set(sample.at, sample);
       }
       const samples = [...samplesByTime.values()].sort((a, b) => a.at - b.at).slice(-MAX_SAMPLES_PER_ACCOUNT);
       if (!samples.length) continue;
@@ -155,6 +194,17 @@
 
   function createSample(account, month, at = Date.now()) {
     if (!account || typeof account !== 'object' || !validTime(at)) return null;
+    const monthValue = typeof month === 'string' && MONTH_RE.test(month) ? month : null;
+    if (!monthValue) return null;
+    if (account.kind === 'traffic') {
+      return {
+        at,
+        kind: 'traffic',
+        remainingTrafficBytes: finiteOrNull(account.remainingTrafficBytes, { nonNegative: true }),
+        month: monthValue,
+      };
+    }
+    if (account.kind != null && account.kind !== 'money') return null;
     const quotaPerUnit = typeof account.quotaPerUnit === 'number'
       ? account.quotaPerUnit
       : (typeof account.quotaPerUnit === 'string' && account.quotaPerUnit.trim() ? Number(account.quotaPerUnit) : NaN);
@@ -162,8 +212,6 @@
     const available = finiteOrNull(account.available);
     const usedQuota = finiteOrNull(account.used);
     const tokens = finiteOrNull(account.monthlyTokens, { nonNegative: true, integer: true });
-    const monthValue = typeof month === 'string' && MONTH_RE.test(month) ? month : null;
-    if (!monthValue) return null;
     return {
       at,
       balance: available == null || unit == null ? null : available / unit,
@@ -178,7 +226,7 @@
   function appendSample(value, platformId, identity, sample, now = Date.now()) {
     if (!validPlatformId(platformId) || !isSafeIdentity(identity)) return sanitizeHistory(value, now);
     const normalizedSample = normalizeSample(sample, now, now - RETENTION_DAYS * DAY_MS);
-    if (!normalizedSample) return sanitizeHistory(value, now);
+    if (!normalizedSample || (normalizedSample.kind === 'traffic') !== isTrafficIdentity(identity)) return sanitizeHistory(value, now);
 
     const history = sanitizeHistory(value, now);
     if (Object.keys(history.accounts).length === 0) history.startedAt = normalizedSample.at;

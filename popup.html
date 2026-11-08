@@ -14,7 +14,7 @@
     <header class="hero">
       <div>
         <h1>NewAPI 一键签到管理</h1>
-        <p class="subtitle">仅支持已启用签到接口的 NewAPI 及兼容站点。数据仅存本地，令牌不出浏览器。</p>
+        <p class="subtitle">多站点签到管理</p>
       </div>
       <div class="hero-actions">
         <button class="theme-toggle" id="themeToggle" type="button" title="切换深/浅色界面" aria-label="切换深/浅色界面">☾</button>
@@ -33,6 +33,7 @@
       <div class="stat"><span class="stat-label">今日已签到</span><strong class="stat-value" id="checkedPlatforms">0</strong></div>
       <div class="stat"><span class="stat-label">本月签到次数</span><strong class="stat-value" id="monthCheckins">0</strong></div>
       <div class="stat"><span class="stat-label">累计可用额度</span><strong class="stat-value" id="totalQuota">0.0000 <small>额度</small></strong></div>
+      <div class="stat traffic-total" id="totalTrafficStat" hidden><span class="stat-label">剩余流量总计</span><strong class="stat-value" id="totalTraffic">— <small>GB</small></strong></div>
     </section>
 
     <section class="panel">
@@ -89,7 +90,13 @@
       <div class="modal-head"><h2 id="modalTitle">添加平台</h2><button class="close" id="closeBtn" aria-label="关闭">×</button></div>
       <form id="platformForm">
         <div class="form-grid auth-top">
-          <label>鉴权方式
+          <label>站点类型
+            <select id="siteType">
+              <option value="newapi">NewAPI</option>
+              <option value="ikuuu">iKuuu（流量站点）</option>
+            </select>
+          </label>
+          <label id="authModeField">鉴权方式
             <select id="authMode">
               <option value="token">访问令牌（默认）</option>
               <option value="password">邮箱密码（邮箱或用户名登录）</option>
@@ -102,8 +109,8 @@
         </div>
         <div class="form-grid">
           <label>站点名称<input id="name" required placeholder="例如：我的 NewAPI 站点" /></label>
-          <label>NewAPI 站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
-          <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
+          <label>站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
+          <label id="userIdField">NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
           <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点生成的系统访问令牌" /></label>
           <label id="loginUsernameField" style="display:none">邮箱 / 用户名<input id="loginUsername" autocomplete="username" placeholder="登录邮箱或用户名" /></label>
           <div id="loginPasswordField" class="full" style="display:none">
@@ -113,11 +120,11 @@
               <button id="loginPasswordToggle" class="password-toggle" type="button" aria-label="显示登录密码" title="显示登录密码" aria-pressed="false" aria-controls="loginPassword"><span class="password-icon" aria-hidden="true"></span></button>
             </div>
           </div>
-          <label id="visitOnlyField" class="full"><span class="keepalive-head"><span>仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">登录完成后在同一临时页刷新一次，读取最新额度再关闭，不会关闭后重新开页；仅跳过签到接口，其他功能保持正常。任务结束后关闭本轮临时页，是否退出账号由下方开关决定；不代表签到成功。</small></label>
+          <label id="visitOnlyField" class="full"><span class="keepalive-head"><span id="visitOnlyLabel">仅访问（不调用签到接口）</span><span class="switch"><input id="visitOnly" type="checkbox" /><span class="track"></span></span></span><small id="visitOnlyHint" style="display:block;margin-top:6px;font-weight:400">登录完成后在同一临时页刷新一次，读取最新额度再关闭，不会关闭后重新开页；仅跳过签到接口，其他功能保持正常。任务结束后关闭本轮临时页，是否退出账号由下方开关决定；不代表签到成功。</small></label>
           <label id="logoutAfterVisitField" class="full" style="display:none"><span class="keepalive-head"><span>访问结束后退出账号</span><span class="switch"><input id="logoutAfterVisit" type="checkbox" /><span class="track"></span></span></span><small style="display:block;margin-top:6px;font-weight:400">默认关闭：不主动退出登录，只关闭本轮临时页。开启后，无论访问成功、失败或停止都会尝试退出；同站其他页面也会受影响。每个账号独立保存，对后续任务生效。</small></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
         </div>
-        <div class="keepalive-box">
+        <div class="keepalive-box" id="keepAliveBox">
           <label class="keepalive-head">
             <span class="keepalive-title">自动调用 API（防僵尸号）</span>
             <span class="switch"><input type="checkbox" id="keepAliveEnabled" /><span class="track"></span></span>
