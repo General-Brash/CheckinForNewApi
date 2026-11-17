@@ -26,7 +26,7 @@ function harness(file, initial = {}) {
   // Legacy auth regressions opt out of queue pacing; dedicated interval tests explicitly enable it.
   const store = structuredClone({ ...initial, 'nacheckin.settings': { checkinIntervalSeconds: 0, ...(initial['nacheckin.settings'] || {}) } });
   const tabs = new Map();
-  const created = [], removed = [], updates = [], reloaded = [], injections = [], noticeInjections = [], dashboardRefreshInjections = [], messages = [];
+  const created = [], removed = [], updates = [], reloaded = [], injections = [], noticeInjections = [], dashboardRefreshInjections = [], loginProbeInjections = [], messages = [];
   let tabId = 1;
   const NativeDate = Date;
   let clockNow = NativeDate.now();
@@ -80,7 +80,7 @@ function harness(file, initial = {}) {
       async update(id, opts) {
         if (!tabs.has(id)) throw new Error('no tab');
         Object.assign(tabs.get(id), opts); updates.push({ id, ...opts });
-        if (opts.url && ['/', '/console'].includes(new URL(opts.url).pathname)) setImmediate(() => {
+        if (opts.url && ['/', '/console', '/login'].includes(new URL(opts.url).pathname)) setImmediate(() => {
           const tab = tabs.get(id);
           if (tab && tab.status === 'complete') for (const fn of chrome.tabs.onUpdated.listeners) fn(id, {status:'complete'}, {...tab});
         });
@@ -103,7 +103,8 @@ function harness(file, initial = {}) {
       // The legacy DOM fixtures have no announcement; keep those preparatory scripts separate
       // from identity/quota/auth assertions. Real announcement DOM behavior has its own suite.
       if (spec.func.name === 'tabDismissSiteNotice') { noticeInjections.push(spec); return [{ result: { ok: true, dismissed: false } }]; }
-      // Native dashboard refresh has its own DOM/XHR suite; auth fixtures isolate login/account reads.
+      if (spec.func.name === 'tabFindSiteLogin') { loginProbeInjections.push(spec); return [{ result: await ctx.findSiteLogin(spec) }]; }
+      // Native dashboard refresh has separate request/DOM regressions.
       if (spec.func.name === 'tabRefreshNewApiDashboard') {
         dashboardRefreshInjections.push(spec);
         return [{ result: await ctx.dashboardRefresh(spec) }];
@@ -129,13 +130,17 @@ function harness(file, initial = {}) {
     // Advance polling without wall-clock waits; long tab timeout not needed for complete mocks.
     setTimeout: scheduleTimeout, clearTimeout: clearScheduledTimeout,
     script: async () => null,
+    findSiteLogin: async (spec) => {
+      const url = new URL(tabs.get(spec.target.tabId).url);
+      return {ok:url.origin === spec.args[0],found:/^\/login\/?$/.test(url.pathname),allowHome:false};
+    },
     dashboardRefresh: async () => ({ok:true,refreshed:true}),
     fetch: async () => { throw new Error('Unexpected network request'); },
   });
   let source = fs.readFileSync(path.join(root, file), 'utf8');
   if (file === 'popup.js') { vm.runInContext(fs.readFileSync(path.join(root,'auth-config.js'),'utf8'),ctx,{filename:'auth-config.js'}); source = source.replace(/\ninit\(\);\s*$/, ''); }
   vm.runInContext(source, ctx, { filename: file });
-  return { ctx, chrome, store, tabs, created, removed, updates, reloaded, injections, noticeInjections, dashboardRefreshInjections, messages, advanceClock, run: (code) => vm.runInContext(code, ctx) };
+  return { ctx, chrome, store, tabs, created, removed, updates, reloaded, injections, noticeInjections, dashboardRefreshInjections, loginProbeInjections, messages, advanceClock, run: (code) => vm.runInContext(code, ctx) };
 }
 const plain = (value) => JSON.parse(JSON.stringify(value));
 function linuxDoAuthorizeUrl(overrides = {}) {
@@ -397,6 +402,56 @@ test('password form refuses wrong origin/path before touching any input', async 
   h.ctx.location={origin:'https://anyrouter.top',protocol:'https:',pathname:'/register'};
   assert.equal((await h.run('tabSubmitPasswordLogin("https://anyrouter.top","alice","secret")')).ok,false);
 });
+test('the current-page login probe is read-only and home forms still require an explicit safe login target', async () => {
+  const h = harness('background.js');
+  let submitted = 0; const events = [], attrs = {method:'post'};
+  class Input {
+    get value() { return this._value || ''; } set value(value) { this._value = value; }
+    getClientRects() { return [1]; } dispatchEvent(event) { events.push(event.type); }
+  }
+  const user = new Input(), password = new Input();
+  const button = {type:'submit',textContent:'Log in',getClientRects(){return [1];},getAttribute(){return null;},click(){submitted++;}};
+  let registered = 0;
+  const register = {type:'submit',textContent:'Register',getClientRects(){return [1];},
+    getAttribute(key){return key === 'formaction' ? '/register' : null;},click(){registered++;}};
+  const form = {addEventListener(name,fn){this.guard=fn;},getAttribute(key){return attrs[key] || null;},
+    querySelectorAll(selector){return selector.includes('button') ? [register,button] : [user];}};
+  password.form = form;
+  h.ctx.HTMLInputElement = Input; h.ctx.Event = class {constructor(type){this.type=type;}};
+  h.ctx.location = {origin:'https://anyrouter.top',protocol:'https:',pathname:'/',href:'https://anyrouter.top/'};
+  h.ctx.document = {querySelectorAll(selector){return selector === 'button' ? [] : [password];}};
+  let probe = h.run('tabFindSiteLogin("https://anyrouter.top")');
+  assert.equal(probe.found,true); assert.equal(probe.allowHome,true);
+  assert.equal(user.value,''); assert.equal(password.value,''); assert.equal(submitted,0); assert.deepEqual(events,[]);
+  let result = await h.run('tabSubmitPasswordLogin("https://anyrouter.top","alice"," exact ","",true)');
+  assert.equal(result.ok,true); assert.equal(password.value,' exact '); assert.equal(submitted,1);
+  assert.equal(registered,0,'a preceding Register submit button must not receive credentials');
+  user.value=''; password.value=''; button.textContent='Register';
+  assert.equal(h.run('tabFindSiteLogin("https://anyrouter.top")').found,false);
+  result = await h.run('tabSubmitPasswordLogin("https://anyrouter.top","alice","secret","",true)');
+  assert.equal(result.ok,false); assert.equal(password.value,''); assert.equal(submitted,1);
+  button.textContent='Log in'; attrs.action='https://evil.example/login';
+  result = await h.run('tabSubmitPasswordLogin("https://anyrouter.top","alice","secret","",true)');
+  assert.equal(result.ok,false); assert.equal(password.value,''); assert.equal(submitted,1);
+  h.ctx.location.origin='https://evil.example';
+  h.ctx.document={querySelectorAll(){assert.fail('foreign page must not be inspected');}};
+  assert.equal(h.run('tabFindSiteLogin("https://anyrouter.top")').ok,false);
+});
+for (const status of [404,405]) {
+  test(`HTML challenge HTTP ${status} is not a missing account or OAuth interface`, async () => {
+    const h = harness('background.js');
+    assert.throws(() => h.run(`sessionProbeUser({ok:false,status:${status},htmlResponse:true},true)`), {code:'SESSION_CHALLENGE'});
+    const tab = await h.chrome.tabs.create({url:'https://agentrouter.org/'});
+    h.ctx.platform=oauthPlatform({authMode:'password',loginUsername:'alice',loginPassword:'secret'}); h.ctx.tabId=tab.id;
+    h.ctx.script=async () => ({ok:false,status,htmlResponse:true});
+    await assert.rejects(h.run('readAgentRouterPasswordSession(platform,tabId,true)'), {code:'SESSION_CHALLENGE'});
+    h.ctx.location={origin:'https://agentrouter.org'};
+    h.ctx.fetch=async () => ({ok:false,status,json:async () => {throw new SyntaxError('HTML challenge');}});
+    const result=await h.run('tabBuildAgentRouterOauthUrl("linuxdo","https://agentrouter.org")');
+    assert.equal(result.ok,false); assert.notEqual(result.loginPageRequired,true);
+    assert.equal(h.updates.length,0);
+  });
+}
 test('password orchestration validates online identity, uses form and closes only owned success tab', async () => {
   const h=harness('background.js'); h.ctx.input=passwordPlatform();
   let submitted=false;
@@ -787,7 +842,7 @@ test('shared auth configuration loads before UI and worker exposes matching capa
   }
   const h=harness('background.js');const listener=h.chrome.runtime.onMessage.listeners[0];
   const capabilities=await new Promise((resolve)=>listener({type:'getCapabilities'},{id:h.chrome.runtime.id,url:h.chrome.runtime.getURL('sidebar.html')},resolve));
-  assert.equal(capabilities.authBuild,'1.7.14-auth-v15');assert.equal(capabilities.version,'1.7.14');assert.ok(capabilities.authModes.includes('agentrouter_linuxdo'));assert.ok(capabilities.authModes.includes('agentrouter_token'));
+  assert.equal(capabilities.authBuild,h.ctx.NACheckinAuth.build);assert.equal(capabilities.version,h.chrome.runtime.getManifest().version);assert.ok(capabilities.authModes.includes('agentrouter_linuxdo'));assert.ok(capabilities.authModes.includes('agentrouter_token'));
 });
 
 // Visit-only preserves login and account reads; only the check-in operation is skipped.
@@ -890,13 +945,14 @@ test('visit-only export/import preserves the option and the corresponding passwo
   assert.equal(h.store[PLATFORMS][1].visitOnly, true);
   assert.equal(h.store[PLATFORMS][1].loginPassword, '');
 });
-test('visit-only opens one owned tab, enters the dashboard and closes it while preserving existing user tabs', async () => {
+test('visit-only refreshes its own dashboard once and preserves existing user tabs', async () => {
   const h = harness('background.js'), counts = allowVisitReads(h);
   const existing = await h.chrome.tabs.create({url:'https://anyrouter.top/',active:true});
   h.ctx.input = visitPlatform({baseUrl:'https://anyrouter.top/api/user/checkin?danger=1'});
   const result = await h.run('runCheckin(input,{reauth:true})');
   assert.equal(result.ok, true); assert.equal(result.visited, true); assert.equal(result.data, null);
   assert.equal(h.created.length, 2); assert.equal(h.created[1].url, 'https://anyrouter.top/console');
+  assert.equal(h.updates.filter(entry => entry.url).length, 1);
   assert.equal(h.reloaded.length, 0); assert.equal(h.dashboardRefreshInjections.length, 1);
   assert.deepEqual(h.removed, [h.created[1].id]); assert.ok(h.tabs.has(existing.id));
   assertNoSiteRequests(h, counts);
@@ -915,7 +971,8 @@ test('visit-only waits for page load and cleans listeners; timeout/closed page d
       return h.tabs.get(tab.id);
     };
     let timeout;
-    h.ctx.setTimeout = (fn, ms) => { if (ms === 30000) timeout = fn; return 1; };
+    const schedule = h.ctx.setTimeout;
+    h.ctx.setTimeout = (fn, ms) => { if (ms === 30000) { timeout = fn; return -1; } return schedule(fn, ms); };
     if (mode === 'close-fails') h.chrome.tabs.remove = async () => { throw new Error('cannot close tab'); };
     h.ctx.input = visitPlatform();
     const running = h.run('runCheckin(input)'); await new Promise(setImmediate);
@@ -1110,7 +1167,8 @@ test('automatic visit result cannot overwrite a config changed while its page wa
   const tab=h.created[0];h.tabs.get(tab.id).status='complete';
   for(const fn of [...h.chrome.tabs.onUpdated.listeners])fn(tab.id,{status:'complete'},h.tabs.get(tab.id));
   const summary=await running;
-  assert.equal(summary.visited,1);assert.equal(summary.ok,0);
+  assert.equal(summary.visited,0);assert.equal(summary.ok,0);assert.equal(summary.fail,1);
+  assert.equal(h.dashboardRefreshInjections.length,0,'changed configuration must stop before the native click');
   assert.equal(h.store[PLATFORMS][0].visitOnly,false);
   assert.equal(h.store[PLATFORMS][0].stats.checked_in_today,false);
   assert.equal(h.store[PLATFORMS][0].lastVisitDate,undefined);
@@ -1165,7 +1223,7 @@ for (const authMode of ['token','cookie','password','agentrouter_token','agentro
     assert.equal(h.created.length, 1); assert.equal(h.removed.length, 1);
     assert.equal(h.reloaded.length, 0);
     assert.equal(h.dashboardRefreshInjections.length, 1);
-    assert.equal(h.dashboardRefreshInjections[0].target.tabId, h.created[0].id);
+    assert.ok(h.injections.every((spec) => spec.target.tabId === h.created[0].id));
     assert.ok(counts.identity >= 2);
     assertNoSiteRequests(h, counts);
     assert.equal(h.store[PLATFORMS][0].stats.checked_in_today, false);
@@ -1191,17 +1249,20 @@ test('visit-only password login keeps its sole page open until fresh online iden
       submitted = true; assert.equal(spec.args[2], p.loginPassword); return {ok:true};
     }
     if (spec.func.name === 'tabReadAgentRouterStoredUser') {
-      await loginFinished; return {id:12,checked_in:true};
+      await loginFinished;
+      h.tabs.get(spec.target.tabId).url = p.baseUrl + '/';
+      return {id:12,checked_in:true};
     }
     assert.fail(`Unexpected injection: ${spec.func.name}`);
   };
-  const running = h.run('runBatchCheckinOne(input)'); await new Promise(setImmediate);
+  const running = h.run('runBatchCheckinOne(input)');
+  for (let i = 0; i < 10 && !submitted; i++) await new Promise(setImmediate);
   assert.equal(submitted, true); assert.equal(h.removed.length, 0);
   assert.equal(h.created.length, 1); assert.match(h.tabs.get(h.created[0].id).url, /\/login$/);
   online = true; release();
   const result = await running;
   assert.equal(result.visited, true); assert.equal(h.removed.length, 1);
-  assert.equal(h.updates.at(-1).url, 'https://anyrouter.top/console');
+  assert.equal(h.updates.filter((entry) => entry.url === 'https://anyrouter.top/console').length, 1);
   assert.equal(h.reloaded.length, 0); assert.equal(h.dashboardRefreshInjections.length, 1);
   assert.equal(h.store[PLATFORMS][0].stats.checked_in_today, false);
   assert.equal(h.store[PLATFORMS][0].lastCheckinAt, undefined);
@@ -1228,6 +1289,7 @@ for (const authMode of ['cookie','token']) {
       assert.equal(spec.args[0], '/api/user/self');
       if (++attempts === 1) return {ok:false,status:401};
       await manualLogin;
+      h.tabs.get(spec.target.tabId).url = 'https://anyrouter.top/';
       return {ok:true,body:{success:true,data:{id:12,quota:50}}};
     };
     const running = h.run('runCheckin(input)'); await new Promise(setImmediate);
@@ -1236,7 +1298,7 @@ for (const authMode of ['cookie','token']) {
     release();
     const result = await running;
     assert.equal(result.visited, true); assert.equal(h.removed.length, 1);
-    assert.equal(h.updates.at(-1).url, 'https://anyrouter.top/console');
+    assert.equal(h.updates.filter((entry) => entry.url === 'https://anyrouter.top/console').length, 1);
     assert.equal(h.reloaded.length, 0); assert.equal(h.dashboardRefreshInjections.length, 1);
   });
 }
@@ -1329,27 +1391,28 @@ test('visit-only rechecks shared account immediately before closing its owned pa
   };
   const result = await h.run('runCheckin(input)');
   assert.equal(result.ok, false); assert.match(result.message, /不一致/);
-  assert.equal(result.visited, undefined); assert.equal(h.removed.length, 1);
-  assert.equal(h.tabs.has(h.created[0].id), false);
+  assert.equal(result.visited, undefined); assert.equal(h.removed.length, 0);
+  assert.equal(h.tabs.has(h.created[0].id), true);
   assert.equal(h.run('visitOnlyOrigins.size'), 0);
 });
 
-test('visit-only refreshes once and publishes fresh quota and monthly tokens before closing', async () => {
+test('visit-only refreshes once and reads fresh quota and monthly tokens before closing', async () => {
   const p = visitPlatform({authMode:'cookie',account:{available:100,used:5,monthlyTokens:99},stats:{checked_in_today:false}});
   const h = harness('background.js', {[PLATFORMS]:[p]}); h.ctx.input = p;
   const existing = await h.chrome.tabs.create({url:'https://anyrouter.top/console',active:true});
-  let refreshed = false, refreshes = 0; const requests = [];
+  const requests = [];
   h.ctx.dashboardRefresh = async (spec) => {
-    assert.equal(h.tabs.get(spec.target.tabId).url, 'https://anyrouter.top/console');
-    refreshes++; refreshed = true; return {ok:true};
+    assert.equal(spec.target.tabId, h.created[1].id);
+    assert.equal(h.removed.length, 0);
+    return {ok:true,refreshed:true};
   };
   h.ctx.script = async (spec) => {
     assert.equal(spec.func.name, 'tabFetchCheckin'); assert.equal(spec.args[1], 'GET');
     assert.equal(h.removed.length, 0);
-    requests.push({tabId:spec.target.tabId,path:spec.args[0],refreshed});
+    requests.push({tabId:spec.target.tabId,path:spec.args[0]});
     if (spec.args[0] === '/api/log/self') return {ok:true,body:{success:true,data:[{prompt_tokens:12,completion_tokens:8}]}};
     assert.equal(spec.args[0], '/api/user/self');
-    return {ok:true,body:{success:true,data:{id:12,quota:refreshed ? 180 : 100,used_quota:7,request_count:3}}};
+    return {ok:true,body:{success:true,data:{id:12,quota:180,used_quota:7,request_count:3}}};
   };
   const remove = h.chrome.tabs.remove;
   h.chrome.tabs.remove = async (id) => {
@@ -1359,48 +1422,52 @@ test('visit-only refreshes once and publishes fresh quota and monthly tokens bef
     await remove(id);
   };
   const result = await h.run('runCheckin(input)');
-  assert.equal(result.visited, true); assert.equal(refreshes, 1);
+  assert.equal(result.visited, true); assert.equal(h.dashboardRefreshInjections.length, 1);
   assert.equal(h.reloaded.length, 0);
+  assert.equal(h.updates.filter(entry => entry.url).length, 1);
   assert.equal(result.account.available, 180); assert.equal(result.account.used, 7);
   assert.equal(result.account.monthlyTokens, 20); assert.equal(result.quotaDelta, 80);
   assert.equal(h.created.length, 2); assert.deepEqual(h.removed, [h.created[1].id]);
   assert.ok(h.tabs.has(existing.id));
   assert.ok(requests.every((r) => r.tabId === h.created[1].id));
-  assert.ok(requests.some((r) => r.refreshed && r.path === '/api/user/self'));
+  assert.ok(requests.some((r) => r.path === '/api/user/self'));
   assert.equal(h.store[PLATFORMS][0].lastCheckinAt, undefined);
 });
 test('visit-only preserves password re-login for callback-triggered sites even with a valid old session', async () => {
   const p = visitPlatform({baseUrl:'https://agentrouter.org',account:{available:100},stats:{checked_in_today:false}});
   const h = harness('background.js', {[PLATFORMS]:[p]}); h.ctx.input = p;
-  let submitted = false, refreshed = false, logouts = 0, refreshes = 0;
+  let submitted = false, logouts = 0;
   const update = h.chrome.tabs.update;
   h.chrome.tabs.update = async (id, opts) => {
     if (opts.url === p.baseUrl + '/console') assert.equal(submitted, true);
     return update(id, opts);
   };
-  h.ctx.dashboardRefresh = async () => { assert.equal(submitted, true); refreshed = true; refreshes++; return {ok:true}; };
+  h.ctx.dashboardRefresh = async () => { assert.equal(submitted, true); return {ok:true,refreshed:true}; };
   h.ctx.script = async (spec) => {
     if (spec.func.name === 'tabFetchAgentRouterAccount' || spec.func.name === 'tabReadAgentRouterDashboard') {
-      return {ok:true,body:{success:true,data:{id:12,email:'alice@example.com',quota:refreshed ? 200 : 100}}};
+      return {ok:true,body:{success:true,data:{id:12,email:'alice@example.com',quota:submitted ? 200 : 100}}};
     }
     if (spec.func.name === 'tabFetchCheckin') {
       if (spec.args[0] === '/api/log/self') return {ok:true,body:{success:true,data:[]}};
       assert.equal(spec.args[0], '/api/user/self');
-      return {ok:true,body:{success:true,data:{id:12,email:'alice@example.com',quota:refreshed ? 200 : 100}}};
+      return {ok:true,body:{success:true,data:{id:12,email:'alice@example.com',quota:submitted ? 200 : 100}}};
     }
     if (spec.func.name === 'tabLogout') {logouts++; return {ok:true};}
     if (spec.func.name === 'tabSubmitPasswordLogin') {submitted = true; return {ok:true};}
-    if (spec.func.name === 'tabReadAgentRouterStoredUser') return submitted ? {id:12,checked_in:true} : null;
+    if (spec.func.name === 'tabReadAgentRouterStoredUser') {
+      if (submitted) h.tabs.get(spec.target.tabId).url = p.baseUrl + '/console';
+      return submitted ? {id:12,checked_in:true} : null;
+    }
     assert.fail(spec.func.name);
   };
   const result = await h.run('runCheckin(input,{reauth:true})');
   assert.equal(result.visited, true); assert.equal(result.account.available, 200);
-  assert.equal(logouts, 1); assert.equal(submitted, true); assert.equal(refreshes, 1);
+  assert.equal(logouts, 1); assert.equal(submitted, true); assert.equal(h.dashboardRefreshInjections.length, 1);
   assert.equal(h.created.length, 1); assert.equal(h.removed.length, 1);
   assert.equal(h.store[PLATFORMS][0].account.available, 200);
   assert.equal(h.store[PLATFORMS][0].stats.checked_in_today, false);
 });
-test('unchanged and zero quota close normally; missing or invalid latest quota still closes without logout', async () => {
+test('unchanged and zero quota close normally; invalid latest quota retains the page without logout', async () => {
   for (const quota of [50,0,null,'invalid',true,' ']) {
     const p = visitPlatform({authMode:'cookie',account:{available:quota === 0 ? 0 : 50}});
     const h = harness('background.js', {[PLATFORMS]:[p]}); h.ctx.input = p;
@@ -1409,9 +1476,9 @@ test('unchanged and zero quota close normally; missing or invalid latest quota s
     const valid = quota === 50 || quota === 0;
     assert.equal(result.ok, valid, String(quota));
     assert.equal(result.visited === true, valid, String(quota));
-    assert.equal(h.removed.length, 1, String(quota));
+    assert.equal(h.removed.length, valid ? 1 : 0, String(quota));
     if (valid) {assert.equal(result.account.available, quota); assert.equal(result.quotaDelta, 0);}
-    else {assert.equal(h.tabs.has(h.created[0].id), false); assert.equal(h.store[PLATFORMS][0].account.available, 50);}
+    else {assert.equal(h.tabs.has(h.created[0].id), true); assert.equal(h.store[PLATFORMS][0].account.available, 50);}
   }
 });
 test('normal log-read failure does not discard freshly refreshed quota or prevent closing', async () => {
@@ -1426,6 +1493,7 @@ test('normal log-read failure does not discard freshly refreshed quota or preven
   const result = await h.run('runCheckin(input)');
   assert.equal(result.visited, true); assert.equal(result.account.available, 130);
   assert.equal(result.account.monthlyTokens, null); assert.match(result.account._warn, /本月Token接口不可用/);
+  assert.equal(h.updates.filter((entry) => entry.url === p.baseUrl + '/console').length, 1);
   assert.equal(h.removed.length, 1);
 });
 test('visit-only retains enabled keepalive in batch and automatic tasks without implicitly enabling it', async () => {
@@ -1476,25 +1544,29 @@ test('visit-only normal model read dispatch remains available and check-in alias
   h.ctx.input = visitPlatform({checkinPath:'/api/user/self',triggerSelf:true});
   await assert.doesNotReject(h.run('assertApiAllowed(input,"/api/user/self")'));
 });
-test('visit-only waits for its one refresh to complete before reading final quota', async () => {
+test('visit-only waits for its post-refresh balance response before closing', async () => {
   const p = visitPlatform({authMode:'cookie'}), h = harness('background.js', {[PLATFORMS]:[p]}); h.ctx.input = p;
   const counts = allowVisitReads(h);
-  let releaseRefresh;
-  const refreshed = new Promise((resolve) => { releaseRefresh = resolve; });
-  h.ctx.dashboardRefresh = async (spec) => {
-    assert.equal(h.tabs.get(spec.target.tabId).url, 'https://anyrouter.top/console');
-    await refreshed; return {ok:true};
+  let releaseBalance, identityReads = 0;
+  const balance = new Promise((resolve) => { releaseBalance = resolve; });
+  const script = h.ctx.script;
+  h.ctx.script = async (spec) => {
+    const result = await script(spec);
+    if (spec.args[0] === '/api/user/self' && ++identityReads === 2) await balance;
+    return result;
   };
-  const running = h.run('runCheckin(input)'); await new Promise(setImmediate);
-  assert.equal(counts.identity, 1); assert.equal(h.removed.length, 0);
-  releaseRefresh();
+  const running = h.run('runCheckin(input)');
+  for (let i=0;i<10&&identityReads<2;i++) await new Promise(setImmediate);
+  assert.equal(counts.identity, 2); assert.equal(counts.logs, 0); assert.equal(h.removed.length, 0);
+  assert.equal(h.updates.filter(entry => entry.url).length, 1); assert.equal(h.dashboardRefreshInjections.length, 1);
+  releaseBalance();
   const result = await running;
   assert.equal(result.visited, true); assert.equal(result.account.available, 50);
-  assert.equal(h.updates.filter((x) => x.url === 'https://anyrouter.top/console').length, 1);
+  assert.equal(h.updates.filter(entry => entry.url).length, 1);
   assert.equal(h.dashboardRefreshInjections.length, 1); assert.equal(h.reloaded.length, 0);
   assert.equal(h.removed.length, 1); assertNoSiteRequests(h, counts);
 });
-test('failure to publish fresh account data still logs out and closes', async () => {
+test('failure to publish fresh account data retains the page without a visit marker', async () => {
   const p = visitPlatform({authMode:'cookie',account:{available:10}});
   const h = harness('background.js', {[PLATFORMS]:[p]}); h.ctx.input = p; allowVisitReads(h);
   h.chrome.storage.local.set = (values, cb) => {
@@ -1503,8 +1575,8 @@ test('failure to publish fresh account data still logs out and closes', async ()
   };
   const result = await h.run('runCheckin(input)');
   assert.equal(result.ok, false); assert.match(result.message, /存储写入失败/);
-  assert.equal(result.visited, undefined); assert.equal(h.removed.length, 1);
-  assert.equal(h.tabs.has(h.created[0].id), false);
+  assert.equal(result.visited, undefined); assert.equal(h.removed.length, 0);
+  assert.equal(h.tabs.has(h.created[0].id), true);
   assert.equal(h.store[PLATFORMS][0].account.available, 10);
   assert.equal(h.run('visitOnlyOrigins.size'), 0);
 });
@@ -1680,6 +1752,7 @@ for (const html of ['popup.html','sidebar.html']) {
   });
 }
 function installAccountXhr(h, reply) {
+  h.ctx.location = {origin:'https://agentrouter.org'};
   const local = new Map([['user', JSON.stringify({id:11,quota:1100,used_quota:11,checked_in:true})]]);
   h.ctx.localStorage = {getItem(k){return local.get(k)||null;},setItem(k,v){local.set(k,v);}};
   h.ctx.XMLHttpRequest = class {
@@ -1730,8 +1803,8 @@ test('OAuth waits for stale previous-account localStorage to update instead of r
     if (spec.func.name === 'tabCheckAgentRouterLogin') return ++cachedReads === 1 ?
       {ok:false,userMismatch:true,userId:'11',checkedIn:true} : {ok:true,userId:'22',checkedIn:true,account:{available:999}};
     if (spec.func.name === 'tabFetchCheckin') {assert.equal(spec.args[0], '/api/log/self'); return {ok:true,body:{success:true,data:[]}};}
-    assert.equal(spec.func.name, h.dashboardRefreshInjections.length ? 'tabReadAgentRouterDashboard' : 'tabFetchAgentRouterAccount');
-    if (!h.dashboardRefreshInjections.length) assert.equal(spec.args[1], true);
+    assert.ok(['tabReadAgentRouterDashboard','tabFetchAgentRouterAccount'].includes(spec.func.name));
+    if (spec.func.name === 'tabFetchAgentRouterAccount') assert.equal(spec.args[1], true);
     return {ok:true,body:{success:true,data:{id:22,quota:2200,used_quota:22}}};
   };
   await h.run('handleAgentRouterReauthTab(pending.tabId,"https://agentrouter.org/oauth/linuxdo?code=c&state=state-linux")');
@@ -1788,24 +1861,25 @@ async function ownedCallbackFixture(authMode = 'agentrouter_linuxdo', extra = {}
   return {h,p,tab,pending,callback};
 }
 for (const mode of ['agentrouter_token','agentrouter_linuxdo']) {
-  test(`${mode}: a transient old live account during OAuth is retried, then dashboard data is refreshed without reload and saved before close`, async () => {
+  test(`${mode}: a transient old live account during OAuth is retried, then refreshed dashboard data is saved before close`, async () => {
     const {h,p,tab} = await ownedCallbackFixture(mode);
-    let reads = 0, refreshed = false;
-    h.ctx.dashboardRefresh = async (spec) => {
-      assert.equal(spec.target.tabId, tab.id); assert.equal(reads, 3); refreshed = true;
-      return {ok:true};
-    };
+    let reads = 0, dashboardReads = 0;
+    h.ctx.dashboardRefresh = async () => { assert.equal(reads,3); return {ok:true,refreshed:true}; };
     h.ctx.script = async (spec) => {
       assert.equal(spec.target.tabId, tab.id); assert.equal(h.removed.length, 0);
       if (spec.func.name === 'tabCheckAgentRouterLogin') return {ok:true,userId:p.userId,checkedIn:true,account:{available:9999}};
       if (spec.func.name === 'tabFetchCheckin') {
-        assert.equal(spec.args[0], '/api/log/self'); assert.equal(refreshed, true);
+        assert.equal(spec.args[0], '/api/log/self'); assert.equal(dashboardReads, 1);
         return {ok:true,body:{success:true,data:[{prompt_tokens:12,completion_tokens:8}]}};
       }
-      assert.equal(spec.func.name, refreshed ? 'tabReadAgentRouterDashboard' : 'tabFetchAgentRouterAccount');
-      if (!refreshed) assert.equal(spec.args[1], true);
-      if (!refreshed && ++reads < 3) return {userMismatch:true,actualUserId:'99',configuredUserId:p.userId};
-      return {ok:true,body:{success:true,data:{id:Number(p.userId),quota:refreshed ? 180 : 100,used_quota:7}}};
+      if (spec.func.name === 'tabFetchAgentRouterAccount') {
+        assert.equal(spec.args[1], true);
+        if (++reads < 3) return {userMismatch:true,actualUserId:'99',configuredUserId:p.userId};
+        return {ok:true,body:{success:true,data:{id:Number(p.userId),quota:100,used_quota:7}}};
+      }
+      assert.equal(spec.func.name, 'tabReadAgentRouterDashboard'); assert.equal(reads, 3);
+      dashboardReads++;
+      return {ok:true,body:{success:true,data:{id:Number(p.userId),quota:180,used_quota:7}}};
     };
     const remove = h.chrome.tabs.remove;
     h.chrome.tabs.remove = async (id) => {
@@ -1815,6 +1889,7 @@ for (const mode of ['agentrouter_token','agentrouter_linuxdo']) {
       await remove(id);
     };
     await h.run('handleAgentRouterReauthTab(pending.tabId,callback)');
+    assert.equal(reads, 3); assert.equal(dashboardReads, 2);
     assert.equal(h.reloaded.length, 0); assert.equal(h.dashboardRefreshInjections.length, 1);
     assert.equal(h.updates.filter((entry) => entry.url).length, 0);
     assert.equal(h.created.length, 1); assert.deepEqual(h.removed, [tab.id]);
@@ -1856,8 +1931,8 @@ for (const failure of ['missing-quota','wrong-account','session-expired']) {
     h.ctx.script = async (spec) => {
       if (spec.func.name === 'tabCheckAgentRouterLogin') return {ok:true,userId:'12',checkedIn:true,account:{available:9999}};
       if (spec.func.name === 'tabFetchCheckin') return {ok:true,body:{success:true,data:[]}};
-      assert.equal(spec.func.name, h.dashboardRefreshInjections.length ? 'tabReadAgentRouterDashboard' : 'tabFetchAgentRouterAccount');
-      if (!h.dashboardRefreshInjections.length) return {ok:true,body:{success:true,data:{id:12,quota:100}}};
+      if (spec.func.name === 'tabFetchAgentRouterAccount') return {ok:true,body:{success:true,data:{id:12,quota:100}}};
+      assert.equal(spec.func.name, 'tabReadAgentRouterDashboard');
       if (failure === 'session-expired') return {ok:false,status:401};
       if (failure === 'wrong-account') return {userMismatch:true,actualUserId:'99'};
       return {ok:true,body:{success:true,data:{id:12}}};
@@ -1969,14 +2044,14 @@ for (const id of [false,true,'false',null,undefined]) {
   });
 }
 for (const mode of ['agentrouter_linuxdo','agentrouter_token']) {
-  test(`${mode}: after login the refreshed dashboard supplies quota without any additional self XHR`, async () => {
+  test(`${mode}: after one native refresh the dashboard supplies quota without additional self XHR`, async () => {
     const {h,p,tab} = await ownedCallbackFixture(mode, {userId:mode === 'agentrouter_linuxdo' ? '272149' : '427285'});
     const local = installDashboardDom(h, {id:Number(p.userId),balance:'$227.04',used:'$2,022.29'});
     let xhrReads = 0, refreshReads = 0;
     h.ctx.XMLHttpRequest = class {
       open(){} setRequestHeader(){} getResponseHeader(){return 'application/json';}
       send(){
-        assert.equal(h.dashboardRefreshInjections.length, 0, 'post-refresh quota must not request the WAF-blocked self endpoint');
+        assert.equal(xhrReads, 0, 'only the initial online identity probe may request the WAF-blocked self endpoint');
         xhrReads++;this.status=200;this.responseText=JSON.stringify({success:true,data:{id:Number(p.userId),quota:100}});
         queueMicrotask(()=>this.onload());
       }
@@ -2588,7 +2663,7 @@ test('post-refresh expired login fails immediately instead of polling until idle
   const p=visitPlatform({authMode:'cookie'});const h=harness('background.js');h.ctx.input=p;let reads=0;
   h.ctx.script=async spec=>spec.func.name === 'tabLogout' ? {ok:true} : spec.func.name === 'tabRefreshAuthToken' ? {httpOk:false,status:401} : ++reads===1?{ok:true,body:{success:true,data:{id:12,quota:50}}}:{ok:false,status:401};
   const result=await h.run('runCheckin(input)');
-  assert.equal(result.ok,false);assert.match(result.message,/401.*失效/);assert.equal(reads,2);assert.equal(h.reloaded.length,0);assert.equal(h.dashboardRefreshInjections.length,1);assert.equal(h.removed.length,1);
+  assert.equal(result.ok,false);assert.match(result.message,/401.*失效/);assert.equal(reads,2);assert.equal(h.reloaded.length,0);assert.equal(h.dashboardRefreshInjections.length,1);assert.equal(h.removed.length,0);
 });
 test('confirmed balance is saved before a stalled log, whose 20-second budget does not fail the visit',async()=>{
   const p=visitPlatform({authMode:'cookie',account:{available:10}});const h=harness('background.js',{[PLATFORMS]:[p]});h.ctx.input=p;
@@ -2605,6 +2680,7 @@ test('confirmed balance is saved before a stalled log, whose 20-second budget do
   const result=await running;
   assert.equal(result.visited,true);assert.equal(result.account.available,130);assert.equal(result.account.monthlyTokens,null);
   assert.match(result.message,/本月Token接口不可用/);assert.equal(h.reloaded.length,0);assert.equal(h.dashboardRefreshInjections.length,1);assert.equal(h.removed.length,1);
+  assert.equal(h.updates.filter((entry) => entry.url === p.baseUrl + '/console').length,1);
   release({ok:true,body:{success:true,data:[{prompt_tokens:999}]}});await new Promise(setImmediate);
   assert.equal(h.store[PLATFORMS][0].account.monthlyTokens,null,'late response cannot publish tokens');
 });

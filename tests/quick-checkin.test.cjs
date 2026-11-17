@@ -6,7 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
-const previewStart = source.indexOf('function accountBatchLocked(p) {');
+const previewStart = source.indexOf('function isAgentRouterSite(p) {');
 const groupStart = source.indexOf('function renderAccountGroup(group, index) {', previewStart);
 const groupEnd = source.indexOf('\nfunction toggleAccountGroup(key) {', groupStart);
 assert.notEqual(previewStart, -1, 'account preview renderer should exist');
@@ -25,6 +25,8 @@ function testContext(overrides = {}) {
     currentVisitProgress: () => '',
     accountGroupKey: (p) => p.baseUrl,
     isVisitOnly: (p) => p.visitOnly === true,
+    isTrafficSite: (p) => p.siteType === 'ikuuu',
+    accountForSite: (_p, account) => account && account.kind !== 'traffic' ? account : null,
     status: () => ['就绪', 'badge-success'],
     accountGroupSummary: () => ({ total: 0, known: 1, unknown: 0, duplicates: 0 }),
     accountIdentity: (p) => `用户 ID ${p.userId || 'unknown'}`,

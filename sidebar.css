@@ -277,6 +277,16 @@ select:focus{border-color:var(--primary);box-shadow:var(--focus-ring)}
 .account-preview-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
 .account-preview-checkin{flex:none;margin:0;padding:4px 7px;border-radius:7px;font-size:10px;line-height:1.25;white-space:nowrap}
 .account-preview-checkin:disabled{cursor:wait;opacity:.68;transform:none}
+.account-preview-row.account-identity-preview{flex-wrap:wrap;align-items:flex-start;row-gap:0}
+.account-identity-preview>.account-preview-details{text-align:right;font-variant-numeric:tabular-nums}
+.account-preview-row.account-identity-preview>span.account-preview-summary{flex:0 0 100%;display:flex;min-width:0;gap:12px;align-items:flex-start;text-align:left;font-variant-numeric:normal}
+.account-identity-preview>.account-preview-summary>.account-preview-meta{flex:1;min-width:0;text-align:left;overflow-wrap:anywhere}
+.account-identity-preview>.account-preview-summary>.account-preview-status{flex:0 1 auto;min-width:0;max-width:40%;text-align:right;overflow-wrap:anywhere}
+.account-identity,.account-identity-email,.account-updated{display:block;min-width:0;overflow-wrap:anywhere;letter-spacing:0}
+.account-identity-line{display:flex;align-items:baseline;gap:0 12px;min-width:0;letter-spacing:0}
+.account-identity-id{flex:0 1 auto;min-width:0;max-width:100%;white-space:nowrap;overflow-wrap:normal;overflow:hidden;text-overflow:ellipsis}
+.account-identity-with-group .account-identity-id{max-width:60%}
+.account-identity-group{flex:1;min-width:0;overflow-wrap:anywhere}
 .actionbar #historyBtnSidebar{display:inline-flex;align-items:center;justify-content:center;gap:5px}
 .actionbar #historyBtnSidebar svg{flex:none}
 @media(max-width:360px){.account-preview-row{align-items:flex-start;flex-wrap:wrap}.account-preview-details{max-width:100%;margin-left:auto}.account-preview-value{gap:4px}.account-preview-checkin{padding:4px 6px}}

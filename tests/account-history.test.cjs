@@ -284,7 +284,10 @@ test('parallel real QUOTA refreshes serialize history read-modify-write operatio
   const h = harness('background.js', { [PLATFORMS]: [saved] });
   installApi(h, { logs: [] });
   let clock = Date.now();
-  h.ctx.Date.now = () => ++clock;
+  h.ctx.Date = class extends Date {
+    constructor(...args) { super(...(args.length ? args : [++clock])); }
+    static now() { return ++clock; }
+  };
   const originalSet = h.chrome.storage.local.set;
   let activeHistoryWrites = 0;
   let maxConcurrentHistoryWrites = 0;
@@ -310,7 +313,8 @@ test('parallel real QUOTA refreshes serialize history read-modify-write operatio
 test('changed or deleted configs serialize history invalidation against stale asynchronous samples', async () => {
   const original = platform('race', { userId: '', account: null });
   const h = harness('background.js', { [PLATFORMS]: [original] });
-  const unverifiedAccount = { userId: null, available: 500, used: 100, quotaPerUnit: 100, monthlyTokens: 3 };
+  const unverifiedAccount = { updatedAt: h.run('new Date().toISOString()'), userId: null,
+    available: 500, used: 100, quotaPerUnit: 100, monthlyTokens: 3 };
   const initialWrite = h.run(`recordAccountHistorySample(${JSON.stringify(original)}, ${JSON.stringify(unverifiedAccount)}, '2026-10')`);
   assert.equal(await initialWrite, true);
   assert.equal(h.store[HISTORY_KEY].accounts.race.identity, 'https://history.example|config:race');
@@ -345,7 +349,7 @@ test('changed or deleted configs serialize history invalidation against stale as
   }
   assert.equal(h.store[PLATFORMS][0].accessToken, changed.accessToken, 'the new config is committed before history invalidation completes');
   releasePlatformRead();
-  assert.equal(await staleWrite, true, 'the delayed operation was already authorized against its captured old config');
+  assert.equal(await staleWrite, false, 'a changed config generation rejects the captured old task');
   await saveChanged;
   assert.deepEqual(h.store[HISTORY_KEY].accounts, {}, 'serialized invalidation removes the sample written by the in-flight old task');
 

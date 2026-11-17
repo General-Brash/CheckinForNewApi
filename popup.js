@@ -490,6 +490,25 @@ function accountIdentity(p) {
   const username = p.authMode === "password" ? String(p.loginUsername || "").trim() : "";
   return username ? username + " · " + identity : identity;
 }
+function isAgentRouterSite(p) {
+  if (isTrafficSite(p)) return false;
+  try {
+    const url = new URL(p.baseUrl);
+    return /^https?:$/.test(url.protocol) && (url.hostname === "agentrouter.org" || url.hostname.endsWith(".agentrouter.org"));
+  } catch { return false; }
+}
+function renderAccountIdentity(p) {
+  if (isTrafficSite(p)) return esc(accountIdentity(p));
+  const id = p.account && p.account.userId || p.userId;
+  const identity = id ? "用户 ID " + id : "尚未确认用户 ID";
+  const username = p.authMode === "password" ? String(p.loginUsername || "").trim() : "";
+  const agentRouter = isAgentRouterSite(p);
+  const group = p.account && typeof p.account.userGroup === "string" ? p.account.userGroup.trim() : "";
+  return '<span class="account-identity' + (agentRouter ? ' account-identity-with-group' : '') + '">' +
+    (username ? '<span class="account-identity-email">' + esc(username) + '</span>' : '') +
+    '<span class="account-identity-line"><span class="account-identity-id" title="' + esc(identity) + '">' + esc(identity) + '</span>' +
+    (agentRouter ? '<span class="account-identity-group">用户分组 ' + esc(group || "—") + '</span>' : '') + '</span></span>';
+}
 function accountBatchLocked(p) {
   return !!activeBatchRun && (activeBatchRun.groupKey === null || activeBatchRun.groupKey === accountGroupKey(p));
 }
@@ -501,13 +520,15 @@ function renderAccountPreview(p) {
   const visitOnly = isVisitOnly(p);
   const actionLabel = visitOnly ? (busy ? "访问中…" : "访问") : (busy ? "签到中…" : "签到");
   const actionName = visitOnly ? "访问" : "快捷签到";
-  return '<div class="account-preview-row' + (traffic ? ' traffic-preview' : '') + '"><span class="account-preview-name">' + esc(p.name) + '<small>' + esc(accountIdentity(p)) + '</small>' +
-    (p.accountHistoryError ? '<small><span class="warn">历史写入告警：' + esc(p.accountHistoryError) + '</span></small>' : '') + '</span>' +
+  const metadata = '<small>' + renderAccountIdentity(p) + '</small>' +
+    (p.accountHistoryError ? '<small><span class="warn">历史写入告警：' + esc(p.accountHistoryError) + '</span></small>' : '');
+  return '<div class="account-preview-row' + (traffic ? ' traffic-preview' : ' account-identity-preview') + '"><span class="account-preview-name">' + esc(p.name) + (traffic ? metadata : '') + '</span>' +
     '<span class="account-preview-details" title="' + esc(accountUpdatedLabel(account, traffic)) + '">' +
     '<span class="account-preview-value"><button type="button" class="btn btn-primary account-preview-checkin" data-action="checkin" data-id="' + esc(p.id) + '" aria-label="' + esc(actionName + "：" + p.name) + '" title="' + esc(actionName + "：" + p.name) + '"' +
     (busy || accountBatchLocked(p) ? " disabled" : "") + '>' + esc(actionLabel) + '</button><span class="account-preview-amount">' + esc(traffic ? trafficDisplay(account) : formatQuota(account.available, quotaUnitFor(account))) + '</span></span>' +
     (traffic ? '<small class="account-preview-membership"' + (account.membershipExpiresAt ? ' title="到期日：' + esc(account.membershipExpiresAt) + '"' : '') + '>会员 ' + esc(membershipDisplay(account)) + '</small>' : '') +
-    '<small class="' + esc(cls) + '">' + esc(label) + '</small></span></div>';
+    (traffic ? '<small class="' + esc(cls) + '">' + esc(label) + '</small>' : '') + '</span>' +
+    (traffic ? '' : '<span class="account-preview-summary"><span class="account-preview-meta">' + metadata + '</span><small class="account-preview-status ' + esc(cls) + '">' + esc(label) + '</small></span>') + '</div>';
 }
 function renderAccountGroup(group, index) {
   if (group.accounts.length === 1) return renderPlatformCard(group.accounts[0]);
@@ -583,7 +604,8 @@ function renderPlatformCard(p) {
     '<span class="badge ' + cls + '">' + label + "</span>" + (!traffic && normalizeKeepAlive(p.keepAlive).enabled ? '<span class="badge badge-keepalive" title="已开启自动调用API（防僵尸号）">保活</span>' : "") + "</div>" +
     '<div class="card-stats">' + stats +
     "</div>" +
-    '<p class="account-meta">' + esc(accountIdentity(p)) + ' · ' + esc(accountUpdatedLabel(acc, traffic)) + '</p>' +
+    '<p class="account-meta">' + renderAccountIdentity(p) +
+    (traffic ? ' · ' + esc(accountUpdatedLabel(acc, traffic)) : '<span class="account-updated">' + esc(accountUpdatedLabel(acc, traffic)) + '</span>') + '</p>' +
     '<p class="message' + ((p.error || p.accountError) && !currentVisitProgress(p.id) && !cancelledCheckins.has(p.id) ? " err" : "") + '">' + esc(currentVisitProgress(p.id) || cancelledCheckins.get(p.id) || p.error || p.accountError || p.message || p.note || "尚未获取最新统计") + "</p>" +
     (p.accountHistoryError ? '<p class="message err">历史写入告警：' + esc(p.accountHistoryError) + '</p>' : '') +
     '<div class="card-actions">' +
